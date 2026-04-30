@@ -15,17 +15,6 @@ Note: pull requests are not imported into the GitHub directory in the usual way.
 5. Make sure your code lints.
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
-## 📚 Documentation
-
-The project documentation lives in [`docs/`](docs/) and is automatically
-synced to the [GitHub Wiki](https://github.com/facebookresearch/CUTracer/wiki)
-on every push to `main` via
-[`.github/workflows/sync-wiki.yml`](.github/workflows/sync-wiki.yml).
-
-**Edit `docs/*.md`, not the wiki directly** — direct wiki edits will be
-overwritten on the next sync. This keeps documentation changes in code
-review with the code they describe.
-
 ## Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You only need
 to do this once to work on any of Meta's open source projects.
