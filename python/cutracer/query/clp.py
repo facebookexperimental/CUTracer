@@ -4,6 +4,8 @@ from typing import Generator, Optional
 
 import yscope_clp_core  # type: ignore
 from cutracer.query.reader import TraceReaderBase
+
+# pyrefly: ignore [missing-import]
 from yscope_clp_core import KqlQuery
 
 

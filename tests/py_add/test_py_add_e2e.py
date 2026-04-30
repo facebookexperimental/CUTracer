@@ -89,6 +89,8 @@ class TestPyAddE2E(unittest.TestCase):
         trace_format=None,
         instrument="reg_trace",
         kernel_filter="triton_poi_fused",
+        dump_cubin=False,
+        extra_env=None,
     ):
         """Run test_add.py as a subprocess with CUTracer instrumentation.
 
@@ -100,6 +102,9 @@ class TestPyAddE2E(unittest.TestCase):
             trace_format: Trace output format (0=text, 1=ndjson+zstd, 2=ndjson).
             instrument: Instrumentation mode(s), comma-separated.
             kernel_filter: Kernel name filter substring.
+            dump_cubin: If True, set CUTRACER_DUMP_CUBIN=1.
+            extra_env: Additional env vars to override (applied after
+                _build_cutracer_env, so can override any CUTracer var).
 
         Returns:
             subprocess.CompletedProcess with stdout/stderr captured.
@@ -117,7 +122,10 @@ class TestPyAddE2E(unittest.TestCase):
             verbose=None,
             zstd_level=None,
             delay_ns=None,
+            dump_cubin=dump_cubin,
         )
+        if extra_env:
+            env.update(extra_env)
         # Pin Triton/Inductor cache so all subprocesses share the same
         # compiled kernels (deterministic CTA/warp config across runs).
         env["TRITON_CACHE_DIR"] = self.triton_cache_dir
@@ -277,6 +285,97 @@ class TestPyAddE2E(unittest.TestCase):
                 record,
                 f"Line {i} missing 'type' field: {line[:100]}",
             )
+
+    # ------------------------------------------------------------------
+    # Test: Cubin dump — explicit enable
+    # ------------------------------------------------------------------
+
+    def test_cubin_dump_enabled(self):
+        """CUTRACER_DUMP_CUBIN=1 generates .cubin files in output dir."""
+        result = self._run_py_add(
+            trace_format=0,
+            instrument="reg_trace",
+            dump_cubin=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+        )
+
+        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        self.assertGreater(
+            len(cubin_files),
+            0,
+            f"No .cubin files generated in {self.trace_dir}",
+        )
+
+        # Verify filename format: kernel_{hex_checksum}_{name}.cubin
+        for f in cubin_files:
+            self.assertRegex(
+                f.name,
+                r"^kernel_[0-9a-f]+_.+\.cubin$",
+                f"Cubin filename does not match expected format: {f.name}",
+            )
+
+        # Verify cubin files are non-empty (actual binary content)
+        for f in cubin_files:
+            self.assertGreater(
+                f.stat().st_size,
+                0,
+                f"Cubin file is empty: {f.name}",
+            )
+
+    # ------------------------------------------------------------------
+    # Test: Cubin dump — explicit disable
+    # ------------------------------------------------------------------
+
+    def test_cubin_dump_disabled(self):
+        """CUTRACER_DUMP_CUBIN=0 suppresses cubin file generation."""
+        result = self._run_py_add(
+            trace_format=0,
+            instrument="reg_trace",
+            extra_env={"CUTRACER_DUMP_CUBIN": "0"},
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+        )
+
+        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        self.assertEqual(
+            len(cubin_files),
+            0,
+            f"Cubin files should NOT be generated when CUTRACER_DUMP_CUBIN=0, "
+            f"but found: {[f.name for f in cubin_files]}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test: Cubin dump — default behavior (auto-enabled with instrumentation)
+    # ------------------------------------------------------------------
+
+    def test_cubin_dump_default_with_instrumentation(self):
+        """Cubin dump auto-enables when instrumentation is active (default)."""
+        result = self._run_py_add(
+            trace_format=0,
+            instrument="reg_trace",
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+        )
+
+        # Without explicit CUTRACER_DUMP_CUBIN, the C++ code defaults to
+        # has_any_instrumentation_enabled(), which is true here.
+        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        self.assertGreater(
+            len(cubin_files),
+            0,
+            f"Cubin files should be auto-generated when instrumentation is "
+            f"enabled, but none found in {self.trace_dir}",
+        )
 
     # ------------------------------------------------------------------
     # Test: Cross-format consistency (mirrors test_trace_formats cross-validation)

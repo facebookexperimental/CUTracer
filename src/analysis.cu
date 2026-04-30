@@ -28,8 +28,8 @@
 #include "log.h"
 #include "trace_writer.h"
 #include "utils/channel.hpp"
+#include "warp_status.h"
 
-#define PC_HISTORY_LEN 32
 #define LOOP_REPEAT_THRESH 3
 // Throttle interval for hang checks (seconds)
 #define HANG_CHECK_THROTTLE_SECS 1
@@ -60,123 +60,6 @@ static inline uint64_t get_timestamp_ns() {
   auto now = std::chrono::high_resolution_clock::now();
   auto duration = now.time_since_epoch();
   return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
-}
-
-/**
- * Print one instruction line in the exact same format as loop body entries.
- *
- * Purpose:
- * - Provide a single-line renderer that matches the loop body formatting so
- *   different states (looping/barrier/progressing) can share the same
- *   presentation logic for an instruction row.
- *
- * Output format (aligned columns):
- *   Example: [idx] PC <dec>; Offset <dec> [0x<hex>];  <SASS> (has_mem)\n
- * - The trailing "(has_mem)" is printed only when the merged record has
- *   associated memory info.
- * - The index field width is currently fixed to 1 for consistency with our
- *   existing loop body output. Adjust if you later support wider indices.
- *
- * Parameters:
- * - index: The row index to print inside square brackets. For barrier/
- *   progressing single-line outputs, callers typically pass 0.
- * - instr: The merged trace record containing the reg info (and optional mem).
- * - sass_map_for_func: Per-function opcode->SASS map to resolve the mnemonic.
- *   If null or missing entry, prints "UNKNOWN" as fallback.
- * - pc_dec_width: Precomputed decimal width for PC/Offset alignment.
- * - hex_nibbles_max: Precomputed hex width (in nibbles), rounded to multiples
- *   of 4 and clamped to [4,16], used for the 0x... field.
- *
- * Notes:
- * - This function does not perform width computation. Callers should compute
- *   widths across the intended set of rows (entire loop body, or just the last
- *   single record) and pass them here to ensure consistent alignment.
- */
-static inline void print_instruction_line(size_t index, const TraceRecordMerged& instr,
-                                          const std::map<int, std::string>* sass_map_for_func, int pc_dec_width,
-                                          int hex_nibbles_max) {
-  uint64_t pc_val = instr.reg.pc;
-  const char* sass_cstr = "UNKNOWN";
-  if (sass_map_for_func && sass_map_for_func->count(instr.reg.opcode_id)) {
-    sass_cstr = sass_map_for_func->at(instr.reg.opcode_id).c_str();
-  }
-  loprintf("        [%*zu] PC %*lu; Offset %*lu /*0x%0*lx*/;  %s", 1, index, pc_dec_width, (unsigned long)pc_val,
-           pc_dec_width, (unsigned long)pc_val, hex_nibbles_max, (unsigned long)pc_val, sass_cstr);
-  if (instr.has_mem) {
-    loprintf(" (has_mem)");
-  }
-  loprintf("\n");
-}
-
-/**
- * Print the most recent instruction for a warp as a single line (loop-body style).
- *
- * Purpose:
- * - Provide a one-liner for BARRIER/PROGRESSING states that mirrors the loop
- *   body row format for visual consistency with LOOPING output.
- *
- * Behavior:
- * - Fetches the latest entry from the per-warp ring buffer
- *   ((head + filled - 1) % PC_HISTORY_LEN).
- * - Computes widths (decimal/hex) based solely on this last record and prints
- *   a single formatted line prefixed by "last: ".
- * - If there is no available entry (null state or empty), prints a line with
- *   UNKNOWN mnemonic and zero PC/Offset.
- *
- * Parameters:
- * - loop_state: Pointer to the warp's loop state holding the ring buffer.
- * - sass_map_for_func: Per-function opcode->SASS map to resolve the mnemonic.
- *
- * Notes:
- * - This function intentionally recomputes widths for the single last record.
- *   For multi-row loop bodies, prefer computing widths once across all rows and
- *   calling print_instruction_line_like_loop per row.
- */
-static inline void print_last_instruction_line(const WarpLoopState* loop_state,
-                                               const std::map<int, std::string>* sass_map_for_func) {
-  uint64_t last_pc_val = 0;
-  bool last_has_mem = false;
-  const char* last_sass_cstr = "UNKNOWN";
-
-  if (loop_state && loop_state->filled > 0 && sass_map_for_func) {
-    int idx_last = (loop_state->head + (int)loop_state->filled + PC_HISTORY_LEN - 1) % PC_HISTORY_LEN;
-    int opcode_last = loop_state->history[idx_last].reg.opcode_id;
-    last_pc_val = loop_state->history[idx_last].reg.pc;
-    last_has_mem = loop_state->history[idx_last].has_mem;
-    if (sass_map_for_func->count(opcode_last)) {
-      last_sass_cstr = sass_map_for_func->at(opcode_last).c_str();
-    }
-  }
-
-  int pc_dec_width = 1;
-  int hex_nibbles_max = 4;
-  {
-    uint64_t td = last_pc_val;
-    int dec_w = 1;
-    while (td >= 10) {
-      td /= 10;
-      dec_w++;
-    }
-    if (dec_w > pc_dec_width) pc_dec_width = dec_w;
-    int nibbles = 1;
-    if (last_pc_val != 0) {
-      nibbles = 0;
-      uint64_t th = last_pc_val;
-      while (th) {
-        th >>= 4;
-        nibbles++;
-      }
-    }
-    if (nibbles > hex_nibbles_max) hex_nibbles_max = nibbles;
-    hex_nibbles_max = ((hex_nibbles_max + 3) / 4) * 4;
-    if (hex_nibbles_max < 4) hex_nibbles_max = 4;
-    if (hex_nibbles_max > 16) hex_nibbles_max = 16;
-  }
-  loprintf("      Last: [%*d] PC %*lu; Offset %*lu /*0x%0*lx*/;  %s", 1, 0, pc_dec_width, (unsigned long)last_pc_val,
-           pc_dec_width, (unsigned long)last_pc_val, hex_nibbles_max, (unsigned long)last_pc_val, last_sass_cstr);
-  if (last_has_mem) {
-    loprintf(" (has_mem)");
-  }
 }
 
 static inline bool matches_barrier_defer_blocking(const std::string& mnemonic) {
@@ -632,256 +515,30 @@ static void clear_deadlock_state(CTXstate* ctx_state, uint64_t kernel_launch_id 
   }
 }
 
-/**
- * @brief Prints detailed status information for all active warps including loop states.
- *
- * This function provides a comprehensive view of each warp's current state including:
- * - Basic warp identification (CTA coordinates, warp ID)
- * - Loop detection status (whether in loop, loop period, repeat count)
- * - Activity timestamps and exit candidate status
- * - Loop body instruction details if available
- *
- * @param ctx_state Pointer to the state for the current CUDA context
- * @param current_kernel_launch_id The current kernel launch ID for context
- */
 static void print_warp_status_summary(CTXstate* ctx_state, uint64_t current_kernel_launch_id) {
-  time_t now = time(nullptr);
-
-  // Print warp statistics if available
-  if (ctx_state->kernel_warp_tracking.count(current_kernel_launch_id)) {
-    const KernelWarpStats& stats = ctx_state->kernel_warp_tracking[current_kernel_launch_id];
-    size_t total_warps = stats.total_warps;
-    size_t seen_warps = stats.all_seen_warps.size();
-    size_t finished_warps = stats.finished_warps.size();
-    size_t active_warps = ctx_state->active_warps.size();
-
-    // Collect warp IDs in different categories
-    std::set<int> finished_warp_ids;
-    std::set<int> active_warp_ids;
-    std::set<int> never_executed_warp_ids;
-
-    for (const WarpKey& key : stats.finished_warps) {
-      finished_warp_ids.insert(key.warp_id);
-    }
-    for (const WarpKey& key : ctx_state->active_warps) {
-      active_warp_ids.insert(key.warp_id);
-    }
-
-    // Calculate never executed warps (all possible warp IDs minus those we've seen)
-    std::set<int> all_seen_warp_ids;
-    for (const WarpKey& key : stats.all_seen_warps) {
-      all_seen_warp_ids.insert(key.warp_id);
-    }
-
-    // Determine max warp ID based on total warps
-    for (uint32_t wid = 0; wid < total_warps; wid++) {
-      if (all_seen_warp_ids.count(wid) == 0) {
-        never_executed_warp_ids.insert(wid);
-      }
-    }
-
-    size_t never_executed = never_executed_warp_ids.size();
-
-    loprintf("==> WARP STATISTICS for kernel_launch_id=%lu:\n", current_kernel_launch_id);
-    loprintf("    Grid: <%u,%u,%u>, Block: <%u,%u,%u>\n", stats.dimensions.gridDimX, stats.dimensions.gridDimY,
-             stats.dimensions.gridDimZ, stats.dimensions.blockDimX, stats.dimensions.blockDimY,
-             stats.dimensions.blockDimZ);
-    loprintf("\n");
-    loprintf("    Summary:\n");
-    loprintf("      Total warps:           %5zu (100.0%%)\n", total_warps);
-    loprintf("      Finished warps:        %5zu (%5.1f%%)\n", finished_warps,
-             total_warps > 0 ? 100.0 * finished_warps / total_warps : 0.0);
-    loprintf("      Active warps:          %5zu (%5.1f%%)\n", active_warps,
-             total_warps > 0 ? 100.0 * active_warps / total_warps : 0.0);
-    loprintf("      Never executed warps:  %5zu (%5.1f%%)\n", never_executed,
-             total_warps > 0 ? 100.0 * never_executed / total_warps : 0.0);
-
-    // Helper lambda to format ranges from a set of IDs
-    auto format_ranges = [](const std::set<int>& ids) -> std::string {
-      if (ids.empty()) return "none";
-
-      std::string result;
-      auto it = ids.begin();
-      int range_start = *it;
-      int range_end = *it;
-
-      for (++it; it != ids.end(); ++it) {
-        if (*it == range_end + 1) {
-          // Continue current range
-          range_end = *it;
-        } else {
-          // End current range and start new one
-          if (!result.empty()) result += ", ";
-          if (range_start == range_end) {
-            result += std::to_string(range_start);
-          } else {
-            result += std::to_string(range_start) + "-" + std::to_string(range_end);
-          }
-          range_start = range_end = *it;
-        }
-      }
-
-      // Add final range
-      if (!result.empty()) result += ", ";
-      if (range_start == range_end) {
-        result += std::to_string(range_start);
-      } else {
-        result += std::to_string(range_start) + "-" + std::to_string(range_end);
-      }
-
-      return result;
-    };
-
-    loprintf("\n");
-    loprintf("    Warp ID Ranges:\n");
-    loprintf("      Finished:       %s\n", format_ranges(finished_warp_ids).c_str());
-    loprintf("      Active:         %s\n", format_ranges(active_warp_ids).c_str());
-    loprintf("      Never executed: %s\n", format_ranges(never_executed_warp_ids).c_str());
-
-    loprintf("    -----------------------------------------------------------------------\n");
-  }
-
-  if (ctx_state->active_warps.empty()) {
-    loprintf("==> WARP STATUS: No active warps for kernel_launch_id=%lu\n", current_kernel_launch_id);
-    return;
-  }
-
-  loprintf("==> WARP STATUS SUMMARY for kernel_launch_id=%lu (%zu active warps):\n", current_kernel_launch_id,
-           ctx_state->active_warps.size());
-  loprintf("    Format: WarpID[CTA_x,y,z] - LoopStatus - Activity\n");
-  loprintf("    -----------------------------------------------------------------------\n");
-
-  // Resolve SASS map for the current function, if available
-  const std::map<int, std::string>* sass_map_for_func = nullptr;
-  {
-    std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-        kernel_launch_to_func_map.find(current_kernel_launch_id);
+  auto summary = collect_warp_status(ctx_state, current_kernel_launch_id);
+  if (trace_format == 0) {
+    print_warp_status_text(summary);
+  } else {
+    auto func_iter = kernel_launch_to_func_map.find(current_kernel_launch_id);
     if (func_iter != kernel_launch_to_func_map.end()) {
-      CUfunction f_func = func_iter->second.second;
-      if (ctx_state->id_to_sass_map.count(f_func)) {
-        sass_map_for_func = &ctx_state->id_to_sass_map[f_func];
-      }
+      CUcontext ctx = func_iter->second.first;
+      CUfunction func = func_iter->second.second;
+      uint32_t iteration = 0;
+      auto iter_it = kernel_launch_to_iter_map.find(current_kernel_launch_id);
+      if (iter_it != kernel_launch_to_iter_map.end()) iteration = iter_it->second;
+      std::string checksum;
+      auto meta_it = kernel_metadata_by_func.find(func);
+      if (meta_it != kernel_metadata_by_func.end()) checksum = meta_it->second.kernel_checksum;
+      std::string basename = generate_kernel_log_basename(ctx, func, iteration, checksum);
+      write_warp_status_json(summary, basename);
+    } else {
+      loprintf(
+          "WARNING: kernel_launch_id=%lu not found in kernel_launch_to_func_map; skipping JSON warp status output\n",
+          current_kernel_launch_id);
     }
+    print_warp_status_text(summary);
   }
-
-  for (const auto& warp_key : ctx_state->active_warps) {
-    // Basic warp info
-    loprintf("    Warp%d[%d,%d,%d]: ", warp_key.warp_id, warp_key.cta_id_x, warp_key.cta_id_y, warp_key.cta_id_z);
-
-    // Loop state info
-    auto loop_iter = ctx_state->loop_states.find(warp_key);
-    bool is_looping = false;
-    if (loop_iter != ctx_state->loop_states.end()) {
-      const WarpLoopState& loop_state = loop_iter->second;
-      if (loop_state.loop_flag) {
-        is_looping = true;
-        time_t last_seen_secs = 0;
-        auto seen_it2 = ctx_state->last_seen_time_by_warp.find(warp_key);
-        if (seen_it2 != ctx_state->last_seen_time_by_warp.end()) {
-          last_seen_secs = now - seen_it2->second;
-        }
-        loprintf("LOOPING(period=%d, repeat=%d) last_seen=%lds ", loop_state.last_period, loop_state.repeat_cnt,
-                 last_seen_secs);
-      }
-    }
-
-    // Activity info
-    time_t inactive_duration = 0;
-    auto seen_iter = ctx_state->last_seen_time_by_warp.find(warp_key);
-    if (seen_iter != ctx_state->last_seen_time_by_warp.end()) {
-      inactive_duration = now - seen_iter->second;
-    }
-
-    if (!is_looping) {
-      // If not looping, distinguish barrier vs progressing by last_is_defer_blocking_by_warp
-      bool is_barrier = false;
-      auto itBar = ctx_state->last_is_defer_blocking_by_warp.find(warp_key);
-      if (itBar != ctx_state->last_is_defer_blocking_by_warp.end()) {
-        is_barrier = itBar->second;
-      }
-
-      // Use unified single-line printer for last instruction; no temporary variables needed here
-
-      if (is_barrier) {
-        // Barrier category (last observed instruction is BAR.SYNC.DEFER_BLOCKING)
-        // Include inactivity seconds for quick assessment
-        int period_val = 0;
-        int repeat_val = 0;
-        if (loop_iter != ctx_state->loop_states.end()) {
-          period_val = loop_iter->second.last_period;
-          repeat_val = loop_iter->second.repeat_cnt;
-        }
-        loprintf("BARRIER(inactive=%lds) no_loop(period=%d, repeat=%d)\n", inactive_duration, period_val, repeat_val);
-        print_last_instruction_line(loop_iter != ctx_state->loop_states.end() ? &loop_iter->second : nullptr,
-                                    sass_map_for_func);
-      } else {
-        // Progressing category
-        int period_val = 0;
-        int repeat_val = 0;
-        if (loop_iter != ctx_state->loop_states.end()) {
-          period_val = loop_iter->second.last_period;
-          repeat_val = loop_iter->second.repeat_cnt;
-        }
-        loprintf("PROGRESSING no_loop(period=%d, repeat=%d)\n", period_val, repeat_val);
-        print_last_instruction_line(loop_iter != ctx_state->loop_states.end() ? &loop_iter->second : nullptr,
-                                    sass_map_for_func);
-      }
-    }
-
-    // Exit candidate status
-    auto exit_iter = ctx_state->exit_candidate_since_by_warp.find(warp_key);
-    if (exit_iter != ctx_state->exit_candidate_since_by_warp.end()) {
-      time_t exit_duration = now - exit_iter->second;
-      loprintf("- EXIT_CANDIDATE(%lds)", exit_duration);
-    }
-
-    loprintf("\n");
-
-    // Print loop body details if warp is in a confirmed loop
-    if (loop_iter != ctx_state->loop_states.end() && loop_iter->second.loop_flag) {
-      const WarpLoopState& loop_state = loop_iter->second;
-      if (!loop_state.current_loop.instructions.empty()) {
-        loprintf("      Loop Body (%d instructions):\n", loop_state.current_loop.period);
-        // Pre-compute alignment for PC/Offset columns across the loop body
-        int pc_dec_width = 1;
-        int hex_nibbles_max = 4;
-        {
-          size_t upper = std::min(static_cast<size_t>(loop_state.current_loop.period),
-                                  loop_state.current_loop.instructions.size());
-          for (size_t j = 0; j < upper; ++j) {
-            uint64_t pc = loop_state.current_loop.instructions[j].reg.pc;
-            int dec_w = 1;
-            uint64_t td = pc;
-            while (td >= 10) {
-              td /= 10;
-              dec_w++;
-            }
-            if (dec_w > pc_dec_width) pc_dec_width = dec_w;
-            int nibbles = 1;
-            if (pc != 0) {
-              nibbles = 0;
-              uint64_t th = pc;
-              while (th) {
-                th >>= 4;
-                nibbles++;
-              }
-            }
-            if (nibbles > hex_nibbles_max) hex_nibbles_max = nibbles;
-          }
-          hex_nibbles_max = ((hex_nibbles_max + 3) / 4) * 4;
-          if (hex_nibbles_max < 4) hex_nibbles_max = 4;
-          if (hex_nibbles_max > 16) hex_nibbles_max = 16;
-        }
-        for (size_t i = 0;
-             i < static_cast<size_t>(loop_state.current_loop.period) && i < loop_state.current_loop.instructions.size();
-             ++i) {
-          const auto& instr = loop_state.current_loop.instructions[i];
-          print_instruction_line(i, instr, sass_map_for_func, pc_dec_width, hex_nibbles_max);
-        }
-      }
-    }
-  }
-  loprintf("    -----------------------------------------------------------------------\n");
 }
 
 // Checks for potential kernel hangs by determining if all active warps are stuck in loops.
@@ -1239,12 +896,7 @@ void* recv_thread_fun(void* args) {
               KernelWarpStats& stats = ctx_state->kernel_warp_tracking[current_launch_id];
               stats.dimensions = dims;
 
-              // Calculate total warps: grid_size * warps_per_block
-              // Each block has (blockDim.x * blockDim.y * blockDim.z + 31) / 32 warps
-              uint32_t threads_per_block = dims.blockDimX * dims.blockDimY * dims.blockDimZ;
-              uint32_t warps_per_block = (threads_per_block + 31) / 32;
-              uint32_t total_blocks = dims.gridDimX * dims.gridDimY * dims.gridDimZ;
-              stats.total_warps = total_blocks * warps_per_block;
+              stats.total_warps = calculate_total_warps(dims);
             }
           }
         }

@@ -90,10 +90,14 @@ def format_report_text(report: dict[str, Any]) -> str:
     lines.append("")
 
     # Metadata
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"Timestamp: {report['metadata']['timestamp']}")
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"Config: {report['metadata']['config_file']}")
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"Test script: {report['metadata']['test_script']}")
     if report["metadata"].get("source_file"):
+        # pyrefly: ignore [bad-argument-type]
         lines.append(f"Source: {report['metadata']['source_file']}")
     lines.append("")
 
@@ -101,8 +105,11 @@ def format_report_text(report: dict[str, Any]) -> str:
     summary = report["summary"]
     lines.append("SUMMARY")
     lines.append("-" * 40)
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"  Total points tested: {summary['total_points']}")
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"  Essential points found: {summary['essential_points']}")
+    # pyrefly: ignore [bad-argument-type]
     lines.append(f"  Iterations: {summary['iterations']}")
     lines.append("")
 
@@ -112,13 +119,17 @@ def format_report_text(report: dict[str, Any]) -> str:
         lines.append("ESSENTIAL DELAY POINTS")
         lines.append("-" * 40)
         for i, point in enumerate(essential, 1):
+            # pyrefly: ignore [bad-argument-type]
             lines.append(f"  {i}. {point['sass']}")
+            # pyrefly: ignore [bad-argument-type]
             lines.append(f"     PC: {point['pc_offset']}")
+            # pyrefly: ignore [bad-argument-type]
             lines.append(f"     Kernel: {point['kernel_name']}")
             lines.append("")
 
     # Minimal config
     if report.get("minimal_config_path"):
+        # pyrefly: ignore [bad-argument-type]
         lines.append(f"Minimal config saved to: {report['minimal_config_path']}")
 
     lines.append("")
