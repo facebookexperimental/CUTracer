@@ -98,12 +98,17 @@ jobs:
             tests/py_add/mode*_validation.log
             tests/py_add/mode*_run.log
             tests/py_add/mode1_decompressed.ndjson
-  test-triton-source:
+  test-triton-nightly:
     runs-on: 4-core-ubuntu-gpu-t4
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       DEBUG: "0"
-      CONDA_ENV: "cutracer-triton-source"
+      CONDA_ENV: "cutracer-triton-nightly"
+      # Upstream Triton team's nightly wheel feed (cp310-cp314,
+      # x86_64 + aarch64). The "Triton-Nightly" segment is the *feed*
+      # name; the package is just `triton`. Versions look like
+      # 3.7.0+gitXXXXXXXX.
+      TRITON_NIGHTLY_INDEX_URL: "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/"
 
     steps:
       - name: Checkout repository
@@ -116,10 +121,24 @@ jobs:
           CUDA_VERSION: "12.8"
         run: |
           bash .ci/setup.sh
-      - name: Install Triton from source
+      - name: Install Triton nightly wheel
+        # Replaces the previous 30-50 min source build (which curled
+        # tritonparse's install-triton.sh and invoked
+        # cmake/ninja/clang on Triton+LLVM). The upstream Triton team
+        # publishes prebuilt nightly wheels; proton ships in the wheel
+        # and works as expected.
         run: |
-          wget https://raw.githubusercontent.com/meta-pytorch/tritonparse/refs/heads/main/.ci/install-triton.sh -O /tmp/install-triton.sh
-          bash /tmp/install-triton.sh
+          source /opt/miniconda3/etc/profile.d/conda.sh
+          conda activate "$CONDA_ENV"
+          # PyTorch nightly bundles 'pytorch-triton'; both packages
+          # provide 'import triton' so we uninstall any existing
+          # variant before installing the upstream nightly to avoid a
+          # half-overwritten install. --extra-index-url keeps PyPI as
+          # fallback for transitive deps; --pre allows +gitXXXXXXXX
+          # version tags.
+          pip uninstall -y pytorch-triton triton 2>/dev/null || true
+          pip install -U --pre triton --extra-index-url "${TRITON_NIGHTLY_INDEX_URL}"
+          python -c "import triton; print(f'Triton: {triton.__version__} from {triton.__file__}')"
       - name: Run tests
         env:
           TEST_TYPE: proton
@@ -138,12 +157,12 @@ jobs:
             tests/proton_tests/*.csv
   check-status:
     runs-on: ubuntu-latest
-    needs: [build-and-test, test-triton-source]
+    needs: [build-and-test, test-triton-nightly]
     if: always()
     steps:
       - name: Check test results
         run: |
-          if [ "${{ needs.build-and-test.result }}" = "success" ] && [ "${{ needs.test-triton-source.result }}" = "success" ]; then
+          if [ "${{ needs.build-and-test.result }}" = "success" ] && [ "${{ needs.test-triton-nightly.result }}" = "success" ]; then
               echo "✅ All tests passed!"
           else
               echo "❌ Some tests failed!"

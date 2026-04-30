@@ -15,12 +15,15 @@ echo "CUDA_VERSION: $CUDA_VERSION"
 echo "DEBUG: $DEBUG"
 echo "CONDA_ENV: $CONDA_ENV"
 
-# Setup CUDA, conda, and pytorch
-echo "⬇️ Setting up dependencies using tritonparse setup script..."
-if curl -sL https://raw.githubusercontent.com/meta-pytorch/tritonparse/main/.ci/setup.sh | bash; then
-    echo "✅ Dependencies setup complete."
+# Setup conda + CUDA + cuDNN + PyTorch nightly via the base script
+# (formerly curled from tritonparse; now vendored locally — see
+# .ci/setup-base.sh header for the migration story).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "⬇️ Setting up base dependencies via $SCRIPT_DIR/setup-base.sh..."
+if bash "$SCRIPT_DIR/setup-base.sh"; then
+    echo "✅ Base dependencies setup complete."
 else
-    echo "❌ Dependencies setup failed."
+    echo "❌ Base dependencies setup failed."
     exit 1
 fi
 
