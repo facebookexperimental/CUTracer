@@ -1,6 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-from __future__ import annotations
-
 
 """
 Shared type definitions for CUTracer trace analysis.
@@ -9,6 +7,8 @@ Provides core types used across multiple analysis modules:
 - WarpKey: Unique warp identifier (frozen dataclass, hashable)
 - TraceRecord: Typed view of NDJSON trace record (TypedDict, runtime is dict)
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TypedDict, Union
@@ -77,6 +77,7 @@ class TraceRecord(TypedDict, total=False):
     block: list[int]
     cubin_path: str
     func_addr: str
+    sm_family: int  # SM architecture family (e.g. 90 = Hopper, 100 = Blackwell)
 
     # kernel_launch specific (kernel events file)
     kernel_launch_id: int

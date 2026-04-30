@@ -44,13 +44,66 @@ if [ "$SKIP_CONDA" = "1" ]; then
 elif [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
   echo "🐍 Activating conda environment..."
   source /opt/miniconda3/etc/profile.d/conda.sh
-  conda activate $CONDA_ENV
+  conda activate "$CONDA_ENV"
+
+  # Sanity check: make sure `python` and `pip` resolve to the activated env.
+  # `conda activate` typically returns 0 even when something goes subtly wrong
+  # (env missing, env name typo, PATH shadowing by another Python on the
+  # runner), so `set -e` alone won't catch the mismatch. Validate explicitly
+  # against $CONDA_PREFIX (set by conda activate) so we don't hard-code the
+  # miniconda install path here.
+  echo "Verifying active Python interpreter..."
+  echo "  CONDA_PREFIX:   ${CONDA_PREFIX:-<unset>}"
+  echo "  which python:   $(command -v python || echo 'not found')"
+  echo "  which pip:      $(command -v pip || echo 'not found')"
+
+  # Guard: if `conda activate` did not put a `python` on PATH, every
+  # subsequent `$(python -c ...)` would emit a noisy "python: command not
+  # found" with no useful context. Fail fast with a clear message.
+  if ! command -v python >/dev/null 2>&1; then
+    echo "❌ No 'python' executable found on PATH after"
+    echo "   'conda activate $CONDA_ENV'. CONDA_PREFIX=${CONDA_PREFIX:-<unset>}."
+    echo "   The conda activation did not produce a usable Python interpreter."
+    echo "   Aborting to avoid confusing pip/python mismatch failures."
+    exit 1
+  fi
+
+  ACTUAL_PYTHON=$(python -c 'import sys; print(sys.executable)')
+  echo "  sys.executable: $ACTUAL_PYTHON"
+  if [[ -z "${CONDA_PREFIX:-}" ]]; then
+    echo "❌ CONDA_PREFIX is not set — 'conda activate $CONDA_ENV' did not"
+    echo "   take effect. Aborting."
+    exit 1
+  fi
+  if [[ "$(basename "$CONDA_PREFIX")" != "$CONDA_ENV" ]]; then
+    echo "❌ Active conda env ($(basename "$CONDA_PREFIX")) does not match"
+    echo "   the requested env ($CONDA_ENV). Aborting."
+    exit 1
+  fi
+  if [[ "$ACTUAL_PYTHON" != "$CONDA_PREFIX"/* ]]; then
+    echo "❌ Python interpreter ($ACTUAL_PYTHON) is NOT inside the activated"
+    echo "   conda env (\$CONDA_PREFIX=$CONDA_PREFIX). Something earlier on"
+    echo "   PATH is shadowing the env's python. Aborting to avoid"
+    echo "   pip/python mismatch."
+    exit 1
+  fi
+
+  # Ensure pip is available inside the env. Older cached envs may have been
+  # created without pip; bootstrap via ensurepip if needed.
+  if ! python -m pip --version >/dev/null 2>&1; then
+    echo "⚠️ pip not found in env, bootstrapping via ensurepip..."
+    python -m ensurepip --upgrade || conda install -n "$CONDA_ENV" -y -c conda-forge pip
+  fi
+  python -m pip --version
+
   conda install -y -c conda-forge libstdcxx-ng=15.1.0
-  pip install pandas
+  # Use `python -m pip` (NOT bare `pip`) so installs always target the same
+  # interpreter we use for verification / running tests below.
+  python -m pip install pandas
 
   # Install cutracer Python package in editable mode (includes all dependencies)
   echo "📦 Installing cutracer Python package..."
-  pip install -e "$PROJECT_ROOT/python"
+  python -m pip install -e "$PROJECT_ROOT/python"
 else
   echo "⚠️ Conda activation script not found, skipping."
 fi
@@ -254,24 +307,37 @@ verify_mem_values() {
 
   # Check 4: Verify computation results (sin²(i) + cos²(i) = 1.0)
   # 1.0 in IEEE 754 double = [0, 1072693248] or near [4294967295, 1072693247] (precision error)
-    local result_ones=$($cat_cmd "$trace_file" | jq -c 'select(.sass | test("STG")) | .values[]? | select(.[1] == 1072693248 or .[1] == 1072693247)' 2>/dev/null | wc -l)
+  #
+  # Trace format: the first line is a kernel_metadata record carrying an
+  # `instructions` dict keyed by opcode_id (each value has a `sass` string).
+  # Subsequent mem_value_trace records reference `opcode_id` but do NOT carry
+  # `sass` themselves, so we must resolve STG via the metadata mapping.
+  local stg_opcodes
+  stg_opcodes=$($cat_cmd "$trace_file" | jq -nc '[inputs | select(.type == "kernel_metadata") | .instructions | to_entries[] | select(.value.sass | test("STG")) | .key | tonumber]')
+  if [ -z "$stg_opcodes" ] || [ "$stg_opcodes" = "[]" ]; then
+    echo "❌ FAILED: No STG instruction opcode_ids found in kernel_metadata"
+    return 1
+  fi
+
+  local result_ones
+  result_ones=$($cat_cmd "$trace_file" | jq -c --argjson stg "$stg_opcodes" 'select(.type == "mem_value_trace") | select(.opcode_id as $o | $stg | index($o)) | .values[]? | select(.[1] == 1072693248 or .[1] == 1072693247)' | wc -l)
 
   if [ "$result_ones" -lt 1 ]; then
-    echo "⚠️  WARNING: Expected some result values ≈ 1.0, found $result_ones"
-    echo "     This may indicate incorrect value capture. Checking STG values..."
-    $cat_cmd "$trace_file" | jq -c 'select(.sass | test("STG")) | .values[0]' 2>/dev/null | head -3
-  else
-    echo "  ✅ Found $result_ones values ≈ 1.0 (sin²+cos²=1 verified)"
+    echo "❌ FAILED: Expected some STG result values ≈ 1.0, found $result_ones"
+    echo "     This indicates incorrect value capture. Sample STG values:"
+    $cat_cmd "$trace_file" | jq -c --argjson stg "$stg_opcodes" 'select(.type == "mem_value_trace") | select(.opcode_id as $o | $stg | index($o)) | .values[0]' | head -3
+    return 1
   fi
+  echo "  ✅ Found $result_ones values ≈ 1.0 (sin²+cos²=1 verified)"
 
   # Check 5: Verify addrs field is also present (mem_value_trace should have both)
   local addrs_count=$($cat_cmd "$trace_file" | jq -c 'select(.addrs != null)' 2>/dev/null | wc -l)
 
   if [ "$addrs_count" -lt 1 ]; then
-    echo "⚠️  WARNING: No 'addrs' field found in trace (mem_value_trace should include addresses)"
-  else
-    echo "  ✅ Found $addrs_count lines with addrs (addresses also captured)"
+    echo "❌ FAILED: No 'addrs' field found in trace (mem_value_trace should include addresses)"
+    return 1
   fi
+  echo "  ✅ Found $addrs_count lines with addrs (addresses also captured)"
 
   echo "  ✅ Memory value verification passed!"
   return 0
@@ -970,6 +1036,114 @@ test_hang_test() {
     fi
   fi
 
+  # Verify text-mode warp status output prints inactive=Xs for LOOPING entries
+  # (regression guard: inactive_secs must be visible for non-BARRIER warps too).
+  if ! grep -q "LOOPING(inactive=" hang_output.log; then
+    echo "❌ Expected 'LOOPING(inactive=...' line missing from hang_output.log."
+    echo "     Recent WARP STATUS lines:"
+    grep -E "WARP STATUS|Warp[0-9]+\[" hang_output.log | tail -20
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+  echo "  ✅ LOOPING entries include inactive=Xs in text output."
+
+  cd "$PROJECT_ROOT"
+  return 0
+}
+
+# Function to verify NDJSON warp status output (append-mode, per-snapshot lines).
+# Exercises the trace_format != 0 branch and ensures multiple hang-detection ticks
+# produce one JSON object per line in <basename>_warp_status_summary.ndjson.
+test_hang_test_warp_status_ndjson() {
+  echo "🧪 Testing hang detection (NDJSON warp status output)..."
+  cd "$PROJECT_ROOT/tests/hang_test"
+
+  # Clean up old artifacts from previous runs to avoid stale-file false positives
+  rm -f *.log *.csv *.chrome_trace *_warp_status_summary.ndjson *_warp_status_summary.json
+
+  if [ ! -f "test_hang.py" ]; then
+    echo "❌ test_hang.py not found."
+    ls -la
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+
+  if ! timeout "$TIMEOUT" env \
+       CUTRACER_TRACE_FORMAT=2 \
+       CUDA_INJECTION64_PATH="$PROJECT_ROOT/lib/cutracer.so" \
+       CUTRACER_ANALYSIS=deadlock_detection \
+       KERNEL_FILTERS=add_kernel \
+       python "./test_hang.py" >hang_ndjson_output.log 2>&1; then
+    exit_code=$?
+    if [ "$exit_code" -eq 124 ]; then
+      echo "❌ Hang NDJSON test timed out (no detection within $TIMEOUT s)."
+      cat hang_ndjson_output.log
+      cd "$PROJECT_ROOT"
+      return 1
+    fi
+    if ! grep -q "Deadlock sustained" hang_ndjson_output.log; then
+      echo "❌ Hang NDJSON test failed without detection (exit $exit_code)."
+      cat hang_ndjson_output.log
+      cd "$PROJECT_ROOT"
+      return 1
+    fi
+  fi
+
+  # The legacy single-file JSON name must NOT exist anymore
+  if ls *_warp_status_summary.json >/dev/null 2>&1; then
+    echo "❌ Unexpected legacy *_warp_status_summary.json file found (should be NDJSON now):"
+    ls -la *_warp_status_summary.json
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+
+  ndjson_file=$(ls -1 *_warp_status_summary.ndjson 2>/dev/null | head -n 1)
+  if [ -z "$ndjson_file" ] || [ ! -f "$ndjson_file" ]; then
+    echo "❌ No *_warp_status_summary.ndjson file produced."
+    echo "     Listing current directory contents:"
+    ls -la
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+  echo "  ✅ Found NDJSON warp status file: $ndjson_file"
+
+  # Validate NDJSON contents:
+  # - every line parses as JSON
+  # - kernel_launch_id is consistent across lines
+  # - each warp entry has inactive_secs (consistency with text output)
+  # - at least one entry is LOOPING (the test kernel hangs in a loop)
+  if ! python - "$ndjson_file" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = [ln for ln in (raw.strip() for raw in f) if ln]
+assert lines, f"{path} is empty"
+records = []
+for i, ln in enumerate(lines):
+    try:
+        records.append(json.loads(ln))
+    except json.JSONDecodeError as e:
+        sys.exit(f"line {i+1} is not valid JSON: {e}")
+ids = {r.get("kernel_launch_id") for r in records}
+assert len(ids) == 1, f"kernel_launch_id not consistent across snapshots: {ids}"
+saw_looping = False
+for r in records:
+    for w in r.get("active_warps", []):
+        assert "inactive_secs" in w, f"warp entry missing inactive_secs: {w}"
+        if w.get("status") == "LOOPING":
+            saw_looping = True
+assert saw_looping, "expected at least one LOOPING warp entry across snapshots"
+print(f"validated {len(lines)} NDJSON snapshot(s) with consistent kernel_launch_id")
+PY
+  then
+    echo "❌ NDJSON content validation failed for $ndjson_file."
+    echo "     --- First 3 lines ---"
+    head -n 3 "$ndjson_file"
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+  echo "  ✅ NDJSON warp status content validated."
+
   cd "$PROJECT_ROOT"
   return 0
 }
@@ -1145,6 +1319,12 @@ run_all_tests() {
     failed_suites+=("hang-test")
   fi
 
+  if test_hang_test_warp_status_ndjson; then
+    passed_suites+=("hang-test-warp-status-ndjson")
+  else
+    failed_suites+=("hang-test-warp-status-ndjson")
+  fi
+
   if test_trace_formats; then
     passed_suites+=("trace-formats")
   else
@@ -1235,6 +1415,9 @@ case "$TEST_TYPE" in
   ;;
 "hang")
   test_hang_test
+  ;;
+"hang-ndjson")
+  test_hang_test_warp_status_ndjson
   ;;
 "python-module")
   test_python_module

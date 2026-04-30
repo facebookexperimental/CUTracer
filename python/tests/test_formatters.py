@@ -60,6 +60,7 @@ class TestGetDisplayFields(unittest.TestCase):
     def test_get_display_fields_default(self):
         """Test default returns all fields when none requested."""
         records = [{"warp": 0, "pc": "0x100", "sass": "NOP ;", "extra": "data"}]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records)
         # Default behavior now returns all fields from the record
         self.assertEqual(fields, ["warp", "pc", "sass", "extra"])
@@ -67,12 +68,14 @@ class TestGetDisplayFields(unittest.TestCase):
     def test_get_display_fields_requested(self):
         """Test user-specified fields are used."""
         records = [{"warp": 0, "pc": "0x100", "sass": "NOP ;"}]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, "warp,sass")
         self.assertEqual(fields, ["warp", "sass"])
 
     def test_get_display_fields_with_spaces(self):
         """Test fields with spaces are trimmed."""
         records = [{"warp": 0, "pc": "0x100"}]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, " warp , pc ")
         self.assertEqual(fields, ["warp", "pc"])
 
@@ -84,6 +87,7 @@ class TestGetDisplayFields(unittest.TestCase):
     def test_get_display_fields_missing_default(self):
         """Test default returns all record fields."""
         records = [{"warp": 0, "custom": "value"}]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records)
         # Default behavior now returns all fields from the record
         self.assertEqual(fields, ["warp", "custom"])
@@ -99,6 +103,7 @@ class TestGetDisplayFields(unittest.TestCase):
             {"warp": 0, "pc": "0x20", "regs": [], "uregs": [1, 2]},
             {"warp": 0, "pc": "0x30", "addrs": [100], "values": [200]},
         ]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, "all")
 
         # Should include fields from all records
@@ -115,6 +120,7 @@ class TestGetDisplayFields(unittest.TestCase):
             {"warp": 0, "pc": "0x0"},
             {"warp": 0, "pc": "0x20", "uregs": [1, 2]},
         ]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, "*")
 
         self.assertIn("uregs", fields)
@@ -126,6 +132,7 @@ class TestGetDisplayFields(unittest.TestCase):
             {"warp": 0, "pc": "0x0"},
             {"warp": 0, "pc": "0x20", "uregs": [1, 2]},
         ]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, "  all  ")
 
         self.assertIn("uregs", fields)
@@ -133,6 +140,7 @@ class TestGetDisplayFields(unittest.TestCase):
     def test_get_display_fields_all_single_record(self):
         """Test --fields all with single record returns that record's fields."""
         records = [{"warp": 0, "pc": "0x0", "sass": "NOP ;"}]
+        # pyrefly: ignore [bad-argument-type]
         fields = get_display_fields(records, "all")
 
         self.assertEqual(fields, ["warp", "pc", "sass"])
@@ -149,6 +157,7 @@ class TestFormatRecordsTable(unittest.TestCase):
     def test_format_table_with_header(self):
         """Test table with header row."""
         records = [{"warp": 0, "pc": "0x100"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_table(records, ["warp", "pc"], show_header=True)
         lines = result.split("\n")
         self.assertEqual(len(lines), 2)
@@ -160,6 +169,7 @@ class TestFormatRecordsTable(unittest.TestCase):
     def test_format_table_without_header(self):
         """Test table without header row."""
         records = [{"warp": 0, "pc": "0x100"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_table(records, ["warp", "pc"], show_header=False)
         lines = result.split("\n")
         self.assertEqual(len(lines), 1)
@@ -171,6 +181,7 @@ class TestFormatRecordsTable(unittest.TestCase):
             {"warp": 0, "sass": "NOP ;"},
             {"warp": 123, "sass": "EXIT ;"},
         ]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_table(records, ["warp", "sass"], show_header=True)
         lines = result.split("\n")
         # All lines should have consistent column positions
@@ -179,6 +190,7 @@ class TestFormatRecordsTable(unittest.TestCase):
     def test_format_table_missing_field(self):
         """Test missing field shows empty string."""
         records = [{"warp": 0}]  # no 'pc' field
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_table(records, ["warp", "pc"], show_header=False)
         self.assertIn("0", result)
 
@@ -194,6 +206,7 @@ class TestFormatRecordsJson(unittest.TestCase):
     def test_format_json_single_record(self):
         """Test single record formatting."""
         records = [{"warp": 0, "pc": "0x100", "extra": "ignored"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_json(records, ["warp", "pc"])
         parsed = json.loads(result)
         self.assertEqual(len(parsed), 1)
@@ -204,6 +217,7 @@ class TestFormatRecordsJson(unittest.TestCase):
     def test_format_json_multiple_records(self):
         """Test multiple records formatting."""
         records = [{"warp": 0}, {"warp": 1}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_json(records, ["warp"])
         parsed = json.loads(result)
         self.assertEqual(len(parsed), 2)
@@ -211,6 +225,7 @@ class TestFormatRecordsJson(unittest.TestCase):
     def test_format_json_filters_fields(self):
         """Test only requested fields are included."""
         records = [{"warp": 0, "pc": "0x100", "sass": "NOP ;"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_json(records, ["warp"])
         parsed = json.loads(result)
         self.assertEqual(list(parsed[0].keys()), ["warp"])
@@ -227,6 +242,7 @@ class TestFormatRecordsCsv(unittest.TestCase):
     def test_format_csv_with_header(self):
         """Test CSV with header row."""
         records = [{"warp": 0, "pc": "0x100"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_csv(records, ["warp", "pc"], show_header=True)
         lines = result.split("\n")
         self.assertEqual(len(lines), 2)
@@ -236,6 +252,7 @@ class TestFormatRecordsCsv(unittest.TestCase):
     def test_format_csv_without_header(self):
         """Test CSV without header row."""
         records = [{"warp": 0, "pc": "0x100"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_csv(records, ["warp", "pc"], show_header=False)
         lines = result.split("\n")
         self.assertEqual(len(lines), 1)
@@ -244,6 +261,7 @@ class TestFormatRecordsCsv(unittest.TestCase):
     def test_format_csv_escapes_comma(self):
         """Test CSV properly escapes values with commas."""
         records = [{"sass": "MOV R0, R1 ;"}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_csv(records, ["sass"], show_header=False)
         # CSV should quote the value containing comma
         self.assertIn('"', result)
@@ -251,6 +269,7 @@ class TestFormatRecordsCsv(unittest.TestCase):
     def test_format_csv_multiple_records(self):
         """Test CSV with multiple records."""
         records = [{"warp": 0}, {"warp": 1}, {"warp": 2}]
+        # pyrefly: ignore [bad-argument-type]
         result = format_records_csv(records, ["warp"], show_header=True)
         lines = result.split("\n")
         self.assertEqual(len(lines), 4)  # 1 header + 3 data

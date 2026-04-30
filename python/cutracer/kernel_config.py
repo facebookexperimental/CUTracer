@@ -44,6 +44,7 @@ class KernelConfig:
     shmem_static_bytes: int = 0
     nregs: int = 0
     cubin_path: str = ""  # Only set when dump_cubin is enabled
+    sm_family: int = 0  # SM architecture family (e.g., 90=Hopper, 100=Blackwell)
 
     @property
     def threads_per_cta(self) -> int:
@@ -106,4 +107,5 @@ def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
         shmem_static_bytes=record.get("shmem_static", 0),
         nregs=record.get("nregs", 0),
         cubin_path=record.get("cubin_path", ""),
+        sm_family=record.get("sm_family", 0),
     )

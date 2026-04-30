@@ -29,6 +29,7 @@ class TestParseFilterExpr(unittest.TestCase):
         self.assertTrue(pred({"warp": 24}))
         self.assertFalse(pred({"warp": 25}))
         # String "24" matches int 24 for backward compatibility
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertTrue(pred({"warp": "24"}))
 
     def test_parse_filter_string_value(self):
@@ -62,27 +63,37 @@ class TestParseFilterExpr(unittest.TestCase):
     def test_parse_filter_semicolon_separated_and(self):
         """Test semicolon-separated multi-condition filter (AND logic)."""
         pred = parse_filter_expr("warp=0;pc=100")
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertTrue(pred({"warp": 0, "pc": 100}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"warp": 0, "pc": 200}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"warp": 1, "pc": 100}))
 
     def test_parse_filter_semicolon_separated_hex(self):
         """Test semicolon-separated filter with hex values."""
         pred = parse_filter_expr("pc=0x64;warp=1")
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertTrue(pred({"pc": 100, "warp": 1}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"pc": 100, "warp": 2}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"pc": 200, "warp": 1}))
 
     def test_parse_filter_semicolon_separated_three_conditions(self):
         """Test three semicolon-separated conditions."""
         pred = parse_filter_expr("warp=0;pc=100;sass=MOV")
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertTrue(pred({"warp": 0, "pc": 100, "sass": "MOV"}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"warp": 0, "pc": 100, "sass": "ADD"}))
 
     def test_parse_filter_semicolon_separated_with_spaces(self):
         """Test semicolon-separated filter with spaces around semicolons."""
         pred = parse_filter_expr(" warp=0 ; pc=100 ")
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertTrue(pred({"warp": 0, "pc": 100}))
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertFalse(pred({"warp": 1, "pc": 100}))
 
     def test_parse_filter_semicolon_separated_invalid_part(self):
@@ -132,54 +143,68 @@ class TestSelectRecords(unittest.TestCase):
     def test_select_head_default(self):
         """Test default head selection (10 records)."""
         records = iter([{"i": i} for i in range(20)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records)
         self.assertEqual(len(result), 10)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[0]["i"], 0)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[9]["i"], 9)
 
     def test_select_head_custom(self):
         """Test custom head selection."""
         records = iter([{"i": i} for i in range(20)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, head=5)
         self.assertEqual(len(result), 5)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[4]["i"], 4)
 
     def test_select_tail(self):
         """Test tail selection."""
         records = iter([{"i": i} for i in range(20)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, tail=5)
         self.assertEqual(len(result), 5)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[0]["i"], 15)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[4]["i"], 19)
 
     def test_select_tail_overrides_head(self):
         """Test that tail overrides head when both specified."""
         records = iter([{"i": i} for i in range(20)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, head=3, tail=5)
         self.assertEqual(len(result), 5)
+        # pyrefly: ignore [bad-typed-dict-key]
         self.assertEqual(result[0]["i"], 15)
 
     def test_select_head_zero(self):
         """Test head=0 returns empty list."""
         records = iter([{"i": i} for i in range(10)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, head=0)
         self.assertEqual(result, [])
 
     def test_select_tail_zero(self):
         """Test tail=0 returns empty list."""
         records = iter([{"i": i} for i in range(10)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, tail=0)
         self.assertEqual(result, [])
 
     def test_select_head_more_than_available(self):
         """Test head larger than available records."""
         records = iter([{"i": i} for i in range(5)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, head=20)
         self.assertEqual(len(result), 5)
 
     def test_select_tail_more_than_available(self):
         """Test tail larger than available records."""
         records = iter([{"i": i} for i in range(5)])
+        # pyrefly: ignore [bad-argument-type]
         result = select_records(records, tail=20)
         self.assertEqual(len(result), 5)
 

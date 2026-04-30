@@ -23,12 +23,17 @@
 
 #include "common.h"
 #include "instr_category.h"
+#include "kernel_types.h"
 #include "nvbit.h"
 /* for channel */
 #include "utils/channel.hpp"
 
 // Forward declaration for TraceWriter (defined in trace_writer.h)
 class TraceWriter;
+
+// Length of the per-warp instruction ring buffer (WarpLoopState::history).
+// Defined here so warp_status.cu and analysis.cu share a single source of truth.
+#define PC_HISTORY_LEN 32
 
 /* Thread state enum */
 enum class RecvThreadState {
@@ -39,36 +44,6 @@ enum class RecvThreadState {
 };
 
 /* ===== Data Structures ===== */
-
-/* Structure to uniquely identify a warp */
-struct WarpKey {
-  int cta_id_x;
-  int cta_id_y;
-  int cta_id_z;
-  // global warp id
-  int warp_id;
-
-  // Operator for map comparison
-  bool operator<(const WarpKey& other) const {
-    if (cta_id_x != other.cta_id_x) return cta_id_x < other.cta_id_x;
-    if (cta_id_y != other.cta_id_y) return cta_id_y < other.cta_id_y;
-    if (cta_id_z != other.cta_id_z) return cta_id_z < other.cta_id_z;
-    return warp_id < other.warp_id;
-  }
-
-  // Hash function for unordered_map
-  struct Hash {
-    size_t operator()(const WarpKey& k) const {
-      return (size_t)k.cta_id_x ^ ((size_t)k.cta_id_y << 10) ^ ((size_t)k.cta_id_z << 20) ^ ((size_t)k.warp_id << 30);
-    }
-  };
-
-  // Equality operator for unordered_map
-  bool operator==(const WarpKey& other) const {
-    return cta_id_x == other.cta_id_x && cta_id_y == other.cta_id_y && cta_id_z == other.cta_id_z &&
-           warp_id == other.warp_id;
-  }
-};
 
 // Merged trace record containing mandatory reg trace and optional mem trace
 struct TraceRecordMerged {
@@ -152,18 +127,6 @@ struct RegionHistogram {
 };
 
 /**
- * @brief Grid and block dimensions for a kernel launch.
- */
-struct KernelDimensions {
-  unsigned int gridDimX;
-  unsigned int gridDimY;
-  unsigned int gridDimZ;
-  unsigned int blockDimX;
-  unsigned int blockDimY;
-  unsigned int blockDimZ;
-};
-
-/**
  * @brief Per-function static metadata collected once during instrumentation.
  *
  * Aggregates all per-function attributes that do not change across launches,
@@ -177,6 +140,7 @@ struct KernelFuncMetadata {
   uint64_t func_addr = 0;       // nvbit_get_func_addr()
   int nregs = 0;                // CU_FUNC_ATTRIBUTE_NUM_REGS
   int shmem_static_nbytes = 0;  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
+  uint32_t sm_family = 0;       // nvbit_get_sm_family()
 
   /// Serialize per-function static attributes to JSON.
   nlohmann::json to_json() const {
@@ -189,36 +153,11 @@ struct KernelFuncMetadata {
     j["func_addr"] = oss.str();
     j["nregs"] = nregs;
     j["shmem_static"] = shmem_static_nbytes;
+    j["sm_family"] = sm_family;
     if (!cubin_path.empty()) {
       j["cubin_path"] = cubin_path;
     }
     return j;
-  }
-};
-
-/**
- * @brief Tracks warp statistics for a single kernel launch.
- *
- * This structure maintains complete information about all warps in a kernel:
- * - Total number of warps (calculated from grid/block dimensions)
- * - All warps ever seen executing
- * - Warps that have finished execution
- * - Currently active warps (maintained elsewhere in CTXstate)
- */
-struct KernelWarpStats {
-  // Total number of warps in this kernel launch
-  uint32_t total_warps;
-
-  // Grid and block dimensions
-  KernelDimensions dimensions;
-
-  // All warps that have ever been observed executing
-  std::unordered_set<WarpKey, WarpKey::Hash> all_seen_warps;
-
-  // Warps that were once active but have finished
-  std::unordered_set<WarpKey, WarpKey::Hash> finished_warps;
-
-  KernelWarpStats() : total_warps(0) {
   }
 };
 

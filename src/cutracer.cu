@@ -568,6 +568,7 @@ static KernelFuncMetadata& get_or_create_kernel_func_metadata(CUfunction func, C
     it->second.func_addr = nvbit_get_func_addr(ctx, func);
     CUDA_SAFECALL(cuFuncGetAttribute(&it->second.nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, func));
     CUDA_SAFECALL(cuFuncGetAttribute(&it->second.shmem_static_nbytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func));
+    it->second.sm_family = nvbit_get_sm_family(ctx);
     ensure_kernel_checksum(it->second, ctx, func);
   }
   return it->second;

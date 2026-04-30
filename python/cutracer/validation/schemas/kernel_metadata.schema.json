@@ -81,6 +81,11 @@
       "minimum": 0,
       "description": "Dynamic shared memory size in bytes"
     },
+    "sm_family": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "SM architecture family from nvbit_get_sm_family() (e.g., 90 for Hopper, 100 for Blackwell)"
+    },
     "cpu_callstack": {
       "type": "array",
       "items": {
