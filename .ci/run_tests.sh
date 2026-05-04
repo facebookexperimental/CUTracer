@@ -1337,6 +1337,12 @@ run_all_tests() {
     failed_suites+=("mem-value-trace")
   fi
 
+  if test_proton; then
+    passed_suites+=("proton")
+  else
+    failed_suites+=("proton")
+  fi
+
   # Re-enable set -e
   set -e
 

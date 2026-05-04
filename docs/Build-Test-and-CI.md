@@ -69,9 +69,8 @@ changes do not trigger a full build/test cycle.
 | Job | Runner | What it does |
 |-----|--------|--------------|
 | `format-check` | `ubuntu-latest` | Installs `clang-format==21.1.2` and the Python dev extras, then runs `./format.sh check` |
-| `build-and-test` | `4-core-ubuntu-gpu-t4` | Builds CUTracer via `bash .ci/setup.sh` (CUDA 12.8) and runs the test suite via `bash .ci/run_tests.sh` (`TEST_TYPE=all`, `TIMEOUT=60`, `INSTALL_THIRD_PARTY=1`). Artifacts: vectoradd, py_add logs/traces |
-| `test-triton-source` | `4-core-ubuntu-gpu-t4` | Same setup, but installs Triton from source (via TritonParse's `install-triton.sh`) and runs `TEST_TYPE=proton`. Artifacts: proton_tests logs/SASS/CSV |
-| `check-status` | `ubuntu-latest` | Aggregates `build-and-test` + `test-triton-source` results and fails the workflow if either failed |
+| `build-and-test (default)` / `build-and-test (nightly)` | `4-core-ubuntu-gpu-t4` | Matrix job over `triton: [default, nightly]`. Both legs build CUTracer via `bash .ci/setup.sh` (CUDA 12.8) and run the full suite via `bash .ci/run_tests.sh` (`TEST_TYPE=all`, `TIMEOUT=60`, `INSTALL_THIRD_PARTY=1`). The `nightly` leg first replaces PyTorch nightly's bundled `pytorch-triton` with the upstream `Triton-Nightly` wheel from OpenAI's Azure DevOps feed; it carries `continue-on-error: true` and is treated as a canary, since upstream Triton main can ABI-drift from the commit PyTorch nightly pins. Artifacts (per leg): vectoradd, py_add, proton_tests logs/traces |
+| `check-status` | `ubuntu-latest` | Aggregates the matrix `build-and-test` results. Fails the workflow if the required `default` leg failed; the `nightly` leg is non-blocking (canary) |
 
 The `workflow_dispatch` trigger also exposes `test-type` (`all` /
 `build-only` / `vectoradd`) and `debug` (boolean) inputs for ad-hoc runs.
