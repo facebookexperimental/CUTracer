@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  h100-tritonbench-test:
+  h100-test:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: [linux.gcp.h100]
     env:
