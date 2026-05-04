@@ -26,7 +26,7 @@ Unique requirements:
 
 ```bash
 cd ~
-git clone git@github.com:facebookresearch/CUTracer.git
+git clone git@github.com:facebookexperimental/CUTracer.git
 cd CUTracer
 ```
 
@@ -268,7 +268,7 @@ This repository contains code under the MIT license (Meta) and the BSD-3-Clause 
 ## 📚 Documentation
 
 The full project documentation lives in [`docs/`](docs/) and is automatically
-synced to the [GitHub Wiki](https://github.com/facebookresearch/CUTracer/wiki)
+synced to the [GitHub Wiki](https://github.com/facebookexperimental/CUTracer/wiki)
 on every push to `main` via
 [`.github/workflows/sync-wiki.yml`](.github/workflows/sync-wiki.yml).
 

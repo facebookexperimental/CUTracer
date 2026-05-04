@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/facebookresearch/CUTracer/schemas/kernel_metadata.schema.json",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/kernel_metadata.schema.json",
   "title": "CUTracer Kernel Metadata Record",
   "description": "Schema for kernel_metadata - per-launch metadata written as the first line in NDJSON trace files",
   "type": "object",

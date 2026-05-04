@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/facebookresearch/CUTracer/schemas/delay_config.schema.json",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/delay_config.schema.json",
   "title": "CUTracer Delay Injection Configuration",
   "description": "Schema for delay injection configuration files used for deterministic replay of random delay instrumentation",
   "type": "object",

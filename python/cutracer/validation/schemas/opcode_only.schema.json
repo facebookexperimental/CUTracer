@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/facebookresearch/CUTracer/schemas/opcode_only.schema.json",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/opcode_only.schema.json",
   "title": "CUTracer Opcode Only Trace Record",
   "description": "Schema for MSG_TYPE_OPCODE_ONLY (type='opcode_only') - records only instruction execution without data",
   "type": "object",

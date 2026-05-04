@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/facebookresearch/CUTracer/schemas/reg_trace.schema.json",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/reg_trace.schema.json",
   "title": "CUTracer Register Trace Record",
   "description": "Schema for MSG_TYPE_REG_INFO (type='reg_trace') - records register values for each warp",
   "type": "object",

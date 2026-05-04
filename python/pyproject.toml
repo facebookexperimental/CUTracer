@@ -34,8 +34,8 @@ dev = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/facebookresearch/CUTracer"
-"Bug Tracker" = "https://github.com/facebookresearch/CUTracer/issues"
+"Homepage" = "https://github.com/facebookexperimental/CUTracer"
+"Bug Tracker" = "https://github.com/facebookexperimental/CUTracer/issues"
 
 [project.scripts]
 cutracer = "cutracer.cli:main"

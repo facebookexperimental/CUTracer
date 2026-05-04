@@ -136,7 +136,7 @@ jobs:
             > ⚠️ Due to GitHub token limitations, tests are triggered separately via `workflow_dispatch`
             > and will **NOT** appear in the PR Checks tab.
             >
-            > 👉 **[View test results on Actions page](https://github.com/facebookresearch/CUTracer/actions/workflows/test.yml)**
+            > 👉 **[View test results on Actions page](https://github.com/facebookexperimental/CUTracer/actions/workflows/test.yml)**
 
             Please verify test results on the Actions page before merging.
 
