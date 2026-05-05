@@ -60,8 +60,24 @@ jobs:
   build-and-test:
     runs-on: 4-core-ubuntu-gpu-t4
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        triton: [default, nightly]
+    # The `nightly` leg installs upstream Triton main (via OpenAI's
+    # Triton-Nightly feed), which can drift out of ABI sync with the
+    # `triton` commit pinned by the current PyTorch nightly. Treat it as
+    # a canary: surface the failure in the PR check list, but don't
+    # block merges on it. The `default` leg remains required.
+    continue-on-error: ${{ matrix.triton == 'nightly' }}
     env:
       DEBUG: "0"
+      CONDA_ENV: "cutracer-${{ matrix.triton }}"
+      # OpenAI-published Triton nightly wheel feed. The package is `triton`,
+      # built from triton-lang/triton main; versions look like
+      # 3.7.0+gitXXXXXXXX (commit-pinned, reproducible). Used only by the
+      # `nightly` matrix leg.
+      TRITON_NIGHTLY_INDEX_URL: "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/"
 
     steps:
       - name: Checkout repository
@@ -74,6 +90,18 @@ jobs:
           CUDA_VERSION: "12.8"
         run: |
           bash .ci/setup.sh
+      - name: Install Triton nightly
+        if: matrix.triton == 'nightly'
+        run: |
+          source /opt/miniconda3/etc/profile.d/conda.sh
+          conda activate "$CONDA_ENV"
+          # PyTorch nightly bundles `pytorch-triton`, which conflicts with
+          # the upstream `triton` package (both register `import triton`).
+          # Remove both before installing the nightly to avoid a
+          # half-overwritten install.
+          python -m pip uninstall -y pytorch-triton triton 2>/dev/null || true
+          python -m pip install -U --pre triton --extra-index-url "${TRITON_NIGHTLY_INDEX_URL}"
+          python -c "import triton; print(f'Triton: {triton.__version__} from {triton.__file__}')"
       - name: Run tests
         env:
           TEST_TYPE: ${{ github.event.inputs.test-type || 'all' }}
@@ -85,7 +113,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: test-artifacts-cuda12.8-debug0
+          name: test-artifacts-cuda12.8-debug0-${{ matrix.triton }}
           path: |
             tests/vectoradd/*.sass
             tests/vectoradd/*.log
@@ -98,52 +126,17 @@ jobs:
             tests/py_add/mode*_validation.log
             tests/py_add/mode*_run.log
             tests/py_add/mode1_decompressed.ndjson
-  test-triton-source:
-    runs-on: 4-core-ubuntu-gpu-t4
-    timeout-minutes: 60
-    env:
-      DEBUG: "0"
-      CONDA_ENV: "cutracer-triton-source"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Setup environment
-        env:
-          CUDA_VERSION: "12.8"
-        run: |
-          bash .ci/setup.sh
-      - name: Install Triton from source
-        run: |
-          wget https://raw.githubusercontent.com/meta-pytorch/tritonparse/refs/heads/main/.ci/install-triton.sh -O /tmp/install-triton.sh
-          bash /tmp/install-triton.sh
-      - name: Run tests
-        env:
-          TEST_TYPE: proton
-          TIMEOUT: 60
-          INSTALL_THIRD_PARTY: 1
-        run: |
-          bash .ci/run_tests.sh
-      - name: Upload test artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-artifacts-triton-cuda12.8-debug0
-          path: |
             tests/proton_tests/*.log
             tests/proton_tests/*.sass
             tests/proton_tests/*.csv
   check-status:
     runs-on: ubuntu-latest
-    needs: [build-and-test, test-triton-source]
+    needs: [build-and-test]
     if: always()
     steps:
       - name: Check test results
         run: |
-          if [ "${{ needs.build-and-test.result }}" = "success" ] && [ "${{ needs.test-triton-source.result }}" = "success" ]; then
+          if [ "${{ needs.build-and-test.result }}" = "success" ]; then
               echo "✅ All tests passed!"
           else
               echo "❌ Some tests failed!"
