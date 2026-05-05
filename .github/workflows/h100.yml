@@ -1,0 +1,26 @@
+name: CUTracer H100 tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  h100-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux-gcp-h100]
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 240
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
