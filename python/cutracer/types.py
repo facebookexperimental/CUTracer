@@ -11,7 +11,7 @@ Provides core types used across multiple analysis modules:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict, Union
+from typing import Any, TypedDict, Union
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,7 @@ class TraceRecord(TypedDict, total=False):
     # tma_trace specific
     desc_addr: str  # TMA descriptor address (hex string "0x...")
     desc_raw: list[Union[int, str]]  # Raw descriptor bytes (16 hex strings or ints)
+    tma_transfer_info: dict[str, Any]  # NVBit 1.8 TMA transfer info (src/dst)
 
     # kernel_metadata specific
     mangled_name: str
