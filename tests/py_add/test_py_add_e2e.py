@@ -20,6 +20,75 @@ Equivalent CLI usage::
     buck2 run fbcode//triton/tools/CUTracer:cutracer -- trace \\
         -i reg_trace,mem_trace -k triton_poi_fused --trace-format 0 \\
         -- python test_add.py
+
+Output Layout
+-------------
+Each ``_run_py_add()`` call writes its trace files to a freshly-allocated
+isolated subdirectory under ``<trace_dir>/<test_method>/``. Concretely::
+
+    <trace_dir>/                                # cutracer_py_add_<rand>
+    ├── test_kernel_filter_reg_trace/
+    │   └── run_001_fmt0/
+    │       └── kernel_*.log
+    ├── test_trace_format_mode0_text/
+    │   └── run_001_fmt0/
+    │       └── kernel_*triton_poi_fused*.log
+    ├── test_trace_format_mode1_ndjson_zstd/
+    │   └── run_001_fmt1/
+    │       └── kernel_*triton_poi_fused*.ndjson.zst
+    ├── test_trace_format_mode2_ndjson/
+    │   └── run_001_fmt2/
+    │       └── kernel_*triton_poi_fused*.ndjson
+    └── test_cross_format_consistency/
+        ├── run_001_mode0/
+        │   └── kernel_*triton_poi_fused*.log
+        └── run_002_mode2/
+            └── kernel_*triton_poi_fused*.ndjson
+
+This layout means:
+  - Tests don't pollute each other's output (each has its own subdir).
+  - Multiple subprocess invocations within one test (cross-format) get
+    independent inspectable directories — no inter-run cleaning, no
+    backup-file gymnastics.
+  - With TEST_KEEP_OUTPUT=1 the entire tree is preserved verbatim, so
+    every produced file remains attributable to a specific (test, run)
+    pair for post-mortem inspection.
+
+Environment Variables
+---------------------
+TEST_KEEP_OUTPUT=1
+    Skip the final rmtree in tearDownClass and print the preserved paths
+    plus a cleanup command to stderr. Useful for debugging test failures
+    or inspecting produced traces interactively.
+
+    CAVEAT: under ``buck2 test`` with remote-execution, the sandbox
+    container is wiped after the test ends regardless of this flag. To
+    actually keep files around, run the test locally with::
+
+        # Run all tests in this file
+        TEST_KEEP_OUTPUT=1 buck2 run \\
+            fbcode//triton/tools/CUTracer/tests/py_add:test_py_add_e2e
+
+        # Run a single test by regex (fb's PAR runner uses -r, NOT -k)
+        TEST_KEEP_OUTPUT=1 buck2 run \\
+            fbcode//triton/tools/CUTracer/tests/py_add:test_py_add_e2e -- \\
+            -r test_kernel_filter_reg_trace
+
+        # Run a single test by fully-qualified dotted path
+        TEST_KEEP_OUTPUT=1 buck2 run \\
+            fbcode//triton/tools/CUTracer/tests/py_add:test_py_add_e2e -- \\
+            triton.tools.CUTracer.tests.py_add.test_py_add_e2e.TestPyAddE2E.test_kernel_filter_reg_trace
+
+        # List discovered tests (also useful to learn the dotted path)
+        buck2 run \\
+            fbcode//triton/tools/CUTracer/tests/py_add:test_py_add_e2e -- \\
+            --list-tests
+
+    Note: fb's ``python_unittest_remote_gpu`` PAR runner uses ``-r REGEX``
+    for filtering (NOT ``-k`` like vanilla ``python -m unittest``). Bare
+    ``TestPyAddE2E.<method>`` is interpreted as a module name and fails;
+    use either the full ``triton.tools.CUTracer.tests.py_add.test_py_add_e2e.<...>``
+    dotted path or the ``-r`` regex.
 """
 
 import json
@@ -35,6 +104,8 @@ import pkg_resources
 import zstandard
 from cutracer.runner import _build_cutracer_env, resolve_cutracer_so
 
+KEEP_OUTPUT_ENV = "TEST_KEEP_OUTPUT"
+
 
 class TestPyAddE2E(unittest.TestCase):
     """E2E: CUTracer tracing of a PT2 compiled kernel (py_add)."""
@@ -46,8 +117,10 @@ class TestPyAddE2E(unittest.TestCase):
         os.environ.pop("CUDA_INJECTION64_PATH", None)
 
         cls.cutracer_so = resolve_cutracer_so()
+        cls.keep_output = bool(os.environ.get(KEEP_OUTPUT_ENV))
 
-        # Extract the test script from bundled resources
+        # Extract the bundled test script to a temp file so the subprocess
+        # can import it normally (resources can't be exec'd directly).
         script_content = pkg_resources.resource_string(
             "py_add_test_resources",
             "test_add.py",
@@ -60,7 +133,8 @@ class TestPyAddE2E(unittest.TestCase):
         tmp.close()
         cls.script_path = tmp.name
 
-        # Temp directory for CUTracer trace output
+        # Class-level temp roots. Per-test and per-run subdirectories are
+        # allocated lazily by setUp() / _allocate_run_dir().
         cls.trace_dir = tempfile.mkdtemp(prefix="cutracer_py_add_")
 
         # Shared Triton/Inductor cache directory for all subprocesses.
@@ -69,20 +143,59 @@ class TestPyAddE2E(unittest.TestCase):
         # cross-format consistency checks.
         cls.triton_cache_dir = tempfile.mkdtemp(prefix="triton_cache_")
 
+        if cls.keep_output:
+            print(
+                f"\n[{KEEP_OUTPUT_ENV}=1] Output will be preserved at:\n"
+                f"  trace root:   {cls.trace_dir}\n"
+                f"  triton cache: {cls.triton_cache_dir}\n"
+                f"  test script:  {cls.script_path}\n",
+                file=sys.stderr,
+                flush=True,
+            )
+
     @classmethod
     def tearDownClass(cls):
+        if getattr(cls, "keep_output", False):
+            print(
+                f"\n[{KEEP_OUTPUT_ENV}=1] Preserved (manual cleanup):\n"
+                f"  rm -rf {cls.trace_dir} {cls.triton_cache_dir}\n"
+                f"  rm -f {cls.script_path}\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
         if hasattr(cls, "script_path") and os.path.exists(cls.script_path):
             os.unlink(cls.script_path)
-        if hasattr(cls, "trace_dir") and os.path.exists(cls.trace_dir):
-            shutil.rmtree(cls.trace_dir, ignore_errors=True)
-        if hasattr(cls, "triton_cache_dir") and os.path.exists(cls.triton_cache_dir):
-            shutil.rmtree(cls.triton_cache_dir, ignore_errors=True)
+        for path in (
+            getattr(cls, "trace_dir", None),
+            getattr(cls, "triton_cache_dir", None),
+        ):
+            if path and os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
 
-    def _clean_trace_dir(self):
-        """Remove all trace files from the output directory."""
-        for f in Path(self.trace_dir).iterdir():
-            if f.is_file():
-                f.unlink()
+    def setUp(self):
+        # Per-test root for all run subdirectories. Test methods that call
+        # _run_py_add() multiple times (e.g. cross-format) get independent
+        # numbered subdirectories under here — no inter-run cleanup needed.
+        self._test_root = Path(self.trace_dir) / self._testMethodName
+        self._test_root.mkdir(parents=True, exist_ok=True)
+        self._run_counter = 0
+
+    def _allocate_run_dir(self, label: str = "") -> Path:
+        """Allocate a fresh isolated output directory for one subprocess run.
+
+        Each call returns a new ``run_<NNN>[_<label>]`` subdirectory under
+        ``self._test_root``. Label is sanitized for filesystem safety.
+        """
+        self._run_counter += 1
+        name = f"run_{self._run_counter:03d}"
+        if label:
+            safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in label)
+            name = f"{name}_{safe}"
+        run_dir = self._test_root / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
 
     def _run_py_add(
         self,
@@ -91,6 +204,7 @@ class TestPyAddE2E(unittest.TestCase):
         kernel_filter="triton_poi_fused",
         dump_cubin=False,
         extra_env=None,
+        run_label: str = "",
     ):
         """Run test_add.py as a subprocess with CUTracer instrumentation.
 
@@ -105,11 +219,17 @@ class TestPyAddE2E(unittest.TestCase):
             dump_cubin: If True, set CUTRACER_DUMP_CUBIN=1.
             extra_env: Additional env vars to override (applied after
                 _build_cutracer_env, so can override any CUTracer var).
+            run_label: Optional label appended to the allocated run-dir name.
+                Defaults to "fmt<N>" when trace_format is given.
 
         Returns:
-            subprocess.CompletedProcess with stdout/stderr captured.
+            (CompletedProcess, output_dir) tuple. The freshly-allocated run
+            directory is returned so callers can glob for produced files
+            without depending on shared state.
         """
-        self._clean_trace_dir()
+        if not run_label and trace_format is not None:
+            run_label = f"fmt{trace_format}"
+        run_dir = self._allocate_run_dir(label=run_label)
 
         env = _build_cutracer_env(
             cutracer_so=self.cutracer_so,
@@ -118,7 +238,7 @@ class TestPyAddE2E(unittest.TestCase):
             kernel_filters=kernel_filter,
             instr_categories=None,
             trace_format=str(trace_format) if trace_format is not None else None,
-            output_dir=self.trace_dir,
+            output_dir=str(run_dir),
             verbose=None,
             zstd_level=None,
             delay_ns=None,
@@ -138,7 +258,7 @@ class TestPyAddE2E(unittest.TestCase):
             text=True,
             timeout=300,
         )
-        return result
+        return result, run_dir
 
     # ------------------------------------------------------------------
     # Test: Kernel filter + reg_trace (mirrors test_py_add_with_kernel_filters)
@@ -146,7 +266,7 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_kernel_filter_reg_trace(self):
         """Kernel filter ensures only triton_poi_fused kernel is traced."""
-        result = self._run_py_add(trace_format=0, instrument="reg_trace")
+        result, run_dir = self._run_py_add(trace_format=0, instrument="reg_trace")
         self.assertEqual(
             result.returncode,
             0,
@@ -154,11 +274,11 @@ class TestPyAddE2E(unittest.TestCase):
         )
 
         # Verify kernel log files were generated
-        log_files = sorted(Path(self.trace_dir).glob("kernel_*.log"))
+        log_files = sorted(run_dir.glob("kernel_*.log"))
         self.assertGreater(
             len(log_files),
             0,
-            f"No kernel log files generated in {self.trace_dir}",
+            f"No kernel log files generated in {run_dir}",
         )
 
         # All generated logs must match the kernel filter
@@ -184,14 +304,16 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_trace_format_mode0_text(self):
         """Mode 0 (text) generates a valid .log trace file."""
-        result = self._run_py_add(trace_format=0, instrument="reg_trace,mem_trace")
+        result, run_dir = self._run_py_add(
+            trace_format=0, instrument="reg_trace,mem_trace"
+        )
         self.assertEqual(
             result.returncode,
             0,
             f"Mode 0 run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
         )
 
-        log_files = sorted(Path(self.trace_dir).glob("kernel_*triton_poi_fused*.log"))
+        log_files = sorted(run_dir.glob("kernel_*triton_poi_fused*.log"))
         self.assertGreater(len(log_files), 0, "No .log file generated for Mode 0")
 
         from cutracer.validation.text_validator import validate_text_trace
@@ -213,16 +335,16 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_trace_format_mode2_ndjson(self):
         """Mode 2 (NDJSON) generates a valid .ndjson trace file."""
-        result = self._run_py_add(trace_format=2, instrument="reg_trace,mem_trace")
+        result, run_dir = self._run_py_add(
+            trace_format=2, instrument="reg_trace,mem_trace"
+        )
         self.assertEqual(
             result.returncode,
             0,
             f"Mode 2 run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
         )
 
-        ndjson_files = sorted(
-            Path(self.trace_dir).glob("kernel_*triton_poi_fused*.ndjson")
-        )
+        ndjson_files = sorted(run_dir.glob("kernel_*triton_poi_fused*.ndjson"))
         self.assertGreater(len(ndjson_files), 0, "No .ndjson file generated for Mode 2")
 
         from cutracer.validation.json_validator import validate_json_trace
@@ -244,16 +366,16 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_trace_format_mode1_ndjson_zstd(self):
         """Mode 1 (NDJSON+Zstd) generates a valid .ndjson.zst file."""
-        result = self._run_py_add(trace_format=1, instrument="reg_trace,mem_trace")
+        result, run_dir = self._run_py_add(
+            trace_format=1, instrument="reg_trace,mem_trace"
+        )
         self.assertEqual(
             result.returncode,
             0,
             f"Mode 1 run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
         )
 
-        zst_files = sorted(
-            Path(self.trace_dir).glob("kernel_*triton_poi_fused*.ndjson.zst")
-        )
+        zst_files = sorted(run_dir.glob("kernel_*triton_poi_fused*.ndjson.zst"))
         self.assertGreater(
             len(zst_files), 0, "No .ndjson.zst file generated for Mode 1"
         )
@@ -292,7 +414,7 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_cubin_dump_enabled(self):
         """CUTRACER_DUMP_CUBIN=1 generates .cubin files in output dir."""
-        result = self._run_py_add(
+        result, run_dir = self._run_py_add(
             trace_format=0,
             instrument="reg_trace",
             dump_cubin=True,
@@ -303,11 +425,11 @@ class TestPyAddE2E(unittest.TestCase):
             f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
         )
 
-        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        cubin_files = sorted(run_dir.glob("kernel_*.cubin"))
         self.assertGreater(
             len(cubin_files),
             0,
-            f"No .cubin files generated in {self.trace_dir}",
+            f"No .cubin files generated in {run_dir}",
         )
 
         # Verify filename format: kernel_{hex_checksum}_{name}.cubin
@@ -332,7 +454,7 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_cubin_dump_disabled(self):
         """CUTRACER_DUMP_CUBIN=0 suppresses cubin file generation."""
-        result = self._run_py_add(
+        result, run_dir = self._run_py_add(
             trace_format=0,
             instrument="reg_trace",
             extra_env={"CUTRACER_DUMP_CUBIN": "0"},
@@ -343,7 +465,7 @@ class TestPyAddE2E(unittest.TestCase):
             f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
         )
 
-        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        cubin_files = sorted(run_dir.glob("kernel_*.cubin"))
         self.assertEqual(
             len(cubin_files),
             0,
@@ -357,7 +479,7 @@ class TestPyAddE2E(unittest.TestCase):
 
     def test_cubin_dump_default_with_instrumentation(self):
         """Cubin dump auto-enables when instrumentation is active (default)."""
-        result = self._run_py_add(
+        result, run_dir = self._run_py_add(
             trace_format=0,
             instrument="reg_trace",
         )
@@ -369,12 +491,12 @@ class TestPyAddE2E(unittest.TestCase):
 
         # Without explicit CUTRACER_DUMP_CUBIN, the C++ code defaults to
         # has_any_instrumentation_enabled(), which is true here.
-        cubin_files = sorted(Path(self.trace_dir).glob("kernel_*.cubin"))
+        cubin_files = sorted(run_dir.glob("kernel_*.cubin"))
         self.assertGreater(
             len(cubin_files),
             0,
             f"Cubin files should be auto-generated when instrumentation is "
-            f"enabled, but none found in {self.trace_dir}",
+            f"enabled, but none found in {run_dir}",
         )
 
     # ------------------------------------------------------------------
@@ -387,6 +509,10 @@ class TestPyAddE2E(unittest.TestCase):
         Runs a warmup subprocess first (without CUTracer) to populate the
         Triton compilation cache, ensuring both Mode 0 and Mode 2 runs
         use the exact same compiled kernel binary.
+
+        Each CUTracer run goes to its own subdirectory, so the Mode 0
+        text file naturally persists while Mode 2 runs — no backup
+        tempfile dance needed.
         """
         # --- Warmup: populate Triton/Inductor cache without CUTracer ---
         # The first torch.compile call triggers Triton compilation + autotuner,
@@ -409,62 +535,50 @@ class TestPyAddE2E(unittest.TestCase):
             f"Warmup failed.\nSTDOUT: {warmup.stdout}\nSTDERR: {warmup.stderr}",
         )
 
-        # --- Run Mode 0 (text) ---
-        result_m0 = self._run_py_add(trace_format=0, instrument="reg_trace,mem_trace")
+        # --- Run Mode 0 (text) — output isolated in its own subdir ---
+        result_m0, mode0_dir = self._run_py_add(
+            trace_format=0, instrument="reg_trace,mem_trace", run_label="mode0"
+        )
         self.assertEqual(
             result_m0.returncode,
             0,
             f"Mode 0 failed.\nSTDOUT: {result_m0.stdout}\nSTDERR: {result_m0.stderr}",
         )
-        log_files = sorted(Path(self.trace_dir).glob("kernel_*triton_poi_fused*.log"))
+        log_files = sorted(mode0_dir.glob("kernel_*triton_poi_fused*.log"))
         self.assertGreater(len(log_files), 0, "No .log file for cross-format test")
 
-        # Save the text file OUTSIDE trace_dir before running Mode 2,
-        # because _run_py_add() cleans trace_dir at the start of each run.
-        text_backup = tempfile.NamedTemporaryFile(
-            suffix=".log", prefix="mode0_backup_", delete=False
+        # --- Run Mode 2 (NDJSON) — separate subdir, no backup needed ---
+        result_m2, mode2_dir = self._run_py_add(
+            trace_format=2, instrument="reg_trace,mem_trace", run_label="mode2"
         )
-        text_backup.close()
-        shutil.copy2(log_files[0], text_backup.name)
+        self.assertEqual(
+            result_m2.returncode,
+            0,
+            f"Mode 2 failed.\nSTDOUT: {result_m2.stdout}\nSTDERR: {result_m2.stderr}",
+        )
+        ndjson_files = sorted(mode2_dir.glob("kernel_*triton_poi_fused*.ndjson"))
+        self.assertGreater(
+            len(ndjson_files), 0, "No .ndjson file for cross-format test"
+        )
 
-        try:
-            # --- Run Mode 2 (NDJSON) ---
-            result_m2 = self._run_py_add(
-                trace_format=2, instrument="reg_trace,mem_trace"
-            )
-            self.assertEqual(
-                result_m2.returncode,
-                0,
-                f"Mode 2 failed.\nSTDOUT: {result_m2.stdout}\nSTDERR: {result_m2.stderr}",
-            )
-            ndjson_files = sorted(
-                Path(self.trace_dir).glob("kernel_*triton_poi_fused*.ndjson")
-            )
-            self.assertGreater(
-                len(ndjson_files), 0, "No .ndjson file for cross-format test"
-            )
-            json_file = ndjson_files[0]
+        # --- Cross-format comparison: both files persist in their own dirs ---
+        from cutracer.validation.consistency import compare_trace_formats
 
-            # --- Cross-format comparison using cutracer validation API ---
-            from cutracer.validation.consistency import compare_trace_formats
-
-            comparison = compare_trace_formats(Path(text_backup.name), json_file)
-            self.assertTrue(
-                comparison["consistent"],
-                f"Cross-format inconsistency detected:\n"
-                f"  Text records: {comparison['text_records']}\n"
-                f"  JSON records: {comparison['json_records']}\n"
-                f"  Differences: {comparison['differences']}",
-            )
-            self.assertGreater(
-                comparison["text_records"],
-                0,
-                "Cross-format test: text format has zero records",
-            )
-            self.assertGreater(
-                comparison["json_records"],
-                0,
-                "Cross-format test: JSON format has zero records",
-            )
-        finally:
-            os.unlink(text_backup.name)
+        comparison = compare_trace_formats(log_files[0], ndjson_files[0])
+        self.assertTrue(
+            comparison["consistent"],
+            f"Cross-format inconsistency detected:\n"
+            f"  Text records: {comparison['text_records']}\n"
+            f"  JSON records: {comparison['json_records']}\n"
+            f"  Differences: {comparison['differences']}",
+        )
+        self.assertGreater(
+            comparison["text_records"],
+            0,
+            "Cross-format test: text format has zero records",
+        )
+        self.assertGreater(
+            comparison["json_records"],
+            0,
+            "Cross-format test: JSON format has zero records",
+        )
