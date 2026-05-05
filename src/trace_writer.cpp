@@ -485,6 +485,38 @@ static void serialize_tma_transfer_info(nlohmann::json& j, const TMATransferInfo
   j["src_memspace"] = enum_str(InstrType::MemorySpaceStr, static_cast<int>(info.src_memspace));
   j["dst_memspace"] = enum_str(InstrType::MemorySpaceStr, static_cast<int>(info.dst_memspace));
 
+  // Shared-memory destination addresses (UTMALDG: global → shared)
+  if (info.dst_memspace == InstrType::MemorySpace::SHARED ||
+      info.dst_memspace == InstrType::MemorySpace::DISTRIBUTED_SHARED) {
+    json dst;
+    dst["data_address"] = info.dst.shared.data_address;
+    dst["data_address_offset"] = info.dst.shared.data_address_offset;
+    dst["data_address_cluster_cta_id"] = info.dst.shared.data_address_cluster_cta_id;
+    dst["is_mbar_valid"] = info.dst.shared.is_mbar_valid;
+    if (info.dst.shared.is_mbar_valid) {
+      dst["mbar_address"] = info.dst.shared.mbar_address;
+      dst["mbar_address_offset"] = info.dst.shared.mbar_address_offset;
+      dst["mbar_address_cluster_cta_id"] = info.dst.shared.mbar_address_cluster_cta_id;
+    }
+    j["dst"] = std::move(dst);
+  }
+
+  // Shared-memory source addresses (UTMASTG: shared → global)
+  if (info.src_memspace == InstrType::MemorySpace::SHARED ||
+      info.src_memspace == InstrType::MemorySpace::DISTRIBUTED_SHARED) {
+    json src;
+    src["data_address"] = info.src.shared.data_address;
+    src["data_address_offset"] = info.src.shared.data_address_offset;
+    src["data_address_cluster_cta_id"] = info.src.shared.data_address_cluster_cta_id;
+    src["is_mbar_valid"] = info.src.shared.is_mbar_valid;
+    if (info.src.shared.is_mbar_valid) {
+      src["mbar_address"] = info.src.shared.mbar_address;
+      src["mbar_address_offset"] = info.src.shared.mbar_address_offset;
+      src["mbar_address_cluster_cta_id"] = info.src.shared.mbar_address_cluster_cta_id;
+    }
+    j["src"] = std::move(src);
+  }
+
   if (!info.is_tensor) {
     return;
   }
