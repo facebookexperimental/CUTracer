@@ -269,10 +269,9 @@ jobs:
           # equivalent on the H100 image.
           (strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 2>/dev/null | grep -E '^GLIBCXX_3\.4\.[0-9]+$' | sort -V | tail -5 || true)
 
-      # NEW v2 — actually exercise apt. Install zstd (~200KB, useful, harmless).
-      # If this works, the real workflow can install zstd + libzstd-dev (and
-      # potentially cuda-toolkit-13-0) without needing scripts/install_cuda.sh.
-      - name: Test sudo apt install (zstd as guinea pig)
+      # v2 — exercise sudo apt. Install zstd (~200KB) as a smoke test that
+      # confirms passwordless sudo + Ubuntu apt repos work.
+      - name: Test sudo apt install (zstd smoke test)
         run: |
           set +e
           echo "=== sudo -n test (passwordless?) ==="
@@ -286,16 +285,94 @@ jobs:
           sudo apt-get install -y zstd libzstd-dev 2>&1 | tail -15
           echo "  exit=$?"
           echo
-          echo "=== verify install ==="
+          echo "=== verify zstd ==="
           (command -v zstd && zstd --version) || echo "::warning::zstd CLI still missing after apt install"
           dpkg -l zstd libzstd-dev 2>/dev/null | tail -3 || true
+
+      # v3 — End-to-end test of apt-installing CUDA toolkit 13.0 on the H100
+      # runner, since this is the path the real workflow will use:
+      #   1. Add NVIDIA CUDA apt repo (cuda-keyring deb adds the GPG key and
+      #      writes /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list).
+      #   2. apt-get update to pick up the new index.
+      #   3. apt-get install cuda-toolkit-13-0.
+      #   4. Verify nvcc on /usr/local/cuda-13.0/bin and works for sm_90.
+      # We measure each phase with `date +%s` so we know the wall-time budget
+      # this adds to every job (no caching across runs - container is
+      # ephemeral k8s pod). This decides whether to keep apt or fall back to
+      # CUTracer's scripts/install_cuda.sh runfile path.
+      - name: Test apt-install cuda-toolkit-13-0 (timed end-to-end)
+        run: |
+          set +e
+          OVERALL_START=$(date +%s)
+          DF_BEFORE=$(df -BM --output=avail / | tail -1 | tr -d 'M ')
+
+          echo "=== [1/4] Download cuda-keyring deb ==="
+          T0=$(date +%s)
+          curl -fsSL -o /tmp/cuda-keyring.deb \
+              https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          KEYRING_DL=$?
+          echo "  curl exit=$KEYRING_DL  size=$(stat -c%s /tmp/cuda-keyring.deb 2>/dev/null || echo '?')"
+          T1=$(date +%s); echo "  elapsed: $((T1-T0))s"
+          [ $KEYRING_DL -ne 0 ] && { echo "::error::cuda-keyring download failed"; exit 0; }
+
           echo
-          echo "=== (probe only) check cuda-toolkit-13-0 availability via apt ==="
-          # --simulate / -s does NOT install, only resolves. Tells us if the
-          # nvidia cuda repo is wired up so the real workflow could
-          # 'apt-get install -y cuda-toolkit-13-0' instead of the runfile.
-          apt-cache policy cuda-toolkit-13-0 2>/dev/null | head -10 || echo "(no apt-cache info for cuda-toolkit-13-0)"
-          apt-get install --simulate -y cuda-toolkit-13-0 2>&1 | head -20 || true
+          echo "=== [2/4] Install cuda-keyring + apt-get update ==="
+          T0=$(date +%s)
+          sudo dpkg -i /tmp/cuda-keyring.deb 2>&1 | tail -5
+          ls /etc/apt/sources.list.d/ | grep -i cuda || echo "::warning::no cuda repo file appeared"
+          sudo apt-get update -y 2>&1 | tail -10
+          UPDATE_RC=$?
+          T1=$(date +%s); echo "  elapsed: $((T1-T0))s  apt-get-update-exit=$UPDATE_RC"
+
+          echo
+          echo "=== [2.5/4] Confirm cuda-toolkit-13-0 now visible ==="
+          apt-cache policy cuda-toolkit-13-0 2>&1 | head -10
+
+          echo
+          echo "=== [3/4] apt-get install cuda-toolkit-13-0 (the big one) ==="
+          T0=$(date +%s)
+          # DEBIAN_FRONTEND noninteractive avoids any tzdata / accept-license prompts.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cuda-toolkit-13-0 2>&1 | tail -30
+          INSTALL_RC=$?
+          T1=$(date +%s); INSTALL_ELAPSED=$((T1-T0))
+          echo "  elapsed: ${INSTALL_ELAPSED}s  apt-get-install-exit=$INSTALL_RC"
+
+          echo
+          echo "=== [4/4] Verify nvcc + sm_90 sanity ==="
+          ls -d /usr/local/cuda* 2>/dev/null
+          NVCC_PATH=/usr/local/cuda-13.0/bin/nvcc
+          if [ -x "$NVCC_PATH" ]; then
+              "$NVCC_PATH" --version
+              echo
+              # Trivial sm_90 build: pipe a one-liner kernel through nvcc to PTX
+              # to confirm the toolchain works end-to-end for H100. No actual
+              # GPU launch — just code generation.
+              echo '__global__ void noop() {}' > /tmp/noop.cu
+              "$NVCC_PATH" -arch=sm_90 -ptx /tmp/noop.cu -o /tmp/noop.ptx 2>&1
+              echo "  nvcc -arch=sm_90 -ptx exit=$?"
+              ls -l /tmp/noop.ptx 2>/dev/null
+              # Also exercise ptxas on the result
+              PTXAS=/usr/local/cuda-13.0/bin/ptxas
+              if [ -x "$PTXAS" ]; then
+                  "$PTXAS" -arch=sm_90 /tmp/noop.ptx -o /tmp/noop.cubin 2>&1
+                  echo "  ptxas -arch=sm_90 exit=$?"
+                  ls -l /tmp/noop.cubin 2>/dev/null
+              fi
+          else
+              echo "::warning::$NVCC_PATH not present after install"
+          fi
+
+          DF_AFTER=$(df -BM --output=avail / | tail -1 | tr -d 'M ')
+          OVERALL_END=$(date +%s)
+          echo
+          echo "::group::CUDA APT INSTALL TIMING"
+          echo "  total wall time:    $((OVERALL_END - OVERALL_START))s"
+          echo "    keyring download: see [1/4]"
+          echo "    apt-get update:   see [2/4]"
+          echo "    cuda-toolkit-13-0 install: ${INSTALL_ELAPSED}s"
+          echo "  disk used (root /):  $((DF_BEFORE - DF_AFTER)) MB"
+          echo "  /usr/local/cuda-13.0 size: $(du -sh /usr/local/cuda-13.0 2>/dev/null | cut -f1)"
+          echo "::endgroup::"
 
       - name: Inspect repo build prerequisites
         run: |
