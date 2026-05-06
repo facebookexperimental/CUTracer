@@ -1,161 +1,132 @@
-name: CI Build and Test (H100, Triton nightly - probe)
+name: CI Build and Test (H100, Triton nightly)
 
-# Probe-only first cut for the triton-main uv venv on the linux-gcp-h100
-# runner. Companion to test-h100.yml (which uses meta-triton venv and is
-# already green). The runner ships /workspace/uv_venvs/triton-main but we
-# never confirmed what's actually inside it — particularly whether it
-# carries an upstream Triton install (e.g. 3.7.0+gitXXX) and a matching
-# cu130 PyTorch, or just an empty Python.
+# Companion to test-h100.yml — same H100 runner, same cu130 PyTorch, same
+# .ci/setup-h100.sh, same .ci/run_tests.sh + SKIP_CONDA=1. Only difference:
+# CONDA_ENV=triton-main instead of meta-triton, which switches the active
+# uv venv from FB Triton (3.6.0+fb.beta) to upstream Triton main snapshot
+# (3.7.0+gitcd8e4acc, pinned by the runner image).
 #
-# /workspace/setup_instance.sh has dedicated branches for CONDA_ENV=
-# triton-main vs meta-triton (sets TRITONBENCH_TRITON_REPO=triton-lang/
-# triton, TRITONBENCH_TRITON_INSTALL_DIR=/workspace/triton-main, etc.),
-# so the runner author clearly intended this venv as the upstream-Triton
-# companion. This probe verifies that intent.
+# Probed 2026-05-06: triton-main venv ships PyTorch 2.13.0.dev+cu130 (same
+# build as meta-triton), Triton editable from /workspace/triton-main, all
+# nvidia-cu13 runtime libs already installed. Setup-h100.sh's 75s
+# cuda-toolkit-13-0 install is still required (no nvcc on the runner).
 #
-# Once green and the meta-triton vs triton-main env diff is known, the
-# follow-up PR turns this file into the real build/test workflow with
-# CONDA_ENV=triton-main (mirroring the same evolution test-h100.yml went
-# through).
+# Triggers narrow during stabilization: workflow_dispatch + pushes that
+# touch this file or the shared CI/code paths. Once green and triton-main
+# proves stable as a canary, broaden to push branches main/develop and
+# pull_request, mirroring test-h100.yml.
 
 on:
   workflow_dispatch:
+    inputs:
+      test-type:
+        description: "Type of tests to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "build-only"
+          - "vectoradd"
+      debug:
+        description: "Enable debug build"
+        required: true
+        default: false
+        type: boolean
   push:
     paths:
       - ".github/workflows/test-h100-triton-nightly.yml"
+      - ".ci/setup-h100.sh"
+      - ".ci/run_tests.sh"
+      - "Makefile"
+      - "src/**"
+      - "include/**"
+      - "python/**"
+      - "tests/**"
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  probe-h100-triton-nightly:
+  build-and-test-h100-triton-nightly:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: [linux-gcp-h100]
-    timeout-minutes: 15
+    timeout-minutes: 60
     env:
-      CONDA_ENV: triton-main      # ← key difference vs test-h100.yml
+      # Switch the runner-provided uv venv from meta-triton (FB Triton fork)
+      # to triton-main (upstream Triton main, snapshot pinned by SETUP_SCRIPT).
+      CONDA_ENV: triton-main
       SETUP_SCRIPT: /workspace/setup_instance.sh
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-        # No submodules: this probe doesn't build anything.
+        with:
+          submodules: recursive
 
-      - name: Inspect /workspace/triton-main and venv layout
+      - name: Tune Nvidia GPU
         run: |
-          echo "=== /workspace/triton-main (source dir) ==="
-          ls -la /workspace/triton-main 2>/dev/null | head -20 || echo "(missing)"
-          echo
-          echo "=== /workspace/uv_venvs/triton-main exists? ==="
-          ls -ld /workspace/uv_venvs/triton-main 2>/dev/null || echo "(missing)"
-          echo
-          echo "=== nvidia/ subdirs in triton-main venv (cu13 etc.) ==="
-          ls -1 /workspace/uv_venvs/triton-main/lib/python3.12/site-packages/nvidia 2>/dev/null \
-              || echo "(no nvidia/ subdir — cu130 PyTorch may be missing here)"
+          sudo nvidia-smi -pm 1 || echo "::warning::sudo nvidia-smi -pm failed"
+          sudo ldconfig || echo "::warning::sudo ldconfig failed"
+          nvidia-smi
 
-      - name: Source SETUP_SCRIPT (CONDA_ENV=triton-main) + dump env diff
-        # Same pattern as the meta-triton probe — capture env before/after
-        # so we can see exactly what activating the triton-main venv injects.
+      - name: Activate uv venv (source SETUP_SCRIPT, persist env)
         run: |
-          set +e
-          echo "=== ENV BEFORE ==="
-          env | grep -E '^(PATH|VIRTUAL_ENV|LD_LIBRARY_PATH|TRITON|TRITONBENCH|PYTHONPATH)=' | sort
-          echo
-          echo "=== sourcing $SETUP_SCRIPT with CONDA_ENV=$CONDA_ENV ==="
-          . "$SETUP_SCRIPT" || echo "::warning::SETUP_SCRIPT exited non-zero"
-          echo
-          echo "=== ENV AFTER ==="
-          env | grep -E '^(PATH|VIRTUAL_ENV|LD_LIBRARY_PATH|TRITON|TRITONBENCH|PYTHONPATH)=' | sort
-
-      - name: Inspect triton-main uv venv (Python / PyTorch / Triton)
-        # The whole point of this probe — find out what's actually pinned
-        # inside triton-main: which Triton version (commit hash if local),
-        # whether PyTorch is cu130 like meta-triton, what other packages
-        # ship.
-        run: |
-          set +e
           . "$SETUP_SCRIPT"
+          {
+            echo "PATH=$PATH"
+            echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "TRITONBENCH_PYTORCH_REPO_PATH=$TRITONBENCH_PYTORCH_REPO_PATH"
+          } >> "$GITHUB_ENV"
+          echo "Active venv: $VIRTUAL_ENV"
 
-          echo "=== which python / pip / uv ==="
-          command -v python
-          (command -v pip || echo "(pip not in venv — use uv pip)")
-          command -v uv && uv --version
-          python -V
-          echo
-          echo "=== VIRTUAL_ENV ==="
-          echo "$VIRTUAL_ENV"
-          echo
-
-          echo "=== PyTorch ==="
-          python - <<'PY' || echo "::warning::torch import failed"
-          import torch
-          print("torch          :", torch.__version__)
-          print("torch.version.cuda:", torch.version.cuda)
-          print("cuda available :", torch.cuda.is_available())
-          if torch.cuda.is_available():
-              for i in range(torch.cuda.device_count()):
-                  p = torch.cuda.get_device_properties(i)
-                  print(f"  [{i}] {p.name} sm_{p.major}{p.minor}")
-          PY
-          echo
-
-          echo "=== Triton (the key question) ==="
-          python - <<'PY' || echo "::warning::triton import failed — triton-main venv is empty"
-          import triton, os
-          print("triton             :", triton.__version__)
-          print("triton path        :", triton.__file__)
-          # If editable from /workspace/triton-main, probe git head there.
-          tp = os.path.dirname(os.path.dirname(triton.__file__))
-          print("triton package dir :", tp)
-          PY
-          echo
-          echo "=== git HEAD of /workspace/triton-main ==="
-          (cd /workspace/triton-main && git rev-parse HEAD 2>/dev/null && git log -1 --oneline 2>/dev/null) \
-              || echo "(not a git repo or missing)"
-          echo
-
-          echo "=== pip / uv pip list (Triton-related) ==="
-          # uv pip list works even when pip isn't bundled into the venv
-          uv pip list 2>/dev/null | grep -iE '^(torch|triton|pytorch-triton|nvidia-)' \
-              || echo "(uv pip list returned nothing or no matches)"
-
-      - name: Compare to meta-triton venv (cross-reference)
-        # Quick side-by-side so we can see in one place whether the two
-        # venvs have the same PyTorch (cu130) and how their Triton differs.
-        # Doesn't activate meta-triton — just runs its python directly.
+      - name: Verify Triton (which version are we actually testing?)
+        # Cheap sanity check before paying for cuda-toolkit-13-0. If
+        # triton-main venv ever loses upstream Triton or starts pointing
+        # somewhere else, fail loud here before wasting 75s on apt.
         run: |
-          set +e
-          META_PY=/workspace/uv_venvs/meta-triton/bin/python
-          if [ -x "$META_PY" ]; then
-              echo "=== meta-triton venv versions (for comparison) ==="
-              "$META_PY" - <<'PY'
-          import torch, triton
-          print("torch  :", torch.__version__)
-          print("triton :", triton.__version__, "from", triton.__file__)
+          python - <<'PY'
+          import sys, triton, torch
+          print(f"python : {sys.version.split()[0]}")
+          print(f"torch  : {torch.__version__} (cuda={torch.version.cuda})")
+          print(f"triton : {triton.__version__}")
+          print(f"  path : {triton.__file__}")
+          assert "fb" not in triton.__version__, (
+              f"expected upstream Triton, got FB fork: {triton.__version__}"
+          )
           PY
-          else
-              echo "(meta-triton python missing at $META_PY)"
-          fi
 
-      - name: Summary
-        run: |
-          set +e
-          . "$SETUP_SCRIPT"
+      - name: Setup H100 environment (apt + CUDA + cutracer pip)
+        run: bash .ci/setup-h100.sh
 
-          PY_V=$(python -V 2>&1 | awk '{print $2}')
-          TORCH_V=$(python -c 'import torch;print(torch.__version__)' 2>/dev/null)
-          TORCH_CUDA=$(python -c 'import torch;print(torch.version.cuda)' 2>/dev/null)
-          TRITON_V=$(python -c 'import triton;print(triton.__version__)' 2>/dev/null)
-          TRITON_PATH=$(python -c 'import triton;print(triton.__file__)' 2>/dev/null)
-          TRITON_GIT=$(cd /workspace/triton-main 2>/dev/null && git rev-parse --short HEAD 2>/dev/null)
+      - name: Run tests
+        env:
+          TEST_TYPE: ${{ github.event.inputs.test-type || 'all' }}
+          TIMEOUT: 60
+          INSTALL_THIRD_PARTY: 1
+          SKIP_CONDA: 1
+          DEBUG: ${{ github.event.inputs.debug == 'true' && '1' || '0' }}
+        run: bash .ci/run_tests.sh
 
-          echo "::group::H100 TRITON-MAIN PROBE SUMMARY"
-          printf "  CONDA_ENV (uv venv): %s\n" "$CONDA_ENV"
-          printf "  VIRTUAL_ENV:         %s\n" "$VIRTUAL_ENV"
-          printf "  Python:              %s\n" "${PY_V:-?}"
-          printf "  PyTorch:             %s (cuda=%s)\n" "${TORCH_V:-?}" "${TORCH_CUDA:-?}"
-          printf "  Triton:              %s\n" "${TRITON_V:-import-failed}"
-          printf "  Triton path:         %s\n" "${TRITON_PATH:-?}"
-          printf "  /workspace/triton-main HEAD: %s\n" "${TRITON_GIT:-not-a-repo}"
-          echo "::endgroup::"
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-h100-cuda13.0-triton-nightly
+          path: |
+            tests/vectoradd/*.sass
+            tests/vectoradd/*.log
+            tests/vectoradd/*.ndjson
+            tests/vectoradd/*.ndjson.zstd
+            tests/py_add/*.log
+            tests/py_add/*.sass
+            tests/py_add/*.ndjson
+            tests/py_add/*.ndjson.zstd
+            tests/py_add/mode*_validation.log
+            tests/py_add/mode*_run.log
+            tests/py_add/mode1_decompressed.ndjson
+            tests/proton_tests/*.log
+            tests/proton_tests/*.sass
+            tests/proton_tests/*.csv
