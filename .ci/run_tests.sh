@@ -14,6 +14,7 @@ CONDA_ENV=${CONDA_ENV:-"cutracer"}
 SKIP_BUILD=${SKIP_BUILD:-"0"}                   # Set to 1 to skip ALL builds
 SKIP_CUTRACER_BUILD=${SKIP_CUTRACER_BUILD:-"0"} # Set to 1 to skip CUTracer build only
 SKIP_CONDA=${SKIP_CONDA:-"0"}                   # Set to 1 to skip conda activation (use current environment)
+SKIP_PROTON=${SKIP_PROTON:-"0"}                 # Set to 1 to skip proton test (env where proton instrumentation backend is unavailable)
 
 echo "Running CUTracer tests..."
 echo "DEBUG: $DEBUG"
@@ -24,6 +25,7 @@ echo "CONDA_ENV: $CONDA_ENV"
 echo "SKIP_BUILD: $SKIP_BUILD"
 echo "SKIP_CUTRACER_BUILD: $SKIP_CUTRACER_BUILD"
 echo "SKIP_CONDA: $SKIP_CONDA"
+echo "SKIP_PROTON: $SKIP_PROTON"
 
 # Define project root path (absolute path)
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1337,7 +1339,9 @@ run_all_tests() {
     failed_suites+=("mem-value-trace")
   fi
 
-  if test_proton; then
+  if [ "$SKIP_PROTON" = "1" ]; then
+    echo "⏭️ Skipping proton test (SKIP_PROTON=1)"
+  elif test_proton; then
     passed_suites+=("proton")
   else
     failed_suites+=("proton")

@@ -101,6 +101,15 @@ jobs:
           # The uv venv is already active via GITHUB_ENV from the earlier
           # step, so the script just inherits it.
           SKIP_CONDA: 1
+          # SKIP_PROTON=1 because meta-triton (FB Triton 3.6.0+fb.beta) lags
+          # upstream by ~100 days and doesn't yet have proton's
+          # `backend="instrumentation", data="trace"` API used by
+          # tests/proton_tests/vector-add-instrumented.py — the call
+          # silently no-ops, no histogram CSV gets generated, and the test
+          # fails. test-h100-triton-nightly.yml uses upstream Triton main
+          # (3.7.0+gitcd8e4acc) where proton works, so it does NOT set
+          # this. Drop this flag once meta-triton catches up.
+          SKIP_PROTON: 1
           DEBUG: ${{ github.event.inputs.debug == 'true' && '1' || '0' }}
         run: bash .ci/run_tests.sh
 
