@@ -1,42 +1,59 @@
-name: CI Build and Test (H100 - probe)
+name: CI Build and Test (H100)
 
-# Probe-only second cut. v1 confirmed:
-#   - runner is Ubuntu 24.04, sudo no-passwd, GPU=H100 sm_9.0, driver=580.126.09
-#   - SETUP_SCRIPT activates a uv venv at /workspace/uv_venvs/$CONDA_ENV
-#     (NOT a conda env despite the env-var name)
-#   - meta-triton venv: Python 3.12.13 + PyTorch 2.13.0.dev+cu130 + Triton 3.6.0+fb.beta
-#   - libzstd.so.1 + libcuda + jq + make + gcc/g++ all present
-#   - missing: nvcc, /usr/local/cuda*, zstd CLI
+# Companion to test.yml during the cu128 -> cu130 transition.
 #
-# v2 still-open questions (this run answers):
-#   1. Is nvcc actually missing, or is it bundled inside one of the venvs
-#      (e.g. nvidia-cuda-nvcc-cu13) or under /workspace somewhere?
-#   2. Does `sudo apt-get install -y zstd` actually work? (we have sudo group +
-#      passwordless sudo, but never tried apt itself.)
-#   3. Is the runner running inside a container (docker/podman/k8s) or on the
-#      bare host? Affects whether apt installs persist, whether we can write
-#      to /opt/cuda-13.0 for caching, etc.
+# This job runs on facebookexperimental's GCP H100 runner (linux-gcp-h100,
+# k8s pod / containerd, NVIDIA H100 80GB sm_9.0, driver 580.126.09). It
+# uses the runner-provided uv venv (meta-triton) which already ships
+# PyTorch 2.13.0.dev+cu130 + Triton 3.6.0+fb.beta editable. It does NOT
+# share the conda-based .ci/setup.sh that test.yml uses on the T4 runner.
 #
-# Once v2 is green and answers these, follow-up PRs add the real build/test
-# steps as a uv-native pipeline (new .ci/setup-h100.sh + .ci/run-tests-h100.sh,
-# leaving the existing conda-based .ci/setup.sh + run_tests.sh untouched).
+# Triggers are intentionally narrow during stabilization:
+#   - workflow_dispatch (manual)
+#   - push that touches the H100 CI files or the actual code
+# Once stable for 1-2 weeks, broaden to push branches main/develop and
+# pull_request, then retire test.yml on T4.
 
 on:
   workflow_dispatch:
+    inputs:
+      test-type:
+        description: "Type of tests to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "build-only"
+          - "vectoradd"
+      debug:
+        description: "Enable debug build"
+        required: true
+        default: false
+        type: boolean
   push:
     paths:
       - ".github/workflows/test-h100.yml"
+      - ".ci/setup-h100.sh"
+      - ".ci/run_tests.sh"
+      - "Makefile"
+      - "src/**"
+      - "include/**"
+      - "python/**"
+      - "tests/**"
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  probe-h100:
+  build-and-test-h100:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: [linux-gcp-h100]
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
+      # CONDA_ENV is a misnomer inherited from the runner's bootstrap
+      # script — it's actually the uv venv name under /workspace/uv_venvs/.
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
 
@@ -52,370 +69,58 @@ jobs:
           sudo ldconfig || echo "::warning::sudo ldconfig failed"
           nvidia-smi
 
-      - name: Runner basics
+      - name: Activate uv venv (source SETUP_SCRIPT, persist env)
+        # SETUP_SCRIPT activates a uv venv at /workspace/uv_venvs/$CONDA_ENV
+        # and sets nvidia LD_LIBRARY_PATH for bundled cu13/cudnn/nccl/...
+        # libs. Persist the diff to $GITHUB_ENV so subsequent steps
+        # inherit. Without this, each step starts in a fresh shell with
+        # no venv active.
         run: |
-          echo "=== uname / OS ==="
-          uname -a
-          (cat /etc/os-release || true)
-          echo
-          echo "=== whoami / groups ==="
-          whoami
-          id
-          echo
-          echo "=== CPU / memory / disk ==="
-          nproc
-          (free -h || true)
-          df -h /
-          (df -h /workspace || true)
-          echo
-          echo "=== \$HOME and \$PATH ==="
-          echo "HOME=$HOME"
-          echo "PATH=$PATH"
-          echo
-          echo "=== Pre-installed top-level dirs of interest ==="
-          ls -la /workspace 2>/dev/null || echo "(no /workspace)"
-          ls -la /opt 2>/dev/null | head -40 || true
+          . "$SETUP_SCRIPT"
+          {
+            echo "PATH=$PATH"
+            echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "TRITONBENCH_PYTORCH_REPO_PATH=$TRITONBENCH_PYTORCH_REPO_PATH"
+          } >> "$GITHUB_ENV"
+          echo "Active venv: $VIRTUAL_ENV"
 
-      - name: Inspect SETUP_SCRIPT
-        run: |
-          echo "SETUP_SCRIPT=$SETUP_SCRIPT"
-          if [ -f "$SETUP_SCRIPT" ]; then
-              echo "=== exists, full content ==="
-              cat "$SETUP_SCRIPT"
-              echo "=== total lines ==="
-              wc -l "$SETUP_SCRIPT"
-          else
-              echo "::warning::SETUP_SCRIPT not found at $SETUP_SCRIPT"
-          fi
+      - name: Setup H100 environment (apt + CUDA + cutracer pip)
+        # Installs zstd + cuda-toolkit-13-0 via apt, then `uv pip install`
+        # cutracer's Python package. Appends CUDA_HOME / PATH / LD_LIBRARY_PATH
+        # for /usr/local/cuda-13.0 to $GITHUB_ENV / $GITHUB_PATH.
+        run: bash .ci/setup-h100.sh
 
-      - name: Probe NVIDIA driver and GPUs
-        run: |
-          echo "=== nvidia-smi (full) ==="
-          nvidia-smi
-          echo
-          echo "=== driver / cuda runtime version (queryable) ==="
-          nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
-          echo
-          echo "=== /proc/driver/nvidia/version ==="
-          (cat /proc/driver/nvidia/version 2>/dev/null || echo "(missing)")
+      - name: Run tests
+        env:
+          TEST_TYPE: ${{ github.event.inputs.test-type || 'all' }}
+          TIMEOUT: 60
+          INSTALL_THIRD_PARTY: 1
+          # SKIP_CONDA=1 makes run_tests.sh skip its conda activation block
+          # (which writes to /opt/miniconda3 paths that don't exist here).
+          # The uv venv is already active via GITHUB_ENV from the earlier
+          # step, so the script just inherits it.
+          SKIP_CONDA: 1
+          DEBUG: ${{ github.event.inputs.debug == 'true' && '1' || '0' }}
+        run: bash .ci/run_tests.sh
 
-      # NEW v2 — Container / isolation detection.
-      # Decides whether apt installs / file writes persist (host vs ephemeral
-      # container) and what filesystem isolation we're inside.
-      - name: Probe runner isolation (container vs host)
-        run: |
-          set +e
-          echo "=== /.dockerenv / /run/.containerenv ==="
-          ([ -f /.dockerenv ] && echo "/.dockerenv exists -> docker") || echo "(no /.dockerenv)"
-          ([ -f /run/.containerenv ] && echo "/run/.containerenv exists -> podman") || echo "(no /run/.containerenv)"
-          echo
-          echo "=== PID 1 ==="
-          (cat /proc/1/comm 2>/dev/null || echo "(can't read /proc/1/comm)")
-          (ls -l /proc/1/exe 2>/dev/null || true)
-          echo
-          echo "=== /proc/1/cgroup (top of stack -> orchestrator hint) ==="
-          (cat /proc/1/cgroup 2>/dev/null | head -10 || true)
-          echo
-          echo "=== /proc/self/cgroup ==="
-          (cat /proc/self/cgroup 2>/dev/null | head -10 || true)
-          echo
-          echo "=== /proc/self/mountinfo (top 20) ==="
-          (cat /proc/self/mountinfo 2>/dev/null | head -20 || true)
-          echo
-          echo "=== systemd-detect-virt ==="
-          (systemd-detect-virt 2>/dev/null || echo "(systemd-detect-virt not available)")
-          echo
-          echo "=== container env hints ==="
-          env | grep -iE '^(CONTAINER|KUBERNETES|RUNC|DOCKER)' || echo "(no container-related env vars)"
-          echo
-          echo "=== root filesystem type ==="
-          stat -f -c '%T' / 2>/dev/null || true
-          findmnt -n -o FSTYPE,SOURCE / 2>/dev/null || true
-
-      # NEW v2 — exhaustive CUDA toolkit search.
-      # v1 only checked PATH / /usr/local/cuda*. nvcc may live inside the uv
-      # venv (nvidia-cuda-nvcc-cu13), under /workspace, in apt packages, etc.
-      - name: Deep-probe CUDA toolkit / nvcc
-        run: |
-          set +e
-          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
-
-          echo "=== command -v nvcc (after sourcing SETUP_SCRIPT) ==="
-          command -v nvcc || echo "(no nvcc on PATH)"
-          echo
-
-          echo "=== /usr/local/cuda* ==="
-          (ls -ld /usr/local/cuda 2>/dev/null || echo "(no /usr/local/cuda)")
-          ls -d /usr/local/cuda-* 2>/dev/null || echo "(no /usr/local/cuda-* dirs)"
-          echo
-
-          echo "=== \$HOME for prior CUDA installs ==="
-          ls -d "$HOME"/opt/cuda-* 2>/dev/null || echo "(no \$HOME/opt/cuda-* dirs)"
-          ls -d "$HOME"/cuda-* 2>/dev/null || echo "(no \$HOME/cuda-* dirs)"
-          echo
-
-          echo "=== uv venv site-packages: nvidia-* subdirs ==="
-          for venv in /workspace/uv_venvs/*; do
-              site="$venv/lib/python3.12/site-packages/nvidia"
-              if [ -d "$site" ]; then
-                  echo "  $site:"
-                  ls -1 "$site" 2>/dev/null | sed 's/^/    /'
-              fi
-          done
-          echo
-
-          echo "=== nvcc bundled in uv venvs? ==="
-          # nvidia-cuda-nvcc-cu13 puts nvcc at site-packages/nvidia/cuda_nvcc/bin/nvcc
-          for venv_nvcc in /workspace/uv_venvs/*/lib/python3.12/site-packages/nvidia/cuda_nvcc/bin/nvcc; do
-              [ -e "$venv_nvcc" ] && echo "  FOUND: $venv_nvcc" && "$venv_nvcc" --version | head -5
-          done
-          [ -z "$(ls /workspace/uv_venvs/*/lib/python3.12/site-packages/nvidia/cuda_nvcc/bin/nvcc 2>/dev/null)" ] && \
-              echo "  (no nvcc inside any venv's nvidia/cuda_nvcc)"
-          echo
-
-          echo "=== bounded find for nvcc under /workspace and /opt ==="
-          # Limit depth and root dirs to keep it fast (~1s) and avoid
-          # walking weird filesystems.
-          (timeout 30 find /workspace /opt -maxdepth 8 -type f -name nvcc 2>/dev/null || true)
-          echo
-
-          echo "=== dpkg-installed CUDA packages ==="
-          dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /cuda|nvidia/' | head -30 || true
-          echo
-
-          echo "=== apt repos that might offer cuda ==="
-          (ls /etc/apt/sources.list.d/ 2>/dev/null || true)
-          (grep -ri 'developer\.download\.nvidia\|cuda' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | head -10 || true)
-          echo
-
-          echo "=== nvjitlink / nvrtc / cuobjdump / ptxas (often co-located with nvcc) ==="
-          for tool in cuobjdump ptxas cuda-gdb nvprune fatbinary; do
-              p="$(command -v $tool 2>/dev/null)"
-              [ -n "$p" ] && echo "  $tool -> $p"
-          done
-          (ldconfig -p 2>/dev/null | grep -E 'libnvjitlink|libnvrtc' | head -10 || echo "(no libnvjitlink/libnvrtc in ldconfig)")
-          echo
-
-          echo "=== CUDA_HOME / CUDA_PATH ==="
-          echo "CUDA_HOME=${CUDA_HOME:-<unset>}"
-          echo "CUDA_PATH=${CUDA_PATH:-<unset>}"
-
-      # NEW v2 — was a conda probe in v1 (failed). Replaced with uv-native.
-      - name: Inspect meta-triton uv venv
-        run: |
-          set +e
-          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
-
-          echo "=== which python / pip / uv ==="
-          command -v python
-          command -v pip
-          command -v uv && uv --version
-          python -V
-          pip -V
-          echo
-          echo "=== VIRTUAL_ENV ==="
-          echo "$VIRTUAL_ENV"
-          echo
-          echo "=== PyTorch ==="
-          python - <<'PY' || echo "::warning::torch import failed"
-          import torch
-          print("torch          :", torch.__version__)
-          print("torch.version.cuda:", torch.version.cuda)
-          print("cudnn          :", torch.backends.cudnn.version())
-          print("cuda available :", torch.cuda.is_available())
-          if torch.cuda.is_available():
-              print("device count   :", torch.cuda.device_count())
-              for i in range(torch.cuda.device_count()):
-                  p = torch.cuda.get_device_properties(i)
-                  print(f"  [{i}] {p.name} sm_{p.major}{p.minor} mem={p.total_memory>>20}MiB")
-          PY
-          echo
-          echo "=== Triton ==="
-          python - <<'PY' || echo "::warning::triton import failed"
-          import triton
-          print("triton         :", triton.__version__)
-          print("triton path    :", triton.__file__)
-          PY
-          echo
-          echo "=== pip list (full, sorted) ==="
-          pip list 2>/dev/null | sort
-          echo
-          echo "=== pip list filtered for CUDA / NVBit-related ==="
-          pip list 2>/dev/null | grep -iE '^(torch|triton|nvidia-|cuda-|nvbit|numpy|pandas|click|zstd|pyzstd|setuptools|wheel|pip)' || true
-
-      - name: Probe system libraries CUTracer needs
-        run: |
-          echo "=== libzstd ==="
-          (ldconfig -p | grep -i 'libzstd' || echo "(libzstd missing)")
-          echo
-          echo "=== libcudart / libcuda ==="
-          (ldconfig -p | grep -E 'libcudart|libcuda' || echo "(no libcudart/libcuda in ldconfig cache)")
-          echo
-          echo "=== zstd CLI ==="
-          (command -v zstd && zstd --version) || echo "(no zstd CLI)"
-          echo
-          echo "=== jq ==="
-          (command -v jq && jq --version) || echo "(no jq)"
-          echo
-          echo "=== make / gcc / g++ ==="
-          (make --version | head -1 || true)
-          (gcc --version | head -1 || true)
-          (g++ --version | head -1 || true)
-          echo
-          echo "=== libstdc++ / GLIBCXX symbols (CUDA-runtime compat surface) ==="
-          # CUTracer's run_tests.sh uses `conda install libstdcxx-ng=15.1.0` to
-          # match newer GLIBCXX symbols some triton/torch builds reference.
-          # Check what's currently available so we know if we need any apt
-          # equivalent on the H100 image.
-          (strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 2>/dev/null | grep -E '^GLIBCXX_3\.4\.[0-9]+$' | sort -V | tail -5 || true)
-
-      # v2 — exercise sudo apt. Install zstd (~200KB) as a smoke test that
-      # confirms passwordless sudo + Ubuntu apt repos work.
-      - name: Test sudo apt install (zstd smoke test)
-        run: |
-          set +e
-          echo "=== sudo -n test (passwordless?) ==="
-          sudo -n true 2>&1 | head -3 && echo "  passwordless sudo: YES" || echo "  passwordless sudo: NO"
-          echo
-          echo "=== apt-get update ==="
-          sudo apt-get update -y 2>&1 | tail -10
-          echo "  exit=$?"
-          echo
-          echo "=== apt-get install -y zstd libzstd-dev ==="
-          sudo apt-get install -y zstd libzstd-dev 2>&1 | tail -15
-          echo "  exit=$?"
-          echo
-          echo "=== verify zstd ==="
-          (command -v zstd && zstd --version) || echo "::warning::zstd CLI still missing after apt install"
-          dpkg -l zstd libzstd-dev 2>/dev/null | tail -3 || true
-
-      # v3 — End-to-end test of apt-installing CUDA toolkit 13.0 on the H100
-      # runner, since this is the path the real workflow will use:
-      #   1. Add NVIDIA CUDA apt repo (cuda-keyring deb adds the GPG key and
-      #      writes /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list).
-      #   2. apt-get update to pick up the new index.
-      #   3. apt-get install cuda-toolkit-13-0.
-      #   4. Verify nvcc on /usr/local/cuda-13.0/bin and works for sm_90.
-      # We measure each phase with `date +%s` so we know the wall-time budget
-      # this adds to every job (no caching across runs - container is
-      # ephemeral k8s pod). This decides whether to keep apt or fall back to
-      # CUTracer's scripts/install_cuda.sh runfile path.
-      - name: Test apt-install cuda-toolkit-13-0 (timed end-to-end)
-        run: |
-          set +e
-          OVERALL_START=$(date +%s)
-          DF_BEFORE=$(df -BM --output=avail / | tail -1 | tr -d 'M ')
-
-          echo "=== [1/4] Download cuda-keyring deb ==="
-          T0=$(date +%s)
-          curl -fsSL -o /tmp/cuda-keyring.deb \
-              https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          KEYRING_DL=$?
-          echo "  curl exit=$KEYRING_DL  size=$(stat -c%s /tmp/cuda-keyring.deb 2>/dev/null || echo '?')"
-          T1=$(date +%s); echo "  elapsed: $((T1-T0))s"
-          [ $KEYRING_DL -ne 0 ] && { echo "::error::cuda-keyring download failed"; exit 0; }
-
-          echo
-          echo "=== [2/4] Install cuda-keyring + apt-get update ==="
-          T0=$(date +%s)
-          sudo dpkg -i /tmp/cuda-keyring.deb 2>&1 | tail -5
-          ls /etc/apt/sources.list.d/ | grep -i cuda || echo "::warning::no cuda repo file appeared"
-          sudo apt-get update -y 2>&1 | tail -10
-          UPDATE_RC=$?
-          T1=$(date +%s); echo "  elapsed: $((T1-T0))s  apt-get-update-exit=$UPDATE_RC"
-
-          echo
-          echo "=== [2.5/4] Confirm cuda-toolkit-13-0 now visible ==="
-          apt-cache policy cuda-toolkit-13-0 2>&1 | head -10
-
-          echo
-          echo "=== [3/4] apt-get install cuda-toolkit-13-0 (the big one) ==="
-          T0=$(date +%s)
-          # DEBIAN_FRONTEND noninteractive avoids any tzdata / accept-license prompts.
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cuda-toolkit-13-0 2>&1 | tail -30
-          INSTALL_RC=$?
-          T1=$(date +%s); INSTALL_ELAPSED=$((T1-T0))
-          echo "  elapsed: ${INSTALL_ELAPSED}s  apt-get-install-exit=$INSTALL_RC"
-
-          echo
-          echo "=== [4/4] Verify nvcc + sm_90 sanity ==="
-          ls -d /usr/local/cuda* 2>/dev/null
-          NVCC_PATH=/usr/local/cuda-13.0/bin/nvcc
-          if [ -x "$NVCC_PATH" ]; then
-              "$NVCC_PATH" --version
-              echo
-              # Trivial sm_90 build: pipe a one-liner kernel through nvcc to PTX
-              # to confirm the toolchain works end-to-end for H100. No actual
-              # GPU launch — just code generation.
-              echo '__global__ void noop() {}' > /tmp/noop.cu
-              "$NVCC_PATH" -arch=sm_90 -ptx /tmp/noop.cu -o /tmp/noop.ptx 2>&1
-              echo "  nvcc -arch=sm_90 -ptx exit=$?"
-              ls -l /tmp/noop.ptx 2>/dev/null
-              # Also exercise ptxas on the result
-              PTXAS=/usr/local/cuda-13.0/bin/ptxas
-              if [ -x "$PTXAS" ]; then
-                  "$PTXAS" -arch=sm_90 /tmp/noop.ptx -o /tmp/noop.cubin 2>&1
-                  echo "  ptxas -arch=sm_90 exit=$?"
-                  ls -l /tmp/noop.cubin 2>/dev/null
-              fi
-          else
-              echo "::warning::$NVCC_PATH not present after install"
-          fi
-
-          DF_AFTER=$(df -BM --output=avail / | tail -1 | tr -d 'M ')
-          OVERALL_END=$(date +%s)
-          echo
-          echo "::group::CUDA APT INSTALL TIMING"
-          echo "  total wall time:    $((OVERALL_END - OVERALL_START))s"
-          echo "    keyring download: see [1/4]"
-          echo "    apt-get update:   see [2/4]"
-          echo "    cuda-toolkit-13-0 install: ${INSTALL_ELAPSED}s"
-          echo "  disk used (root /):  $((DF_BEFORE - DF_AFTER)) MB"
-          echo "  /usr/local/cuda-13.0 size: $(du -sh /usr/local/cuda-13.0 2>/dev/null | cut -f1)"
-          echo "::endgroup::"
-
-      - name: Inspect repo build prerequisites
-        run: |
-          echo "=== repo root ==="
-          ls -la
-          echo
-          echo "=== Makefile head ==="
-          (sed -n '1,40p' Makefile || true)
-          echo
-          echo "=== install_third_party.sh head ==="
-          (sed -n '1,40p' install_third_party.sh || true)
-
-      - name: Summary
-        run: |
-          set +e
-          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
-
-          DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-          GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-          SMCC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
-          NVCC_PATH="$(command -v nvcc 2>/dev/null)"
-          # Fall back to the venv-bundled location if PATH didn't pick it up
-          if [ -z "$NVCC_PATH" ]; then
-              VENV_NVCC=$(ls /workspace/uv_venvs/*/lib/python3.12/site-packages/nvidia/cuda_nvcc/bin/nvcc 2>/dev/null | head -1)
-              [ -n "$VENV_NVCC" ] && NVCC_PATH="$VENV_NVCC"
-          fi
-          NVCC_V=$([ -n "$NVCC_PATH" ] && "$NVCC_PATH" --version 2>/dev/null | grep release | sed -E 's/.*release ([0-9.]+).*/\1/')
-          PY_V=$(python -V 2>&1 | awk '{print $2}')
-          TORCH_V=$(python -c 'import torch;print(torch.__version__)' 2>/dev/null)
-          TORCH_CUDA=$(python -c 'import torch;print(torch.version.cuda)' 2>/dev/null)
-          TRITON_V=$(python -c 'import triton;print(triton.__version__)' 2>/dev/null)
-          ZSTD_V=$(zstd --version 2>/dev/null | head -1)
-          IS_DOCKER=$([ -f /.dockerenv ] && echo "yes" || echo "no")
-          PID1=$(cat /proc/1/comm 2>/dev/null)
-
-          echo "::group::H100 PROBE SUMMARY (v2)"
-          printf "  GPU:         %s (sm_%s)\n" "${GPU:-?}" "${SMCC:-?}"
-          printf "  Driver:      %s\n" "${DRIVER:-?}"
-          printf "  Container:   /.dockerenv=%s pid1=%s\n" "$IS_DOCKER" "${PID1:-?}"
-          printf "  nvcc path:   %s\n" "${NVCC_PATH:-missing}"
-          printf "  nvcc:        %s\n" "${NVCC_V:-missing}"
-          printf "  Python:      %s\n" "${PY_V:-?}"
-          printf "  PyTorch:     %s (cuda=%s)\n" "${TORCH_V:-?}" "${TORCH_CUDA:-?}"
-          printf "  Triton:      %s\n" "${TRITON_V:-?}"
-          printf "  zstd CLI:    %s\n" "${ZSTD_V:-missing}"
-          echo "::endgroup::"
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-h100-cuda13.0
+          path: |
+            tests/vectoradd/*.sass
+            tests/vectoradd/*.log
+            tests/vectoradd/*.ndjson
+            tests/vectoradd/*.ndjson.zstd
+            tests/py_add/*.log
+            tests/py_add/*.sass
+            tests/py_add/*.ndjson
+            tests/py_add/*.ndjson.zstd
+            tests/py_add/mode*_validation.log
+            tests/py_add/mode*_run.log
+            tests/py_add/mode1_decompressed.ndjson
+            tests/proton_tests/*.log
+            tests/proton_tests/*.sass
+            tests/proton_tests/*.csv
