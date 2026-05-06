@@ -1421,7 +1421,11 @@ case "$TEST_TYPE" in
   maybe_build_vectoradd_smem && test_mem_value_trace
   ;;
 "proton")
-  test_proton
+  if [ "$SKIP_PROTON" = "1" ]; then
+    echo "⏭️ TEST_TYPE=proton requested but SKIP_PROTON=1 — skipping."
+  else
+    test_proton
+  fi
   ;;
 "hang")
   test_hang_test
