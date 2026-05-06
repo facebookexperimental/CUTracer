@@ -92,6 +92,13 @@ jobs:
           bash .ci/setup.sh
       - name: Install Triton nightly
         if: matrix.triton == 'nightly'
+        env:
+          # Provided so the Triton-nightly resolver below can authenticate
+          # to the GitHub Actions API. Without this, we hit the 60 req/hr
+          # unauthenticated limit and silently fall back to the unpinned
+          # install. With the workflow token, the limit is 1000/hr per
+          # repo; only public-repo read access is needed (default scope).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           source /opt/miniconda3/etc/profile.d/conda.sh
           conda activate "$CONDA_ENV"
@@ -100,7 +107,34 @@ jobs:
           # Remove both before installing the nightly to avoid a
           # half-overwritten install.
           python -m pip uninstall -y pytorch-triton triton 2>/dev/null || true
-          python -m pip install -U --pre triton --extra-index-url "${TRITON_NIGHTLY_INDEX_URL}"
+
+          # Workaround: the Triton-Nightly feed publishes wheels with
+          # PEP-440 local versions like `3.7.0+gitXXXXXXXX`, which pip
+          # sorts lexicographically — so `pip install -U` silently selects
+          # an arbitrarily-old wheel rather than the newest commit.
+          # We resolve the latest upstream wheels.yml head_sha via GitHub
+          # API and pin to it. The resolver lives in tritonparse alongside
+          # the existing setup.sh that this workflow already curls.
+          # On any resolver failure, fall back to the unpinned install
+          # (preserves the original behavior so the canary never regresses).
+          PIN_SCRIPT="$(mktemp --suffix=.py)"
+          curl -fsSL https://raw.githubusercontent.com/meta-pytorch/tritonparse/main/.ci/triton_nightly_pin.py \
+              -o "$PIN_SCRIPT" || rm -f "$PIN_SCRIPT"
+          PIN=""
+          if [ -s "$PIN_SCRIPT" ]; then
+              PY_TAG=$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+              PIN=$(python "$PIN_SCRIPT" --pytag "$PY_TAG" --platform x86_64) || PIN=""
+              rm -f "$PIN_SCRIPT"
+          fi
+          if [[ "$PIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+git[0-9a-f]+$ ]]; then
+              echo "Pinning Triton nightly to upstream HEAD: triton==$PIN"
+              python -m pip install "triton==$PIN" \
+                  --extra-index-url "${TRITON_NIGHTLY_INDEX_URL}"
+          else
+              echo "Resolver did not produce a valid pin (got: '$PIN'); falling back to default"
+              python -m pip install -U --pre triton \
+                  --extra-index-url "${TRITON_NIGHTLY_INDEX_URL}"
+          fi
           python -c "import triton; print(f'Triton: {triton.__version__} from {triton.__file__}')"
       - name: Run tests
         env:
