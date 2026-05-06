@@ -11,12 +11,24 @@ name: CI Build and Test (H100, Triton nightly)
 # nvidia-cu13 runtime libs already installed. Setup-h100.sh's 75s
 # cuda-toolkit-13-0 install is still required (no nvcc on the runner).
 #
-# Triggers narrow during stabilization: workflow_dispatch + pushes that
-# touch this file or the shared CI/code paths. Once green and triton-main
-# proves stable as a canary, broaden to push branches main/develop and
-# pull_request, mirroring test-h100.yml.
+# Same trigger surface as test-h100.yml and test.yml (push branches
+# main/develop + pull_request, with `paths-ignore` for docs-only
+# changes). Acts as the upstream-Triton canary alongside the meta-triton
+# H100 lane.
 
 on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
   workflow_dispatch:
     inputs:
       test-type:
@@ -33,16 +45,6 @@ on:
         required: true
         default: false
         type: boolean
-  push:
-    paths:
-      - ".github/workflows/test-h100-triton-nightly.yml"
-      - ".ci/setup-h100.sh"
-      - ".ci/run_tests.sh"
-      - "Makefile"
-      - "src/**"
-      - "include/**"
-      - "python/**"
-      - "tests/**"
 
 permissions:
   contents: read

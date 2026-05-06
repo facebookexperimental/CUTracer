@@ -8,13 +8,25 @@ name: CI Build and Test (H100)
 # PyTorch 2.13.0.dev+cu130 + Triton 3.6.0+fb.beta editable. It does NOT
 # share the conda-based .ci/setup.sh that test.yml uses on the T4 runner.
 #
-# Triggers are intentionally narrow during stabilization:
-#   - workflow_dispatch (manual)
-#   - push that touches the H100 CI files or the actual code
-# Once stable for 1-2 weeks, broaden to push branches main/develop and
-# pull_request, then retire test.yml on T4.
+# Same trigger surface as test.yml (push branches main/develop +
+# pull_request, both with `paths-ignore` for docs-only changes), so this
+# H100 lane runs on the same commits the T4 lane does. test.yml stays
+# in place during the cu128 -> cu130 transition; it will be retired
+# once the H100 lanes are stable.
 
 on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
   workflow_dispatch:
     inputs:
       test-type:
@@ -31,16 +43,6 @@ on:
         required: true
         default: false
         type: boolean
-  push:
-    paths:
-      - ".github/workflows/test-h100.yml"
-      - ".ci/setup-h100.sh"
-      - ".ci/run_tests.sh"
-      - "Makefile"
-      - "src/**"
-      - "include/**"
-      - "python/**"
-      - "tests/**"
 
 permissions:
   contents: read
