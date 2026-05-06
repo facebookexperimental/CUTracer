@@ -110,8 +110,11 @@ if is_fbcode():
 
     # Prefer AI-extended deadlock command (with --ai flag) if available;
     # fall back to base deadlock command if tritonparse.ai is not installed.
+    # ``all_command`` lives next to the AI-extended deadlock_command and
+    # is registered together so they appear/disappear in sync.
+    all_command = None
     try:
-        from cutracer.analyze.fb.ai.cli import deadlock_command
+        from cutracer.analyze.fb.ai.cli import all_command, deadlock_command
     except ImportError:
         from cutracer.analyze.fb.deadlock.cli import deadlock_command
 
@@ -119,3 +122,5 @@ if is_fbcode():
     analyze_command.add_command(tma_command)
     analyze_command.add_command(mma_command)
     analyze_command.add_command(deadlock_command)
+    if all_command is not None:
+        analyze_command.add_command(all_command)
