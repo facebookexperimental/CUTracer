@@ -105,22 +105,12 @@ analyze_command.add_command(warp_summary_command)
 
 # Conditionally register internal commands (fb/ modules not synced to OSS)
 if is_fbcode():
+    from cutracer.analyze.fb.ai.cli import all_command, deadlock_command
     from cutracer.analyze.fb.data_race.cli import data_race_command
     from cutracer.analyze.fb.dataflow.cli import mma_command, tma_command
-
-    # Prefer AI-extended deadlock command (with --ai flag) if available;
-    # fall back to base deadlock command if tritonparse.ai is not installed.
-    # ``all_command`` lives next to the AI-extended deadlock_command and
-    # is registered together so they appear/disappear in sync.
-    all_command = None
-    try:
-        from cutracer.analyze.fb.ai.cli import all_command, deadlock_command
-    except ImportError:
-        from cutracer.analyze.fb.deadlock.cli import deadlock_command
 
     analyze_command.add_command(data_race_command)
     analyze_command.add_command(tma_command)
     analyze_command.add_command(mma_command)
     analyze_command.add_command(deadlock_command)
-    if all_command is not None:
-        analyze_command.add_command(all_command)
+    analyze_command.add_command(all_command)
