@@ -1,0 +1,271 @@
+name: CI Build and Test (H100 - probe)
+
+# Probe-only first cut: inventory the H100 runner environment so we can
+# decide what the real H100 build/test job needs to install vs. inherit
+# from the pre-baked `meta-triton` conda env. Once this is green and we
+# know what's there, follow-up PRs add the actual build + test steps and
+# broaden the triggers (push/pull_request) to mirror test.yml.
+#
+# Until then, keep the runner cost low: only fire on manual dispatch
+# and on pushes that touch this file itself.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/test-h100.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe-h100:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux-gcp-h100]
+    timeout-minutes: 30
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Tune Nvidia GPU
+        # Same prologue as Xu's h100.yml — persistence mode + ldconfig
+        # before any CUDA work. Tolerated to fail (sudoers may not allow
+        # nvidia-smi -pm on every runner image).
+        run: |
+          sudo nvidia-smi -pm 1 || echo "::warning::sudo nvidia-smi -pm failed"
+          sudo ldconfig || echo "::warning::sudo ldconfig failed"
+          nvidia-smi
+
+      - name: Runner basics
+        run: |
+          echo "=== uname / OS ==="
+          uname -a
+          (cat /etc/os-release || true)
+          echo
+          echo "=== whoami / groups ==="
+          whoami
+          id
+          echo
+          echo "=== CPU / memory / disk ==="
+          nproc
+          (free -h || true)
+          df -h /
+          (df -h /workspace || true)
+          echo
+          echo "=== \$HOME and \$PATH ==="
+          echo "HOME=$HOME"
+          echo "PATH=$PATH"
+          echo
+          echo "=== Pre-installed top-level dirs of interest ==="
+          ls -la /workspace 2>/dev/null || echo "(no /workspace)"
+          ls -la /opt 2>/dev/null | head -40 || true
+
+      - name: Inspect SETUP_SCRIPT
+        run: |
+          echo "SETUP_SCRIPT=$SETUP_SCRIPT"
+          if [ -f "$SETUP_SCRIPT" ]; then
+              echo "=== exists, first 200 lines ==="
+              sed -n '1,200p' "$SETUP_SCRIPT"
+              echo "=== total lines ==="
+              wc -l "$SETUP_SCRIPT"
+          else
+              echo "::warning::SETUP_SCRIPT not found at $SETUP_SCRIPT"
+          fi
+
+      - name: Probe NVIDIA driver and GPUs
+        run: |
+          echo "=== nvidia-smi (full) ==="
+          nvidia-smi
+          echo
+          echo "=== driver / cuda runtime version (queryable) ==="
+          nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
+          echo
+          echo "=== /proc/driver/nvidia/version ==="
+          (cat /proc/driver/nvidia/version 2>/dev/null || echo "(missing)")
+
+      - name: Probe conda installations
+        run: |
+          echo "=== which conda / locations ==="
+          (command -v conda || echo "no conda on PATH")
+          for p in /opt/conda /opt/miniconda3 /workspace/miniconda3 /workspace/conda /home/runner/miniconda3; do
+              [ -d "$p" ] && echo "  found: $p" && ls -d "$p"/etc/profile.d/conda.sh 2>/dev/null
+          done
+          echo
+          echo "=== CONDA_HOME / CONDA_PREFIX env (pre-source) ==="
+          echo "CONDA_HOME=${CONDA_HOME:-<unset>}"
+          echo "CONDA_PREFIX=${CONDA_PREFIX:-<unset>}"
+
+      - name: Source SETUP_SCRIPT and dump env diff
+        # Source the runner bootstrap (per Xu's stub it's how meta-triton
+        # gets activated) and inspect what it adds: PATH, CONDA_*, CUDA_*.
+        # `set +e` because the bootstrap may noisily warn but still work.
+        run: |
+          set +e
+          echo "=== ENV BEFORE ==="
+          env | grep -E '^(PATH|CONDA|CUDA|LD_LIBRARY|TRITON|PYTHONPATH|VIRTUAL_ENV)=' | sort
+          echo
+          if [ -f "$SETUP_SCRIPT" ]; then
+              echo "=== sourcing $SETUP_SCRIPT ==="
+              # Don't use 'source' under non-interactive shell traps; use '.'
+              . "$SETUP_SCRIPT" || echo "::warning::SETUP_SCRIPT exited non-zero"
+          else
+              echo "::warning::no SETUP_SCRIPT to source"
+          fi
+          echo
+          echo "=== ENV AFTER ==="
+          env | grep -E '^(PATH|CONDA|CUDA|LD_LIBRARY|TRITON|PYTHONPATH|VIRTUAL_ENV)=' | sort
+          echo
+          echo "=== conda info / env list ==="
+          (conda info 2>&1 | head -40 || true)
+          (conda env list 2>&1 || true)
+
+      - name: Inspect meta-triton env (Python / PyTorch / Triton)
+        # The real heart of the probe: figure out whether meta-triton is
+        # already cu130 + new PyTorch + new Triton, or whether we need to
+        # `pip install --pre torch ... cu130` on top.
+        run: |
+          set +e
+          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
+
+          # Try to find the conda we want to use.
+          CONDA_BIN=""
+          for cand in "$(command -v conda)" /opt/conda/bin/conda /opt/miniconda3/bin/conda /workspace/miniconda3/bin/conda; do
+              if [ -n "$cand" ] && [ -x "$cand" ]; then
+                  CONDA_BIN="$cand"
+                  break
+              fi
+          done
+          if [ -z "$CONDA_BIN" ]; then
+              echo "::error::no conda binary found; cannot probe $CONDA_ENV"
+              exit 0   # keep going; later steps still useful
+          fi
+          echo "Using conda: $CONDA_BIN"
+          eval "$($CONDA_BIN shell.bash hook)"
+
+          conda activate "$CONDA_ENV" || {
+              echo "::warning::conda activate $CONDA_ENV failed"
+              echo "Available envs:"
+              conda env list
+              exit 0
+          }
+
+          echo "=== which python / pip ==="
+          command -v python
+          command -v pip
+          python -V
+          pip -V
+          echo
+          echo "=== CONDA_PREFIX after activate ==="
+          echo "$CONDA_PREFIX"
+          echo
+          echo "=== PyTorch ==="
+          python - <<'PY' || echo "::warning::torch import failed"
+          import torch
+          print("torch          :", torch.__version__)
+          print("torch.version.cuda:", torch.version.cuda)
+          print("cudnn          :", torch.backends.cudnn.version())
+          print("cuda available :", torch.cuda.is_available())
+          if torch.cuda.is_available():
+              print("device count   :", torch.cuda.device_count())
+              for i in range(torch.cuda.device_count()):
+                  p = torch.cuda.get_device_properties(i)
+                  print(f"  [{i}] {p.name} sm_{p.major}{p.minor} mem={p.total_memory>>20}MiB")
+          PY
+          echo
+          echo "=== Triton ==="
+          python - <<'PY' || echo "::warning::triton import failed"
+          import triton, importlib.util
+          print("triton         :", triton.__version__)
+          print("triton path    :", triton.__file__)
+          PY
+          echo
+          echo "=== pip list (relevant subset) ==="
+          pip list 2>/dev/null | grep -iE '^(torch|triton|nvidia-|cuda-|nvbit|numpy|pandas|click|zstd|pyzstd)' || true
+
+      - name: Probe CUDA toolkit (nvcc)
+        run: |
+          set +e
+          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
+          echo "=== which nvcc ==="
+          command -v nvcc || echo "(no nvcc on PATH after sourcing SETUP_SCRIPT)"
+          echo
+          echo "=== /usr/local/cuda symlink target ==="
+          (ls -ld /usr/local/cuda 2>/dev/null || echo "(no /usr/local/cuda)")
+          ls -d /usr/local/cuda-* 2>/dev/null || echo "(no /usr/local/cuda-* dirs)"
+          echo
+          echo "=== nvcc --version ==="
+          (nvcc --version 2>&1 || true)
+          echo
+          echo "=== CUDA_HOME / CUDA_PATH ==="
+          echo "CUDA_HOME=${CUDA_HOME:-<unset>}"
+          echo "CUDA_PATH=${CUDA_PATH:-<unset>}"
+
+      - name: Probe system libraries CUTracer needs
+        run: |
+          echo "=== libzstd ==="
+          (ldconfig -p | grep -i 'libzstd' || echo "(libzstd missing — run_tests.sh expects libzstd-dev)")
+          echo
+          echo "=== libcudart / libcuda ==="
+          (ldconfig -p | grep -E 'libcudart|libcuda' || echo "(no libcudart/libcuda in ldconfig cache)")
+          echo
+          echo "=== zstd CLI ==="
+          (command -v zstd && zstd --version) || echo "(no zstd CLI)"
+          echo
+          echo "=== jq (used by run_tests.sh trace verification) ==="
+          (command -v jq && jq --version) || echo "(no jq)"
+          echo
+          echo "=== make / gcc / g++ ==="
+          (make --version | head -1 || true)
+          (gcc --version | head -1 || true)
+          (g++ --version | head -1 || true)
+
+      - name: Inspect repo build prerequisites
+        # Sanity check: confirm the checkout looks like a CUTracer tree
+        # and that third_party/ would install correctly later.
+        run: |
+          echo "=== repo root ==="
+          ls -la
+          echo
+          echo "=== Makefile head ==="
+          (sed -n '1,40p' Makefile || true)
+          echo
+          echo "=== install_third_party.sh head ==="
+          (sed -n '1,40p' install_third_party.sh || true)
+
+      - name: Summary
+        # One-line summary at the end so we can grep the run log easily.
+        run: |
+          set +e
+          if [ -f "$SETUP_SCRIPT" ]; then . "$SETUP_SCRIPT"; fi
+
+          CONDA_BIN="$(command -v conda || true)"
+          [ -z "$CONDA_BIN" ] && [ -x /opt/conda/bin/conda ] && CONDA_BIN=/opt/conda/bin/conda
+          if [ -n "$CONDA_BIN" ]; then
+              eval "$($CONDA_BIN shell.bash hook)"
+              conda activate "$CONDA_ENV" 2>/dev/null
+          fi
+
+          DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+          GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+          SMCC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+          NVCC_V=$(nvcc --version 2>/dev/null | grep release | sed -E 's/.*release ([0-9.]+).*/\1/')
+          PY_V=$(python -V 2>&1 | awk '{print $2}')
+          TORCH_V=$(python -c 'import torch;print(torch.__version__)' 2>/dev/null)
+          TORCH_CUDA=$(python -c 'import torch;print(torch.version.cuda)' 2>/dev/null)
+          TRITON_V=$(python -c 'import triton;print(triton.__version__)' 2>/dev/null)
+
+          echo "::group::H100 PROBE SUMMARY"
+          printf "  GPU:         %s (sm_%s)\n" "${GPU:-?}" "${SMCC:-?}"
+          printf "  Driver:      %s\n" "${DRIVER:-?}"
+          printf "  nvcc:        %s\n" "${NVCC_V:-missing}"
+          printf "  Python:      %s\n" "${PY_V:-?}"
+          printf "  PyTorch:     %s (cuda=%s)\n" "${TORCH_V:-?}" "${TORCH_CUDA:-?}"
+          printf "  Triton:      %s\n" "${TRITON_V:-?}"
+          echo "::endgroup::"
