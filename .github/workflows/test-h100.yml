@@ -1,0 +1,200 @@
+name: CI Build and Test (H100)
+
+# Two H100 lanes share this workflow via matrix:
+#   - meta-triton    : runner-provided meta-triton uv venv (FB Triton 3.6.0+fb.beta).
+#                      SKIP_PROTON=1 because FB Triton lags upstream by ~100 days
+#                      and lacks proton's `backend="instrumentation", data="trace"`
+#                      API used by tests/proton_tests/. Drop SKIP_PROTON once
+#                      meta-triton catches up.
+#   - triton-nightly : runner-provided triton-main uv venv (upstream Triton main).
+#                      Proton works here.
+#
+# Both lanes share runner (linux-gcp-h100), cu130 PyTorch, .ci/setup-h100.sh,
+# .ci/run_tests.sh + SKIP_CONDA=1. fail-fast: false so one lane's failure
+# doesn't cancel the other (canary visibility).
+#
+# Trigger surface mirrors test.yml (push branches main/develop + pull_request,
+# both with paths-ignore for docs). test.yml stays in place during cu128 ->
+# cu130 transition; will be retired once both H100 lanes are stable.
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-type:
+        description: "Type of tests to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "build-only"
+          - "vectoradd"
+      debug:
+        description: "Enable debug build"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-test-h100:
+    # Override the auto-generated matrix job name. Default would be
+    # "build-and-test-h100 (meta-triton, meta-triton, 1, 1)" — all four
+    # matrix keys concatenated. We only want the lane name in the UI.
+    name: build-and-test-h100 (${{ matrix.lane }})
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux-gcp-h100]
+    timeout-minutes: 60
+    strategy:
+      # Don't let one lane's failure cancel the other — both are canaries
+      # and we want independent signal from each.
+      fail-fast: false
+      matrix:
+        include:
+          - lane: meta-triton
+            conda_env: meta-triton
+            skip_proton: "1"
+            expect_fb_fork: "1"
+          - lane: triton-nightly
+            conda_env: triton-main
+            skip_proton: "0"
+            expect_fb_fork: "0"
+    env:
+      # CONDA_ENV is a misnomer inherited from the runner's bootstrap
+      # script — it's actually the uv venv name under /workspace/uv_venvs/.
+      CONDA_ENV: ${{ matrix.conda_env }}
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1 || echo "::warning::sudo nvidia-smi -pm failed"
+          sudo ldconfig || echo "::warning::sudo ldconfig failed"
+          nvidia-smi
+
+      - name: Activate uv venv (source SETUP_SCRIPT, persist env)
+        # SETUP_SCRIPT activates a uv venv at /workspace/uv_venvs/$CONDA_ENV
+        # and sets nvidia LD_LIBRARY_PATH for bundled cu13/cudnn/nccl/...
+        # libs. Persist the diff to $GITHUB_ENV so subsequent steps inherit.
+        # Without this, each step starts in a fresh shell with no venv active.
+        #
+        # The TRITONBENCH_TRITON_* envs come from tritonbench's install.sh
+        # appending an `export` block to SETUP_SCRIPT (see meta-pytorch/tritonbench
+        # .ci/triton/install.sh:115-127). They give the full 40-char triton
+        # commit hash, repo URL, requested commit, and install dir — strictly
+        # better than parsing the 8-char suffix of `triton.__version__`. Default
+        # to empty so this step doesn't fail if the runner image was built
+        # without tritonbench's install.sh.
+        run: |
+          . "$SETUP_SCRIPT"
+          {
+            echo "PATH=$PATH"
+            echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "TRITONBENCH_PYTORCH_REPO_PATH=$TRITONBENCH_PYTORCH_REPO_PATH"
+            echo "TRITONBENCH_TRITON_COMMIT_HASH=${TRITONBENCH_TRITON_COMMIT_HASH:-}"
+            echo "TRITONBENCH_TRITON_REPO=${TRITONBENCH_TRITON_REPO:-}"
+            echo "TRITONBENCH_TRITON_COMMIT=${TRITONBENCH_TRITON_COMMIT:-}"
+            echo "TRITONBENCH_TRITON_INSTALL_DIR=${TRITONBENCH_TRITON_INSTALL_DIR:-}"
+          } >> "$GITHUB_ENV"
+          echo "Active venv: $VIRTUAL_ENV"
+
+      - name: Verify Triton (which version are we actually testing?)
+        # Cheap sanity check before paying for cuda-toolkit-13-0. If a lane
+        # ever activates the wrong venv (e.g. meta-triton runs upstream
+        # Triton, or triton-nightly runs the FB fork), fail loud here
+        # before wasting 75s on apt + tens of minutes on tests.
+        env:
+          EXPECT_FB_FORK: ${{ matrix.expect_fb_fork }}
+        run: |
+          echo "TRITONBENCH_TRITON_REPO=${TRITONBENCH_TRITON_REPO:-<unset>}"
+          echo "TRITONBENCH_TRITON_COMMIT_HASH=${TRITONBENCH_TRITON_COMMIT_HASH:-<unset>}"
+          echo "TRITONBENCH_TRITON_COMMIT=${TRITONBENCH_TRITON_COMMIT:-<unset>}"
+          echo "TRITONBENCH_TRITON_INSTALL_DIR=${TRITONBENCH_TRITON_INSTALL_DIR:-<unset>}"
+          python - <<'PY'
+          import os, sys, triton, torch
+          print(f"python : {sys.version.split()[0]}")
+          print(f"torch  : {torch.__version__} (cuda={torch.version.cuda})")
+          print(f"triton : {triton.__version__}")
+          print(f"  path : {triton.__file__}")
+          # Dual-direction lane check: meta-triton must be the FB fork,
+          # triton-nightly must NOT be. Catches runner-image regressions
+          # where a venv silently points at the wrong Triton.
+          expect_fb = os.environ.get("EXPECT_FB_FORK") == "1"
+          has_fb = "fb" in triton.__version__
+          assert expect_fb == has_fb, (
+              f"lane mismatch: expect_fb_fork={expect_fb} but triton.__version__={triton.__version__}"
+          )
+          # Prefer the full 40-char hash exported by tritonbench install.sh
+          # over parsing the 8-char suffix of triton.__version__. Cross-check
+          # they agree so a stale env doesn't silently mislabel runs.
+          full = os.environ.get("TRITONBENCH_TRITON_COMMIT_HASH", "")
+          short = triton.__version__.rsplit("+git", 1)[-1] if "+git" in triton.__version__ else ""
+          if full:
+              print(f"  full commit : {full}")
+              if short and not full.startswith(short):
+                  print(f"::warning::triton.__version__ short hash {short!r} does not prefix env full hash {full!r}")
+          else:
+              print("::warning::TRITONBENCH_TRITON_COMMIT_HASH unset; runner image may not have been built with tritonbench install.sh")
+          PY
+
+      - name: Setup H100 environment (apt + CUDA + cutracer pip)
+        # Installs zstd + cuda-toolkit-13-0 via apt, then `uv pip install`
+        # cutracer's Python package. Appends CUDA_HOME / PATH / LD_LIBRARY_PATH
+        # for /usr/local/cuda-13.0 to $GITHUB_ENV / $GITHUB_PATH.
+        run: bash .ci/setup-h100.sh
+
+      - name: Run tests
+        env:
+          TEST_TYPE: ${{ github.event.inputs.test-type || 'all' }}
+          TIMEOUT: 60
+          INSTALL_THIRD_PARTY: 1
+          # SKIP_CONDA=1 makes run_tests.sh skip its conda activation block
+          # (which writes to /opt/miniconda3 paths that don't exist here).
+          # The uv venv is already active via GITHUB_ENV from the earlier
+          # step, so the script just inherits it.
+          SKIP_CONDA: 1
+          SKIP_PROTON: ${{ matrix.skip_proton }}
+          DEBUG: ${{ github.event.inputs.debug == 'true' && '1' || '0' }}
+        run: bash .ci/run_tests.sh
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-h100-cuda13.0-${{ matrix.lane }}
+          path: |
+            tests/vectoradd/*.sass
+            tests/vectoradd/*.log
+            tests/vectoradd/*.ndjson
+            tests/vectoradd/*.ndjson.zstd
+            tests/py_add/*.log
+            tests/py_add/*.sass
+            tests/py_add/*.ndjson
+            tests/py_add/*.ndjson.zstd
+            tests/py_add/mode*_validation.log
+            tests/py_add/mode*_run.log
+            tests/py_add/mode1_decompressed.ndjson
+            tests/proton_tests/*.log
+            tests/proton_tests/*.sass
+            tests/proton_tests/*.csv
