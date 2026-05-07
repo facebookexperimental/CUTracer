@@ -53,6 +53,10 @@ permissions:
 
 jobs:
   build-and-test-h100:
+    # Override the auto-generated matrix job name. Default would be
+    # "build-and-test-h100 (meta-triton, meta-triton, 1, 1)" — all four
+    # matrix keys concatenated. We only want the lane name in the UI.
+    name: build-and-test-h100 (${{ matrix.lane }})
     if: github.repository_owner == 'facebookexperimental'
     runs-on: [linux-gcp-h100]
     timeout-minutes: 60
