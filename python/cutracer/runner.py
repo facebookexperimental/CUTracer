@@ -240,6 +240,7 @@ _CUTRACER_OPTIONS = [
     click.option(
         "--output-dir",
         "--trace-output-dir",
+        "-o",
         default=None,
         help="Output directory for trace files",
     ),
