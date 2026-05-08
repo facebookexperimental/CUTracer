@@ -124,7 +124,9 @@ def _build_cutracer_env(
     if trace_format is not None:
         env["CUTRACER_TRACE_FORMAT"] = str(trace_format)
     if output_dir is not None:
-        env["CUTRACER_OUTPUT_DIR"] = output_dir
+        # Resolve to absolute path so subprocesses that chdir (e.g. tests
+        # using `cwd=tmp_dir`) still write logs to the user-visible location.
+        env["CUTRACER_OUTPUT_DIR"] = str(Path(output_dir).resolve())
     if verbose is not None:
         env["TOOL_VERBOSE"] = str(verbose)
     if zstd_level is not None:
@@ -140,9 +142,9 @@ def _build_cutracer_env(
     if delay_patterns is not None:
         env["CUTRACER_DELAY_PATTERNS"] = delay_patterns
     if delay_dump_path is not None:
-        env["CUTRACER_DELAY_DUMP_PATH"] = delay_dump_path
+        env["CUTRACER_DELAY_DUMP_PATH"] = str(Path(delay_dump_path).resolve())
     if delay_load_path is not None:
-        env["CUTRACER_DELAY_LOAD_PATH"] = delay_load_path
+        env["CUTRACER_DELAY_LOAD_PATH"] = str(Path(delay_load_path).resolve())
     if cpu_callstack is not None:
         env["CUTRACER_CPU_CALLSTACK"] = str(cpu_callstack)
     if channel_records is not None:
@@ -430,6 +432,36 @@ def trace_command(
     if not cmd:
         raise click.UsageError(
             "No command specified. Usage: cutracer trace [OPTIONS] -- COMMAND"
+        )
+
+    # `ignore_unknown_options=True` lets us forward arbitrary args to the wrapped
+    # command after `--`, but it also silently turns a typo'd flag (e.g. `-o`
+    # before `-o` was added) into the first token of `cmd`. The wrapped shell
+    # then chokes with a cryptic message like `/bin/sh: - : invalid option`.
+    # Catch that case here and point the user at the likely fix.
+    if cmd[0].startswith("-"):
+        raise click.UsageError(
+            f"Unrecognized option {cmd[0]!r} before '--'. "
+            "If this is meant for the wrapped command, separate CUTracer flags "
+            "from the command with '--', e.g.: "
+            "cutracer trace [OPTIONS] -- COMMAND [ARGS...]. "
+            "Run `cutracer trace --help` to see available options."
+        )
+
+    # `buck2 test` dispatches the actual test binary through TPX in a sandbox
+    # that scrubs environment variables, so CUDA_INJECTION64_PATH never reaches
+    # the GPU process and cutracer.so is never loaded — no logs, silent no-op.
+    # Warn early so users don't waste a full test run wondering where the logs
+    # went. `buck2 run <test_target>` works because the test binary inherits
+    # our env directly.
+    if cmd[0] in ("buck", "buck2") and len(cmd) > 1 and cmd[1] == "test":
+        click.echo(
+            f"WARNING: Wrapping `{cmd[0]} test` is unsupported. TPX runs the "
+            "test binary in a sandbox that strips CUDA_INJECTION64_PATH, so "
+            "cutracer.so will not be loaded and no traces will be produced. "
+            f"Use `{cmd[0]} run <test_target>` instead, or run the test binary "
+            "from buck-out directly.",
+            err=True,
         )
 
     so_path = resolve_cutracer_so(cutracer_so)
