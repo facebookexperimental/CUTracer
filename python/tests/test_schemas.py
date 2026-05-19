@@ -9,6 +9,7 @@ import unittest
 
 import jsonschema
 from cutracer.validation.schema_loader import (
+    DEBUGGER_OPCODE_ONLY_SCHEMA,
     DELAY_CONFIG_SCHEMA,
     KERNEL_METADATA_SCHEMA,
     MEM_ACCESS_SCHEMA,
@@ -37,6 +38,10 @@ class SchemaTest(unittest.TestCase):
         """Test that delay config schema is a valid JSON Schema document."""
         jsonschema.Draft7Validator.check_schema(DELAY_CONFIG_SCHEMA)
 
+    def test_debugger_opcode_only_schema_is_valid(self):
+        """Test that the cuda-gdb opcode_only schema is valid JSON Schema."""
+        jsonschema.Draft7Validator.check_schema(DEBUGGER_OPCODE_ONLY_SCHEMA)
+
     def test_real_reg_trace_record_passes(self):
         """Test that real reg_trace records from sample file pass schema validation."""
         with open(REG_TRACE_NDJSON, "r") as f:
@@ -60,6 +65,45 @@ class SchemaTest(unittest.TestCase):
         # opcode_only should NOT have regs or addrs
         self.assertNotIn("regs", OPCODE_ONLY_SCHEMA.get("required", []))
         self.assertNotIn("addrs", OPCODE_ONLY_SCHEMA.get("required", []))
+
+    def test_valid_debugger_opcode_only_record_passes(self):
+        """Test that a cuda-gdb opcode_only record passes its schema."""
+        valid_record = {
+            "type": "opcode_only",
+            "trace_index": 0,
+            "cta": [0, 0, 0],
+            "warp": 4,
+            "cuda_warp_slot": 6,
+            "pc": "0x15fb0",
+            "sass": "BAR.SYNC.DEFER_BLOCKING 0x1",
+            "observed_pc": "0x15fc0",
+            "observed_sass": "USETMAXREG.DEALLOC.CTAPOOL 0x50",
+            "source_type": "gdb_inferred",
+            "pc_semantics": "effective_blocking_instruction",
+            "registers": {"UR12": 5120},
+            "memory_addresses": [
+                {
+                    "evidence_type": "hgmma_gdesc",
+                    "operand": "gdesc[UR12]",
+                    "shared_offsets": ["0x1400"],
+                }
+            ],
+        }
+        jsonschema.validate(valid_record, DEBUGGER_OPCODE_ONLY_SCHEMA)
+
+    def test_debugger_opcode_only_source_kind_fails(self):
+        """Test that the legacy cuda-gdb source_kind field is rejected."""
+        invalid_record = {
+            "type": "opcode_only",
+            "trace_index": 0,
+            "cta": [0, 0, 0],
+            "warp": 4,
+            "pc": "0x15fb0",
+            "sass": "BAR.SYNC.DEFER_BLOCKING 0x1",
+            "source_kind": "gdb_inferred",
+        }
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(invalid_record, DEBUGGER_OPCODE_ONLY_SCHEMA)
 
 
 class KernelMetadataSchemaTest(unittest.TestCase):

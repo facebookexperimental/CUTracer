@@ -60,6 +60,11 @@ class CudaWarpSample:
     # raw disassembly window used to prove nearby blockers.
     pc_runtime: str | None = None
     pc_address_space: str | None = None
+    observed_pc: str | None = None
+    observed_pc_runtime: str | None = None
+    observed_sass: str | None = None
+    source_type: str | None = None
+    pc_semantics: str | None = None
     sass_context: str = ""
     # Register evidence captured only when cuda-hang-detect is invoked with
     # --capture-operands.

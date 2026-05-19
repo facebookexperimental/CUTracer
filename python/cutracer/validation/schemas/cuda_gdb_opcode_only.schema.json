@@ -1,0 +1,191 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/cuda_gdb_opcode_only.schema.json",
+  "title": "CUTracer cuda-gdb Opcode Only Trace Record",
+  "description": "Schema for opcode_only records emitted by the cuda-gdb live sampler. These records share type='opcode_only' but carry debugger-specific PC provenance and operand evidence instead of NVBit ctx/timestamp/opcode_id fields.",
+  "type": "object",
+  "required": [
+    "type",
+    "trace_index",
+    "cta",
+    "warp",
+    "pc",
+    "sass"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["opcode_only"],
+      "description": "Message type identifier"
+    },
+    "trace_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequential index of this debugger trace record"
+    },
+    "cta": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "CTA coordinates [x, y, z]"
+    },
+    "warp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Warp ID within the CTA"
+    },
+    "cuda_warp_slot": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "cuda-gdb warp slot identifier"
+    },
+    "first_active_threadidx": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "First active CUDA thread index in the sampled warp"
+    },
+    "active_mask": {
+      "type": "string",
+      "description": "cuda-gdb active lane mask"
+    },
+    "pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Instruction selected for analysis. Usually a kernel offset when pc_address_space is kernel_offset."
+    },
+    "sass": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SASS for the selected instruction"
+    },
+    "pc_runtime": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Runtime virtual address corresponding to pc"
+    },
+    "pc_address_space": {
+      "type": "string",
+      "enum": ["kernel_offset", "absolute"],
+      "description": "Address space used by pc"
+    },
+    "observed_pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Raw PC where cuda-gdb stopped before context inference"
+    },
+    "observed_pc_runtime": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Runtime virtual address corresponding to observed_pc"
+    },
+    "observed_sass": {
+      "type": "string",
+      "description": "Raw SASS where cuda-gdb stopped before context inference"
+    },
+    "source_type": {
+      "type": "string",
+      "enum": ["gdb_trace", "gdb_direct", "gdb_inferred"],
+      "description": "Debugger provenance for the selected PC"
+    },
+    "pc_semantics": {
+      "type": "string",
+      "enum": ["observed_instruction", "effective_blocking_instruction"],
+      "description": "Whether pc is the observed stop instruction or an inferred/direct blocking instruction"
+    },
+    "sass_context": {
+      "type": "string",
+      "description": "Raw disassembly window used to infer nearby blockers"
+    },
+    "operand_capture_lane": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 31,
+      "description": "Lane used for scalar register operand capture"
+    },
+    "registers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "description": "Captured scalar register values keyed by register name"
+    },
+    "read_errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Non-fatal register or memory read failures"
+    },
+    "memory_addresses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["evidence_type"],
+        "properties": {
+          "evidence_type": {
+            "type": "string",
+            "description": "Decoded evidence record type"
+          },
+          "operand": {
+            "type": "string"
+          },
+          "shared_offsets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$"
+            }
+          },
+          "shared_offset": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]+$"
+          },
+          "barrier": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]+$"
+          },
+          "desc_addr": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]+$"
+          },
+          "desc_raw": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$"
+            }
+          },
+          "global_addr": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]+$"
+          },
+          "coords": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "global_start_addr": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]+$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Decoded operand memory evidence"
+    }
+  },
+  "additionalProperties": false
+}

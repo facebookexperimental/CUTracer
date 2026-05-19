@@ -11,7 +11,7 @@ Provides core types used across multiple analysis modules:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypedDict, Union
+from typing import Any, TypedDict
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ class TraceRecord(TypedDict, total=False):
     other field.
     """
 
-    # Common fields across record types
+    # Common per-instruction fields across trace record types.
     type: str  # "reg_trace" | "mem_trace" | "kernel_metadata" | "opcode_only" | "tma_trace"
     ctx: str  # CUDA context
     sass: str  # SASS instruction text
@@ -60,6 +60,11 @@ class TraceRecord(TypedDict, total=False):
     active_mask: str
     pc_runtime: str
     pc_address_space: str
+    observed_pc: str
+    observed_pc_runtime: str
+    observed_sass: str
+    source_type: str
+    pc_semantics: str
     sass_context: str
 
     # cuda-gdb register operand evidence. Present only when --capture-operands
@@ -79,7 +84,7 @@ class TraceRecord(TypedDict, total=False):
 
     # tma_trace specific
     desc_addr: str  # TMA descriptor address (hex string "0x...")
-    desc_raw: list[Union[int, str]]  # Raw descriptor bytes (16 hex strings or ints)
+    desc_raw: list[int | str]  # Raw descriptor bytes (16 hex strings or ints)
     tma_transfer_info: dict[str, Any]  # NVBit 1.8 TMA transfer info (src/dst)
 
     # kernel_metadata specific

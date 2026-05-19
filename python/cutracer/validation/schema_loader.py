@@ -11,11 +11,12 @@ Schema files are located in the 'schemas/' subdirectory:
 - reg_trace.schema.json: Schema for register trace records
 - mem_trace.schema.json: Schema for memory access trace records
 - opcode_only.schema.json: Schema for opcode-only trace records
+- cuda_gdb_opcode_only.schema.json: Schema for cuda-gdb opcode_only records
 """
 
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from tritonparse._json_compat import load, loads
 
@@ -25,7 +26,7 @@ else:
     import importlib_resources as resources
 
 
-def _load_schema(schema_name: str) -> Dict[str, Any]:
+def _load_schema(schema_name: str) -> dict[str, Any]:
     """
     Load a JSON schema from the schemas directory.
 
@@ -61,14 +62,15 @@ def _load_schema(schema_name: str) -> Dict[str, Any]:
 
 
 # Load schemas from JSON files
-REG_INFO_SCHEMA: Dict[str, Any] = _load_schema("reg_trace")
-MEM_ACCESS_SCHEMA: Dict[str, Any] = _load_schema("mem_trace")
-OPCODE_ONLY_SCHEMA: Dict[str, Any] = _load_schema("opcode_only")
-DELAY_CONFIG_SCHEMA: Dict[str, Any] = _load_schema("delay_config")
-KERNEL_METADATA_SCHEMA: Dict[str, Any] = _load_schema("kernel_metadata")
+REG_INFO_SCHEMA: dict[str, Any] = _load_schema("reg_trace")
+MEM_ACCESS_SCHEMA: dict[str, Any] = _load_schema("mem_trace")
+OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("opcode_only")
+DEBUGGER_OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("cuda_gdb_opcode_only")
+DELAY_CONFIG_SCHEMA: dict[str, Any] = _load_schema("delay_config")
+KERNEL_METADATA_SCHEMA: dict[str, Any] = _load_schema("kernel_metadata")
 
 # Mapping from type field to schema (for trace records with "type" field)
-SCHEMAS_BY_TYPE: Dict[str, Dict[str, Any]] = {
+SCHEMAS_BY_TYPE: dict[str, dict[str, Any]] = {
     "reg_trace": REG_INFO_SCHEMA,
     "mem_trace": MEM_ACCESS_SCHEMA,
     "opcode_only": OPCODE_ONLY_SCHEMA,
