@@ -62,6 +62,12 @@ class TraceRecord(TypedDict, total=False):
     pc_address_space: str
     sass_context: str
 
+    # cuda-gdb register operand evidence. Present only when --capture-operands
+    # was enabled for the debugger sampler.
+    operand_capture_lane: int
+    registers: dict[str, int]
+    read_errors: list[str]
+
     # reg_trace specific
     regs: list[list[int]]
     regs_indices: list[int]

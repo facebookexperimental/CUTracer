@@ -46,6 +46,12 @@ def samples_to_trace_records(samples: list[CudaKernelSample]) -> list[TraceRecor
                 record["pc_address_space"] = warp.pc_address_space
             if warp.sass_context:
                 record["sass_context"] = warp.sass_context
+            if warp.operand_capture_lane is not None:
+                record["operand_capture_lane"] = warp.operand_capture_lane
+            if warp.registers:
+                record["registers"] = warp.registers
+            if warp.read_errors:
+                record["read_errors"] = warp.read_errors
             records.append(record)
     return records
 

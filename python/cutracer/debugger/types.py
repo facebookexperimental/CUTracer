@@ -61,6 +61,11 @@ class CudaWarpSample:
     pc_runtime: str | None = None
     pc_address_space: str | None = None
     sass_context: str = ""
+    # Register evidence captured only when cuda-hang-detect is invoked with
+    # --capture-operands.
+    operand_capture_lane: int | None = None
+    registers: dict[str, int] = field(default_factory=dict)
+    read_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
