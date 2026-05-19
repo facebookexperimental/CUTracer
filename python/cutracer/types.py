@@ -53,6 +53,12 @@ class TraceRecord(TypedDict, total=False):
     opcode_id: int
     pc: str  # Hex string "0x..."
 
+    # cuda-gdb opcode_only specific fields. These are emitted by the debugger
+    # sampler, not by NVBit reg_trace/mem_trace/tma_trace records.
+    cuda_warp_slot: int
+    first_active_threadidx: list[int]
+    active_mask: str
+
     # reg_trace specific
     regs: list[list[int]]
     regs_indices: list[int]

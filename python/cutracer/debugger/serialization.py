@@ -26,16 +26,21 @@ def samples_to_trace_records(samples: list[CudaKernelSample]) -> list[TraceRecor
                 w.identity.warp_id,
             ),
         ):
-            records.append(
-                {
-                    "type": TraceRecordType.OPCODE_ONLY,
-                    "cta": list(warp.identity.cta),
-                    "warp": warp.identity.warp_id,
-                    "pc": _normalize_pc(warp.pc),
-                    "sass": warp.sass,
-                    "trace_index": len(records),
-                }
-            )
+            record: TraceRecord = {
+                "type": TraceRecordType.OPCODE_ONLY,
+                "cta": list(warp.identity.cta),
+                "warp": warp.identity.warp_id,
+                "pc": _normalize_pc(warp.pc),
+                "sass": warp.sass,
+                "trace_index": len(records),
+            }
+            if warp.identity.cuda_warp_slot is not None:
+                record["cuda_warp_slot"] = warp.identity.cuda_warp_slot
+            if warp.first_active_threadidx is not None:
+                record["first_active_threadidx"] = list(warp.first_active_threadidx)
+            if warp.active_mask is not None:
+                record["active_mask"] = warp.active_mask
+            records.append(record)
     return records
 
 

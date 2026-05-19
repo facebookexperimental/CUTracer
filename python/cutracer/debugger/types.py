@@ -44,6 +44,7 @@ class CudaWarpIdentity:
     sm: int
     cta: tuple[int, int, int]
     warp_id: int
+    cuda_warp_slot: int | None = None
 
 
 @dataclass
@@ -52,6 +53,8 @@ class CudaWarpSample:
     sample_index: int
     pc: str
     sass: str = ""
+    first_active_threadidx: tuple[int, int, int] | None = None
+    active_mask: str | None = None
 
 
 @dataclass

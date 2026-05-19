@@ -73,9 +73,8 @@ def parse_cuda_warps_output(
 ) -> CudaKernelSample:
     """Parse `info cuda warps` output into normalized per-warp samples.
 
-    Example row:
-        `* 0 ... 0x0000000000000100 1 (0,0,0) (0,0,0)`
-        -> `warp_id=0`, `pc=0x100`, `cta=(0, 0, 0)`.
+    `Wp` is cuda-gdb's physical warp slot. The logical warp id is derived
+    from `First Active ThreadIdx.x // 32`.
     """
     current_device = 0
     current_sm = 0
@@ -317,8 +316,9 @@ def _parse_warp_line(
 
     hex_values = HEX_RE.findall(normalized)
     coord_values = COORD_RE.findall(normalized)
-    if len(hex_values) < 3 or not coord_values:
+    if len(hex_values) < 3 or len(coord_values) < 2:
         return None
+    first_active_threadidx = _parse_coord_tuple(coord_values[1])
 
     return CudaWarpSample(
         identity=CudaWarpIdentity(
@@ -326,10 +326,13 @@ def _parse_warp_line(
             device=device,
             sm=sm,
             cta=_parse_coord_tuple(coord_values[0]),
-            warp_id=int(parts[0]),
+            warp_id=first_active_threadidx[0] // 32,
+            cuda_warp_slot=int(parts[0]),
         ),
         sample_index=sample_index,
         pc=_normalize_pc(hex_values[2]),
+        first_active_threadidx=first_active_threadidx,
+        active_mask=_normalize_mask(hex_values[0]),
     )
 
 
@@ -350,3 +353,7 @@ def _extract_kernel_name(line: str) -> str | None:
 def _parse_coord_tuple(value: str) -> tuple[int, int, int]:
     a, b, c = (int(p) for p in value.strip("()").split(","))
     return (a, b, c)
+
+
+def _normalize_mask(mask: str) -> str:
+    return f"0x{int(mask, 16) & 0xFFFFFFFF:08x}"
