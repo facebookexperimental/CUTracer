@@ -21,10 +21,16 @@ KERNEL_EVENTS_NDJSON = EXAMPLE_INPUTS_DIR / "kernel_events_sample.ndjson"
 INVALID_SYNTAX_NDJSON = EXAMPLE_INPUTS_DIR / "invalid_syntax.ndjson"
 INVALID_SCHEMA_NDJSON = EXAMPLE_INPUTS_DIR / "invalid_schema.ndjson"
 
+# CLP archive test files
+CLP_ARCHIVE_SAMPLE = EXAMPLE_INPUTS_DIR / "sample.clp"
+
 # Expected record counts for sample files
 REG_TRACE_NDJSON_RECORD_COUNT = 100
 REG_TRACE_NDJSON_ZST_RECORD_COUNT = 100
 REG_TRACE_LOG_RECORD_COUNT = 67
+CLP_ARCHIVE_RECORD_COUNT = 100
+CLP_ARCHIVE_REG_TRACE_COUNT = 80
+CLP_ARCHIVE_MEM_TRACE_COUNT = 20
 
 
 def count_records_of_type(path: Path, record_type: str) -> int:
