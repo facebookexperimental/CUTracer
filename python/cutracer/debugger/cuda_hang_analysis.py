@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import cast, TypedDict
 
 from cutracer.analyze.fb.deadlock.detection import DeadlockAnalyzer
@@ -32,6 +34,9 @@ class DeadlockSummary(TypedDict):
 
 COORD_RE: re.Pattern[str] = re.compile(r"\(\s*-?\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*\)")
 HEX_RE: re.Pattern[str] = re.compile(r"0x[0-9a-fA-F]+")
+GDB_DISASM_LINE_RE: re.Pattern[str] = re.compile(
+    r"(?:=>\s*)?(?P<pc>0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?:\s*(?P<sass>.*)"
+)
 DEVICE_SM_RE: re.Pattern[str] = re.compile(
     r"\bDevice\s+(?P<device>\d+)\b.*\bSM\s+(?P<sm>\d+)\b"
 )
@@ -44,6 +49,12 @@ CUDA_DEBUGGER_INJECTION_ERROR_MARKERS = (
     "initializeinjection",
     "the cuda driver has hit an internal error",
 )
+
+
+@dataclass(frozen=True)
+class DisassembledInstruction:
+    pc: str
+    sass: str
 
 
 def parse_active_kernel_name(kernels_output: str) -> str | None:
@@ -122,6 +133,52 @@ def detect_cuda_debugger_internal_error(backtrace_output: str) -> str | None:
             "cuda-gdb hit a CUDA driver internal error during debugger injection; "
             "no active warps could be sampled."
         )
+    return None
+
+
+def parse_gdb_disassembly(output: str) -> list[DisassembledInstruction]:
+    instructions: list[DisassembledInstruction] = []
+    for line in output.splitlines():
+        match = GDB_DISASM_LINE_RE.search(line.strip())
+        if match is None:
+            continue
+        sass = match.group("sass").strip()
+        if sass:
+            instructions.append(
+                DisassembledInstruction(
+                    pc=_normalize_pc(match.group("pc")),
+                    sass=sass,
+                )
+            )
+    return instructions
+
+
+def infer_previous_blocking_instruction(
+    observed_pc: str,
+    disassembly: str,
+    is_blocking_instruction: Callable[[str], bool],
+) -> DisassembledInstruction | None:
+    try:
+        observed = int(observed_pc, 16)
+    except ValueError:
+        return None
+
+    previous: DisassembledInstruction | None = None
+    for instruction in parse_gdb_disassembly(disassembly):
+        try:
+            instruction_pc = int(instruction.pc, 16)
+        except ValueError:
+            continue
+        if instruction_pc == observed:
+            if (
+                previous is not None
+                and int(previous.pc, 16) + 16 == observed
+                and is_blocking_instruction(previous.sass)
+            ):
+                return previous
+            return None
+        if instruction_pc < observed:
+            previous = instruction
     return None
 
 
@@ -316,9 +373,11 @@ def _parse_warp_line(
 
     hex_values = HEX_RE.findall(normalized)
     coord_values = COORD_RE.findall(normalized)
-    if len(hex_values) < 3 or len(coord_values) < 2:
+    if len(hex_values) < 3 or len(coord_values) < 1:
         return None
-    first_active_threadidx = _parse_coord_tuple(coord_values[1])
+    first_active_threadidx = (
+        _parse_coord_tuple(coord_values[1]) if len(coord_values) >= 2 else None
+    )
 
     return CudaWarpSample(
         identity=CudaWarpIdentity(
@@ -326,7 +385,11 @@ def _parse_warp_line(
             device=device,
             sm=sm,
             cta=_parse_coord_tuple(coord_values[0]),
-            warp_id=first_active_threadidx[0] // 32,
+            warp_id=(
+                first_active_threadidx[0] // 32
+                if first_active_threadidx is not None
+                else int(parts[0])
+            ),
             cuda_warp_slot=int(parts[0]),
         ),
         sample_index=sample_index,
