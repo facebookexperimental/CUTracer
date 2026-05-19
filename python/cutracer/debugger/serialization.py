@@ -40,6 +40,12 @@ def samples_to_trace_records(samples: list[CudaKernelSample]) -> list[TraceRecor
                 record["first_active_threadidx"] = list(warp.first_active_threadidx)
             if warp.active_mask is not None:
                 record["active_mask"] = warp.active_mask
+            if warp.pc_runtime is not None:
+                record["pc_runtime"] = _normalize_pc(warp.pc_runtime)
+            if warp.pc_address_space is not None:
+                record["pc_address_space"] = warp.pc_address_space
+            if warp.sass_context:
+                record["sass_context"] = warp.sass_context
             records.append(record)
     return records
 

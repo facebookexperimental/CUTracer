@@ -58,6 +58,9 @@ class TraceRecord(TypedDict, total=False):
     cuda_warp_slot: int
     first_active_threadidx: list[int]
     active_mask: str
+    pc_runtime: str
+    pc_address_space: str
+    sass_context: str
 
     # reg_trace specific
     regs: list[list[int]]

@@ -55,6 +55,12 @@ class CudaWarpSample:
     sass: str = ""
     first_active_threadidx: tuple[int, int, int] | None = None
     active_mask: str | None = None
+    # `pc`/`sass` are the instruction fed to analyzers. When resolvable,
+    # `pc` is the kernel-relative form of `pc_runtime`; `sass_context` is the
+    # raw disassembly window used to prove nearby blockers.
+    pc_runtime: str | None = None
+    pc_address_space: str | None = None
+    sass_context: str = ""
 
 
 @dataclass
