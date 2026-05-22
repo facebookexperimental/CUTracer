@@ -71,6 +71,7 @@ class CudaWarpSample:
     operand_capture_lane: int | None = None
     registers: dict[str, int] = field(default_factory=dict)
     read_errors: list[str] = field(default_factory=list)
+    memory_addresses: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

@@ -84,6 +84,8 @@ def _add_operand_fields(record: TraceRecord, warp: CudaWarpSample) -> None:
         record["registers"] = warp.registers
     if warp.read_errors:
         record["read_errors"] = warp.read_errors
+    if warp.memory_addresses:
+        record["memory_addresses"] = warp.memory_addresses
 
 
 def write_samples_trace_file(path: Path, samples: list[CudaKernelSample]) -> None:

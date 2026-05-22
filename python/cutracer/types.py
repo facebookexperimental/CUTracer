@@ -72,6 +72,7 @@ class TraceRecord(TypedDict, total=False):
     operand_capture_lane: int
     registers: dict[str, int]
     read_errors: list[str]
+    memory_addresses: list[dict[str, object]]
 
     # reg_trace specific
     regs: list[list[int]]
