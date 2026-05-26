@@ -95,6 +95,7 @@ def _build_cutracer_env(
     zstd_level: Optional[int],
     delay_ns: Optional[int],
     delay_min_ns: Optional[int] = None,
+    delay_enable_prob: Optional[float] = None,
     delay_mode: Optional[str] = None,
     delay_cluster_cta_id: Optional[int] = None,
     delay_warpgroup_id: Optional[int] = None,
@@ -137,6 +138,8 @@ def _build_cutracer_env(
         env["CUTRACER_DELAY_NS"] = str(delay_ns)
     if delay_min_ns is not None:
         env["CUTRACER_DELAY_MIN_NS"] = str(delay_min_ns)
+    if delay_enable_prob is not None:
+        env["CUTRACER_DELAY_ENABLE_PROB"] = str(delay_enable_prob)
     if delay_mode is not None:
         env["CUTRACER_DELAY_MODE"] = delay_mode
     if delay_cluster_cta_id is not None:
@@ -193,6 +196,7 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_ZSTD_LEVEL",
         "CUTRACER_DELAY_NS",
         "CUTRACER_DELAY_MIN_NS",
+        "CUTRACER_DELAY_ENABLE_PROB",
         "CUTRACER_DELAY_MODE",
         "CUTRACER_CLUSTER_CTA_ID",
         "CUTRACER_DELAY_WARPGROUP_ID",
@@ -284,6 +288,15 @@ _CUTRACER_OPTIONS = [
         default=None,
         help="Min delay in nanoseconds (floor for random mode, default: 0). "
         "Setting min > 0 ensures every thread gets at least this much delay.",
+    ),
+    click.option(
+        "--delay-enable-prob",
+        type=click.FloatRange(0.0, 1.0),
+        default=None,
+        help="Probability per PC of enabling delay during recording (0.0-1.0, default 0.5). "
+        "Set to 1.0 for deterministic injection (strongly recommended with "
+        "--delay-warpgroup-id / --delay-warp-mask, where the default 0.5 gate halves "
+        "the active warpgroup PCs). No effect in replay mode.",
     ),
     click.option(
         "--delay-mode",
@@ -423,6 +436,7 @@ def trace_command(
     zstd_level: Optional[int],
     delay_ns: Optional[int],
     delay_min_ns: Optional[int],
+    delay_enable_prob: Optional[float],
     delay_mode: Optional[str],
     delay_cluster_cta_id: Optional[int],
     delay_warpgroup_id: Optional[int],
@@ -511,6 +525,7 @@ def trace_command(
         zstd_level=zstd_level,
         delay_ns=delay_ns,
         delay_min_ns=delay_min_ns,
+        delay_enable_prob=delay_enable_prob,
         delay_mode=delay_mode,
         delay_cluster_cta_id=delay_cluster_cta_id,
         delay_warpgroup_id=delay_warpgroup_id,

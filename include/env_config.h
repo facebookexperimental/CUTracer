@@ -158,6 +158,15 @@ extern uint32_t g_delay_warp_mask;
 // Set via CUTRACER_DELAY_WARPGROUP_ID environment variable.
 extern int g_delay_warpgroup_id;
 
+// Probability per PC of enabling delay during recording (random mode only).
+// Range [0.0, 1.0]. Default 0.5 preserves the historical 50/50 PC gate. Set
+// to 1.0 for deterministic injection — strongly recommended with warp
+// targeting, where the 0.5 default halves the active warpgroup PCs and
+// usually just adds noise. No effect in replay mode (where per-point
+// enabled is loaded from config).
+// Set via CUTRACER_DELAY_ENABLE_PROB environment variable.
+extern float g_delay_enable_prob;
+
 // User-specified delay injection patterns (optional, overrides DELAY_INJECTION_PATTERNS)
 // Comma-separated SASS substrings, e.g. "SYNCS.EXCH,BAR.SYNC"
 extern std::vector<std::string> g_delay_patterns;

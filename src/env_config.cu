@@ -72,6 +72,9 @@ uint32_t g_delay_warp_mask;
 // Warp-targeted delay: warpgroup index (-1 = no targeting, >= 0 = warps [4N..4N+3])
 int g_delay_warpgroup_id;
 
+// Probability per PC of enabling delay during recording (default 0.5 = 50/50 gate)
+float g_delay_enable_prob;
+
 // User-specified delay injection patterns
 std::vector<std::string> g_delay_patterns;
 
@@ -222,6 +225,16 @@ static void get_var_uint32_auto(uint32_t& var, const char* env_name, uint32_t de
   loprintf("%s = 0x%x (%s)\n", env_name, var, description);
 }
 
+static void get_var_float(float& var, const char* env_name, float default_val, const char* description) {
+  const char* env_val = getenv(env_name);
+  if (env_val) {
+    var = strtof(env_val, nullptr);
+  } else {
+    var = default_val;
+  }
+  loprintf("%s = %.3f (%s)\n", env_name, var, description);
+}
+
 static void get_var_uint64(uint64_t& var, const char* env_name, uint64_t default_val, const char* description) {
   const char* env_val = getenv(env_name);
   if (env_val) {
@@ -350,6 +363,18 @@ void parse_delay_config() {
   }
   g_delay_min_ns = (uint32_t)delay_min_val;
 
+  // Probability per PC of enabling delay during recording (random mode).
+  // Default 0.5 preserves the historical 50/50 PC gate. Set to 1.0 for
+  // deterministic injection (strongly recommended with warp targeting, where
+  // the 0.5 default halves the active warpgroup PCs and usually just adds
+  // noise). No effect in replay mode.
+  get_var_float(g_delay_enable_prob, "CUTRACER_DELAY_ENABLE_PROB", 0.5f,
+                "Probability per PC of enabling delay during recording (0.0-1.0, default 0.5)");
+  if (g_delay_enable_prob < 0.0f || g_delay_enable_prob > 1.0f) {
+    fprintf(stderr, "FATAL: CUTRACER_DELAY_ENABLE_PROB=%.3f out of range [0.0, 1.0].\n", g_delay_enable_prob);
+    exit(1);
+  }
+
   // Parse delay mode (distribution) and CTA targeting (orthogonal axes).
   //
   // Accepted CUTRACER_DELAY_MODE values:
@@ -464,6 +489,53 @@ void parse_delay_config() {
             "  NOT bit-identical to the recording. Unset CUTRACER_CLUSTER_CTA_ID (or set to -1)\n"
             "  for exact replay.\n",
             g_cluster_cta_id, g_cluster_cta_id);
+  }
+
+  // Cross-axis validations: warp targeting vs. CTA targeting / distribution mode / enable_prob.
+  // Mirrors the dispatcher cascade in cutracer.cu — keep these aligned.
+  const bool warp_active = (g_delay_warp_mask != 0) || (g_delay_warpgroup_id >= 0);
+  const bool cluster_active = (g_delay_cta_target == 1);
+
+  // FATAL: warp + cluster targeting is not yet supported. The Diff 1 device
+  // function takes only (delay_ns, warp_mask) — no cluster_seed/cta_id. A real
+  // combo will require a new instrument_delay_cluster_warpgroup; until then,
+  // surface the conflict early instead of silently letting one axis win.
+  if (warp_active && cluster_active) {
+    fprintf(stderr,
+            "FATAL: Warp-targeted delay (CUTRACER_DELAY_WARP_MASK / CUTRACER_DELAY_WARPGROUP_ID)\n"
+            "       cannot be combined with cluster targeting (CUTRACER_DELAY_MODE=cluster%s).\n"
+            "       Pick one axis: either delay across all CTAs with a warp mask, or delay one\n"
+            "       CTA per cluster with all warps.\n",
+            (g_delay_mode == 0) ? "_fixed" : "");
+    exit(1);
+  }
+
+  // WARNING: warp targeting always uses fixed distribution within selected
+  // warps (warp lock-step requires every thread in a warp to sleep the same
+  // amount). --delay-mode random is silently downgraded to fixed.
+  if (warp_active && g_delay_mode == 1) {
+    fprintf(stderr,
+            "WARNING: Warp-targeted delay always uses fixed distribution within selected warps\n"
+            "         (warp lock-step requires all 32 threads sleep the same amount).\n"
+            "         CUTRACER_DELAY_MODE=random is silently treated as fixed.\n");
+  }
+
+  // INFO: warp targeting with the default 0.5 gate halves the active PCs.
+  if (warp_active && g_delay_enable_prob < 1.0f) {
+    loprintf(
+        "INFO: Warp targeting active with CUTRACER_DELAY_ENABLE_PROB=%.3f - only ~%.0f%% of\n"
+        "      matching PCs will actually stall the selected warps. Set --delay-enable-prob 1.0\n"
+        "      for deterministic warpgroup skew.\n",
+        g_delay_enable_prob, g_delay_enable_prob * 100.0f);
+  }
+
+  // NOTE: warp targeting + dump path — warp_mask comes from env, not the
+  // recorded config, so replay needs the same env vars (Diff 4 will persist).
+  if (warp_active && !delay_dump_path.empty()) {
+    loprintf(
+        "NOTE: Warp targeting mask is sourced from env vars, NOT persisted to %s.\n"
+        "      For replay you must re-supply --delay-warp-mask / --delay-warpgroup-id.\n",
+        delay_dump_path.c_str());
   }
 }
 

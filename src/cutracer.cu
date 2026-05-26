@@ -103,11 +103,15 @@ static void ensure_delay_rng_initialized() {
   }
 }
 
-/* Generate random enabled state (50% probability) */
+/* Generate random enabled state with configurable probability (g_delay_enable_prob, default 0.5).
+ * Short-circuits at the endpoints so --delay-enable-prob 1.0 / 0.0 are bit-deterministic and the
+ * dumped replay config truly contains all-enabled / all-disabled points. */
 static bool generate_random_delay_enabled() {
   ensure_delay_rng_initialized();
-  std::uniform_int_distribution<int> dist(0, 1);
-  return dist(g_delay_rng) == 1;
+  if (g_delay_enable_prob >= 1.0f) return true;
+  if (g_delay_enable_prob <= 0.0f) return false;
+  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+  return dist(g_delay_rng) < g_delay_enable_prob;
 }
 
 /* Generate a random seed for cluster mode CTA selection */
@@ -876,14 +880,31 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
           }
         }
 
+        // Dispatcher: 5-branch combinatorial over orthogonal targeting axes.
+        // Axes: distribution (g_delay_mode), CTA targeting (g_delay_cta_target),
+        // warp targeting (g_delay_warp_mask / g_delay_warpgroup_id). The
+        // cluster+warp combo is FATAL'd at env-parse; the assert here is
+        // defense-in-depth and a placeholder for a future
+        // instrument_delay_cluster_warpgroup.
+        const bool warp_active = (g_delay_warp_mask != 0) || (g_delay_warpgroup_id >= 0);
+        const bool cluster_active = (g_delay_cta_target == 1);
+
         if (found && enabled) {
-          if (g_delay_cta_target == 1) {
+          if (cluster_active && warp_active) {
+            assert(false && "cluster + warp targeting unsupported (see CUTRACER_DELAY_* validation)");
+          } else if (cluster_active) {
             // Cluster targeting: delay one CTA per cluster (random per point via
             // cluster_seed, or forced via g_cluster_cta_id). Distribution within
             // the selected CTA is fixed (g_delay_mode==0) or per-thread random
             // (g_delay_mode==1) — orthogonal to targeting.
             instrument_cluster_delay_injection(instr, g_delay_min_ns, delay_ns, cluster_seed, g_cluster_cta_id,
                                                /*use_fixed_delay=*/(g_delay_mode == 0) ? 1 : 0);
+          } else if (warp_active) {
+            // Warp targeting: stall only the warps selected by warp_mask /
+            // warpgroup_id within every CTA. Fixed delay per thread (lock-step
+            // within selected warps); g_delay_mode=random is silently treated
+            // as fixed (a startup WARNING is emitted in parse_delay_config).
+            instrument_warpgroup_delay_injection(instr, delay_ns, g_delay_warp_mask, g_delay_warpgroup_id);
           } else if (g_delay_mode == 1) {
             // All-CTA random: per-thread random delay in [min_delay_ns, delay_ns]
             instrument_random_delay_injection(instr, g_delay_min_ns, delay_ns);
@@ -893,9 +914,15 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
           }
         }
         if (found) {
-          loprintf("Delay injection: kernel=%s pc=0x%lx sass='%s' enabled=%s delay=%u%s%s\n", unmangled_name,
+          char warp_tag[64] = {0};
+          if (warp_active) {
+            uint32_t effective_mask =
+                (g_delay_warpgroup_id >= 0) ? (0xFu << (g_delay_warpgroup_id * 4)) : g_delay_warp_mask;
+            snprintf(warp_tag, sizeof(warp_tag), " [WARPGROUP mask=0x%x id=%d]", effective_mask, g_delay_warpgroup_id);
+          }
+          loprintf("Delay injection: kernel=%s pc=0x%lx sass='%s' enabled=%s delay=%u%s%s%s\n", unmangled_name,
                    instr->getOffset(), instr->getSass(), enabled ? "true" : "false", enabled ? delay_ns : 0,
-                   g_delay_cta_target == 1 ? " [CLUSTER]" : "", is_delay_replay_mode() ? " [REPLAY]" : "");
+                   cluster_active ? " [CLUSTER]" : "", warp_tag, is_delay_replay_mode() ? " [REPLAY]" : "");
         }
       }
     }
