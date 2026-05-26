@@ -66,6 +66,12 @@ int g_delay_cta_target;
 // One-per-cluster CTA selection override (-1 = random per point, >= 0 = force CTA index)
 int g_cluster_cta_id;
 
+// Warp-targeted delay: explicit CTA-local warp bitmask (0 = no filtering)
+uint32_t g_delay_warp_mask;
+
+// Warp-targeted delay: warpgroup index (-1 = no targeting, >= 0 = warps [4N..4N+3])
+int g_delay_warpgroup_id;
+
 // User-specified delay injection patterns
 std::vector<std::string> g_delay_patterns;
 
@@ -201,6 +207,19 @@ static void get_var_uint32(uint32_t& var, const char* env_name, uint32_t default
     var = default_val;
   }
   loprintf("%s = %u (%s)\n", env_name, var, description);
+}
+
+// Like get_var_uint32 but parses with strtoul base=0 so "0x..." (hex), "0..."
+// (octal), and decimal values are all accepted. Useful for bitmask-style env
+// vars such as CUTRACER_DELAY_WARP_MASK where users naturally write hex.
+static void get_var_uint32_auto(uint32_t& var, const char* env_name, uint32_t default_val, const char* description) {
+  const char* env_val = getenv(env_name);
+  if (env_val) {
+    var = (uint32_t)strtoul(env_val, nullptr, 0);
+  } else {
+    var = default_val;
+  }
+  loprintf("%s = 0x%x (%s)\n", env_name, var, description);
 }
 
 static void get_var_uint64(uint64_t& var, const char* env_name, uint64_t default_val, const char* description) {
@@ -374,6 +393,33 @@ void parse_delay_config() {
               "Only meaningful with --delay-mode cluster or cluster_fixed. "
               "When set together with --delay-load-path, the override wins — replay is no "
               "longer bit-identical to the recording.");
+
+  // Warp-targeted delay configuration (orthogonal to CTA targeting).
+  //
+  // Two complementary inputs:
+  //   CUTRACER_DELAY_WARPGROUP_ID — integer warpgroup index (>= 0 selects warps
+  //                                  [4N..4N+3]). -1 = disabled.
+  //   CUTRACER_DELAY_WARP_MASK    — explicit CTA-local warp bitmask (hex/dec/oct
+  //                                  via strtoul base=0). 0 = disabled.
+  //
+  // When both are set, warpgroup_id wins (resolved to mask on host side) and a
+  // startup warning is emitted. The host wrapper
+  // (instrument_warpgroup_delay_injection) consumes these to bake a 32-bit
+  // warp_mask constant into the instrumentation call.
+  get_var_uint32_auto(g_delay_warp_mask, "CUTRACER_DELAY_WARP_MASK", 0,
+                      "Warp-targeted delay: explicit CTA-local warp bitmask (0 = disabled). "
+                      "Bit N == 1 means CTA-local warp N is delayed. Warps >= 32 are silently skipped.");
+  get_var_int(g_delay_warpgroup_id, "CUTRACER_DELAY_WARPGROUP_ID", -1,
+              "Warp-targeted delay: warpgroup index (-1 = disabled, >= 0 selects warps [4N..4N+3]). "
+              "Wins over CUTRACER_DELAY_WARP_MASK when both are set.");
+
+  if (g_delay_warp_mask != 0 && g_delay_warpgroup_id >= 0) {
+    fprintf(stderr,
+            "WARNING: Both CUTRACER_DELAY_WARPGROUP_ID=%d and CUTRACER_DELAY_WARP_MASK=0x%x are set.\n"
+            "  CUTRACER_DELAY_WARPGROUP_ID wins — the warpgroup mask 0x%x will be used and the\n"
+            "  explicit mask 0x%x will be ignored. Unset one of them to silence this warning.\n",
+            g_delay_warpgroup_id, g_delay_warp_mask, (0xFu << (g_delay_warpgroup_id * 4)), g_delay_warp_mask);
+  }
 
   // Parse user-specified delay patterns (optional, overrides DELAY_INJECTION_PATTERNS)
   std::string delay_patterns_str;

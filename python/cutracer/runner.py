@@ -97,6 +97,8 @@ def _build_cutracer_env(
     delay_min_ns: Optional[int] = None,
     delay_mode: Optional[str] = None,
     delay_cluster_cta_id: Optional[int] = None,
+    delay_warpgroup_id: Optional[int] = None,
+    delay_warp_mask: Optional[str] = None,
     delay_patterns: Optional[str] = None,
     delay_dump_path: Optional[str] = None,
     delay_load_path: Optional[str] = None,
@@ -139,6 +141,10 @@ def _build_cutracer_env(
         env["CUTRACER_DELAY_MODE"] = delay_mode
     if delay_cluster_cta_id is not None:
         env["CUTRACER_CLUSTER_CTA_ID"] = str(delay_cluster_cta_id)
+    if delay_warpgroup_id is not None:
+        env["CUTRACER_DELAY_WARPGROUP_ID"] = str(delay_warpgroup_id)
+    if delay_warp_mask is not None:
+        env["CUTRACER_DELAY_WARP_MASK"] = delay_warp_mask
     if delay_patterns is not None:
         env["CUTRACER_DELAY_PATTERNS"] = delay_patterns
     if delay_dump_path is not None:
@@ -189,6 +195,8 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_DELAY_MIN_NS",
         "CUTRACER_DELAY_MODE",
         "CUTRACER_CLUSTER_CTA_ID",
+        "CUTRACER_DELAY_WARPGROUP_ID",
+        "CUTRACER_DELAY_WARP_MASK",
         "CUTRACER_DELAY_PATTERNS",
         "CUTRACER_DELAY_DUMP_PATH",
         "CUTRACER_DELAY_LOAD_PATH",
@@ -299,6 +307,24 @@ _CUTRACER_OPTIONS = [
         "to the recording. Unset (or omit) for exact replay.",
     ),
     click.option(
+        "--delay-warpgroup-id",
+        type=int,
+        default=None,
+        help="Warp-targeted delay: warpgroup index (>= 0 selects warps [4N..4N+3]). "
+        "Use to stall one warpgroup while peers race ahead (exposes warpgroup-scheduler races, "
+        "e.g. TMEM dealloc on Blackwell). Resolved to a 32-bit warp mask on the host side. "
+        "Wins over --delay-warp-mask when both are set (a startup warning is emitted).",
+    ),
+    click.option(
+        "--delay-warp-mask",
+        type=str,
+        default=None,
+        help="Warp-targeted delay: explicit bitmask of CTA-local warp ids (hex or decimal, "
+        "e.g. '0xF' for warps 0-3, '0xF0' for warps 4-7). Bit N == 1 means warp N is delayed. "
+        "Warps >= 32 are silently skipped. Accepts strings so '0xF' works; C++ side parses "
+        "via strtoul(_, nullptr, 0). Ignored when --delay-warpgroup-id is also set.",
+    ),
+    click.option(
         "--delay-patterns",
         default=None,
         help="Comma-separated SASS instruction substrings for delay injection "
@@ -399,6 +425,8 @@ def trace_command(
     delay_min_ns: Optional[int],
     delay_mode: Optional[str],
     delay_cluster_cta_id: Optional[int],
+    delay_warpgroup_id: Optional[int],
+    delay_warp_mask: Optional[str],
     delay_patterns: Optional[str],
     delay_dump_path: Optional[str],
     delay_load_path: Optional[str],
@@ -485,6 +513,8 @@ def trace_command(
         delay_min_ns=delay_min_ns,
         delay_mode=delay_mode,
         delay_cluster_cta_id=delay_cluster_cta_id,
+        delay_warpgroup_id=delay_warpgroup_id,
+        delay_warp_mask=delay_warp_mask,
         delay_patterns=delay_patterns,
         delay_dump_path=delay_dump_path,
         delay_load_path=delay_load_path,

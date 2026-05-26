@@ -143,6 +143,21 @@ extern int g_delay_cta_target;
 // is emitted in that case (see init_config_from_env).
 extern int g_cluster_cta_id;
 
+// Warp-targeted delay: explicit bitmask of CTA-local warp ids that receive the
+// delay (bit N == 1 means CTA-local warp N is delayed). 0 (default) means "no
+// warp filtering" — the warpgroup dispatcher is not engaged and delay applies
+// per the active CTA/distribution mode. Currently supports up to 32 warps per
+// CTA (one bit per warp); warps >= 32 are silently skipped.
+// Set via CUTRACER_DELAY_WARP_MASK environment variable.
+extern uint32_t g_delay_warp_mask;
+
+// Warp-targeted delay: warpgroup index (>= 0 selects warps [4N..4N+3]).
+// -1 (default) means "no warpgroup targeting". When set, it is resolved to a
+// mask on the host side and takes precedence over g_delay_warp_mask (a startup
+// warning is emitted if both are set).
+// Set via CUTRACER_DELAY_WARPGROUP_ID environment variable.
+extern int g_delay_warpgroup_id;
+
 // User-specified delay injection patterns (optional, overrides DELAY_INJECTION_PATTERNS)
 // Comma-separated SASS substrings, e.g. "SYNCS.EXCH,BAR.SYNC"
 extern std::vector<std::string> g_delay_patterns;
