@@ -463,3 +463,63 @@ extern "C" __device__ __noinline__ void instrument_delay_random_cluster(int pred
   (void)use_fixed_delay;
 #endif
 }
+
+/**
+ * @brief Device function to inject a warp-targeted fixed delay within a CTA.
+ *
+ * Stalls only the warps whose CTA-local warp id is set in warp_mask. Within a
+ * selected warp every thread sleeps the same amount, preserving warp lock-step
+ * so the warp stalls as a single scheduling unit. This is what produces the
+ * warpgroup-vs-warpgroup timing skew that intra-CTA races (e.g. consumer
+ * warpgroup vs. destructor warpgroup) require — per-thread randomness washes
+ * out at the warp boundary and cannot reproduce this class of bug.
+ *
+ * CTA-local warp id is computed from threadIdx and blockDim. We do not use
+ * NVBit's get_global_warp_id() (grid-wide) or PTX %warpid (physical slot,
+ * unstable across scheduler) — warp targeting is a CTA-local concept and must
+ * be based on the logical warp position within the block.
+ *
+ * Warps whose id is >= 32 (kernels with > 1024 threads/CTA cannot occur on
+ * current hardware, but defensively) are silently skipped: the mask is 32-bit
+ * and addresses warps 0..31 only.
+ *
+ * @param pred       Guard predicate value (per-thread, from nvbit_add_call_arg_guard_pred_val).
+ * @param delay_ns   Fixed delay in nanoseconds for every thread in each selected warp.
+ * @param warp_mask  Bitmask of CTA-local warp ids (bit i set = delay warp i).
+ *                   Use 0 to select no warps (no-op).
+ */
+extern "C" __device__ __noinline__ void instrument_delay_warpgroup(int pred, uint32_t delay_ns, uint32_t warp_mask) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+  if (!pred) {
+    return;
+  }
+
+  const uint32_t tid_linear = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+  const uint32_t warp_id = tid_linear >> 5;
+
+  // warp-uniform: all 32 lanes compute the same warp_id, so the branch does
+  // not introduce intra-warp divergence. Hit warps stall together.
+  const bool hit = (warp_id < 32u) && (((warp_mask >> warp_id) & 1u) != 0u);
+  if (!hit) {
+    return;
+  }
+
+  // CUDA __nanosleep has an implementation-defined per-call maximum
+  // (~1ms in practice on Hopper/Blackwell). Loop in 1ms chunks so a 50ms or
+  // 500ms request actually sleeps that long instead of silently capping.
+  const uint32_t CHUNK_NS = 1000000u;
+  uint32_t remaining = delay_ns;
+  while (remaining > CHUNK_NS) {
+    __nanosleep(CHUNK_NS);
+    remaining -= CHUNK_NS;
+  }
+  if (remaining > 0u) {
+    __nanosleep(remaining);
+  }
+#else
+  // Reference args to silence unused-parameter warnings under -Wall.
+  (void)pred;
+  (void)delay_ns;
+  (void)warp_mask;
+#endif
+}

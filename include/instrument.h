@@ -134,6 +134,31 @@ void instrument_cluster_delay_injection(Instr* instr, uint32_t min_delay_ns, uin
                                         uint32_t cluster_seed, int32_t cta_id_override, int32_t use_fixed_delay);
 
 /**
+ * @brief Instruments an instruction to inject a warp-targeted fixed delay
+ *        within a CTA.
+ *
+ * Inserts a call to the `instrument_delay_warpgroup` device function before
+ * the instruction. Only warps whose CTA-local warp id is in the selected set
+ * are stalled, and within those warps every thread sleeps the same amount —
+ * preserving warp lock-step. Designed to expose intra-CTA warpgroup-vs-
+ * warpgroup races (e.g., consumer warpgroup still reading TMEM while
+ * destructor warps free it) that per-thread random delays cannot reproduce.
+ *
+ * Selection precedence: if @p warpgroup_id >= 0, the selected warps are
+ * [4*warpgroup_id .. 4*warpgroup_id+3] and @p warp_mask is ignored.
+ * Otherwise the selection is exactly @p warp_mask.
+ *
+ * @param instr        Instruction to instrument.
+ * @param delay_ns     Fixed delay in nanoseconds applied to every thread in
+ *                     each selected warp.
+ * @param warp_mask    Bitmask of CTA-local warp ids (bit i = warp i). Only
+ *                     used when @p warpgroup_id < 0.
+ * @param warpgroup_id If >= 0, selects warps [4N..4N+3] and overrides mask.
+ *                     -1 = use mask.
+ */
+void instrument_warpgroup_delay_injection(Instr* instr, uint32_t delay_ns, uint32_t warp_mask, int32_t warpgroup_id);
+
+/**
  * @brief SASS instruction patterns for delay injection.
  */
 static const std::vector<const char*> DELAY_INJECTION_PATTERNS = {
