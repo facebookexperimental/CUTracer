@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
@@ -13,6 +14,15 @@ class TraceRecordType(str, Enum):
     # TraceRecord["type"] value emitted by the debugger pipeline.
     # Matches the "opcode_only" schema in cutracer/validation/schemas/.
     OPCODE_ONLY = "opcode_only"
+
+
+def is_debugger_trace_record(record: Mapping[str, object]) -> bool:
+    record_type = record.get("type")
+    source_type = record.get("source_type", "")
+    return (
+        record_type == TraceRecordType.OPCODE_ONLY
+        or record_type == TraceRecordType.OPCODE_ONLY.value
+    ) and str(source_type).startswith("gdb_")
 
 
 class HangVerdict(Enum):
