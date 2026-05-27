@@ -73,6 +73,8 @@ def _add_pc_fields(record: TraceRecord, warp: CudaWarpSample) -> None:
         record["source_type"] = warp.source_type
     if warp.pc_semantics is not None:
         record["pc_semantics"] = warp.pc_semantics
+    if warp.cuda_focus_status is not None:
+        record["cuda_focus_status"] = warp.cuda_focus_status
     if warp.sass_context:
         record["sass_context"] = warp.sass_context
 

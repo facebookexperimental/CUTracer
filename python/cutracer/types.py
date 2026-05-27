@@ -65,6 +65,7 @@ class TraceRecord(TypedDict, total=False):
     observed_sass: str
     source_type: str
     pc_semantics: str
+    cuda_focus_status: str
     sass_context: str
 
     # cuda-gdb register operand evidence. Present only when --capture-operands

@@ -101,6 +101,11 @@
       "enum": ["observed_instruction", "effective_blocking_instruction"],
       "description": "Whether pc is the observed stop instruction or an inferred/direct blocking instruction"
     },
+    "cuda_focus_status": {
+      "type": "string",
+      "enum": ["focused", "focus_failed"],
+      "description": "Whether cuda-gdb successfully focused this warp before collecting per-warp evidence"
+    },
     "sass_context": {
       "type": "string",
       "description": "Raw disassembly window used to infer nearby blockers"

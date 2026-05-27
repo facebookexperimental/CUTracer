@@ -75,6 +75,7 @@ class CudaWarpSample:
     observed_sass: str | None = None
     source_type: str | None = None
     pc_semantics: str | None = None
+    cuda_focus_status: str | None = None
     sass_context: str = ""
     # Register evidence captured only when cuda-hang-detect is invoked with
     # --capture-operands.
