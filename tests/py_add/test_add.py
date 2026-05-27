@@ -8,6 +8,22 @@ enabling reliable cross-format validation (Mode 0/1/2 comparison).
 """
 
 import torch
+import torch._inductor.config as inductor_config
+
+# Force inductor to compile inline in the main process. The default path routes
+# Triton compilation through inductor's compile-worker SubprocPool, whose
+# workers are forked after a CUDA-touching pre_fork_setup(). With upstream
+# NVIDIA Triton 3.7.0+, the forked child's cuInit returns
+# CUDA_ERROR_NOT_INITIALIZED and Triton's `_create_driver` raises
+# `RuntimeError: 0 active drivers ([])` — observed in the test.yml `nightly`
+# leg (cu128) and expected in the test-h100.yml `triton-nightly` lane (cu130).
+#
+# Setting only TORCHINDUCTOR_COMPILE_THREADS=1 is not enough: the env var is
+# read once via decide_compile_threads() and cached on inductor_config, so any
+# earlier inductor touch in the same process would make it a no-op. Override
+# the config attribute directly. Same root-cause + fix shape as D105902628 in
+# tritonparse.
+inductor_config.compile_threads = 1
 
 
 @torch.compile
