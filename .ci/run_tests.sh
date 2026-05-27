@@ -1261,6 +1261,15 @@ test_unit() {
     return 1
   fi
 
+  # Run fb-only unit tests when present (skipped in OSS, where fb/ is stripped).
+  if [ -d fb ]; then
+    if ! make -C fb test; then
+      echo "❌ fb unit tests failed"
+      cd "$PROJECT_ROOT"
+      return 1
+    fi
+  fi
+
   echo "✅ Unit tests passed!"
   cd "$PROJECT_ROOT"
   return 0

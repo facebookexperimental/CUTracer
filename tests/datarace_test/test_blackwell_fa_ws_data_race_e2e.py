@@ -25,7 +25,6 @@ import unittest
 import pkg_resources
 import torch
 
-
 _BLACKWELL_MAJOR = 10  # sm100 = Blackwell
 
 
