@@ -31,7 +31,6 @@ Notes:
 
 import click
 import torch
-import triton
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
     matmul as blackwell_gemm_ws_matmul,
 )
