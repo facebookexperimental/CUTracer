@@ -101,6 +101,9 @@ class TraceRecord(TypedDict, total=False):
     cubin_path: str
     func_addr: str
     sm_family: int  # SM architecture family (e.g. 90 = Hopper, 100 = Blackwell)
+    instructions: dict[
+        str, dict[str, Any]
+    ]  # opcode_id (str) -> {sass, binary, regs, uregs, ...}
 
     # kernel_launch specific (kernel events file)
     kernel_launch_id: int
