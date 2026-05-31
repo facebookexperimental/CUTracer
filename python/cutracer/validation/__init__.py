@@ -33,9 +33,12 @@ from .schema_loader import (
     DEBUGGER_OPCODE_ONLY_SCHEMA,
     DELAY_CONFIG_SCHEMA,
     MEM_ACCESS_SCHEMA,
+    MEM_ADDR_TRACE_SCHEMA,
+    MEM_VALUE_TRACE_SCHEMA,
     OPCODE_ONLY_SCHEMA,
     REG_INFO_SCHEMA,
     SCHEMAS_BY_TYPE,
+    TMA_TRACE_SCHEMA,
 )
 from .text_validator import (
     parse_text_trace_record,
@@ -69,6 +72,9 @@ __all__ = [
     # Schemas
     "REG_INFO_SCHEMA",
     "MEM_ACCESS_SCHEMA",
+    "MEM_VALUE_TRACE_SCHEMA",
+    "MEM_ADDR_TRACE_SCHEMA",
+    "TMA_TRACE_SCHEMA",
     "OPCODE_ONLY_SCHEMA",
     "DEBUGGER_OPCODE_ONLY_SCHEMA",
     "DELAY_CONFIG_SCHEMA",

@@ -1,0 +1,92 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/mem_addr_trace.schema.json",
+  "title": "CUTracer Memory Address Trace Record",
+  "description": "Schema for MSG_TYPE_MEM_ADDR_ACCESS (type='mem_addr_trace') - records the per-thread memory addresses accessed, captured IPOINT_BEFORE (ipoint='B'). Unlike mem_value_trace, it carries no values / mem_space / access_size.",
+  "type": "object",
+  "required": [
+    "type",
+    "ctx",
+    "trace_index",
+    "timestamp",
+    "grid_launch_id",
+    "cta",
+    "warp",
+    "opcode_id",
+    "pc",
+    "ipoint",
+    "addrs"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["mem_addr_trace"],
+      "description": "Message type identifier"
+    },
+    "ctx": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "CUDA context pointer in hex format"
+    },
+    "sass": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SASS instruction string (injected by the Python TraceReader on read; not present in raw NDJSON)"
+    },
+    "trace_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequential index of this trace record"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Timestamp when trace was captured"
+    },
+    "grid_launch_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Kernel launch identifier"
+    },
+    "cta": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "CTA (Cooperative Thread Array) coordinates [x, y, z]"
+    },
+    "warp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Warp ID within the CTA"
+    },
+    "opcode_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Opcode identifier"
+    },
+    "pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Instruction byte offset within the kernel function (hex). This is not an absolute virtual address; combine with func_addr from kernel_metadata to get the runtime address."
+    },
+    "ipoint": {
+      "type": "string",
+      "enum": ["B"],
+      "description": "Instrumentation point: 'B' (IPOINT_BEFORE) for address-only traces."
+    },
+    "addrs": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 32,
+      "maxItems": 32,
+      "description": "Memory addresses accessed by each of the 32 threads in the warp."
+    }
+  },
+  "additionalProperties": false
+}

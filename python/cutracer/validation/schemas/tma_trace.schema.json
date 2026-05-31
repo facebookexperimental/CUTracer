@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/tma_trace.schema.json",
+  "title": "CUTracer TMA Access Trace Record",
+  "description": "Schema for MSG_TYPE_TMA_ACCESS (type='tma_trace') - records TMA (Tensor Memory Accelerator) descriptor / transfer info for UTMALDG/UTMASTG/UTMAREDG etc. Two writer variants are accepted: the current writer emits tma_param_size + tma_transfer_info (+ desc_addr), while older traces emit desc_addr + desc_raw. Only the common fields are required; the descriptor fields are version-dependent and optional.",
+  "type": "object",
+  "required": [
+    "type",
+    "ctx",
+    "trace_index",
+    "timestamp",
+    "grid_launch_id",
+    "cta",
+    "warp",
+    "opcode_id",
+    "pc"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["tma_trace"],
+      "description": "Message type identifier"
+    },
+    "ctx": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "CUDA context pointer in hex format"
+    },
+    "sass": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SASS instruction string (injected by the Python TraceReader on read; not present in raw NDJSON)"
+    },
+    "trace_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequential index of this trace record"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Timestamp when trace was captured"
+    },
+    "grid_launch_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Kernel launch identifier"
+    },
+    "cta": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "CTA (Cooperative Thread Array) coordinates [x, y, z]"
+    },
+    "warp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Warp ID within the CTA"
+    },
+    "opcode_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Opcode identifier"
+    },
+    "pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Instruction byte offset within the kernel function (hex). This is not an absolute virtual address; combine with func_addr from kernel_metadata to get the runtime address."
+    },
+    "desc_addr": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Stable per-tensor key (hex): the parsed global tensor address (tiled) or raw bulk-copy source address. Used by downstream analyzers for dedup."
+    },
+    "desc_raw": {
+      "type": "array",
+      "items": {
+        "type": ["string", "integer"]
+      },
+      "description": "Legacy 16-qword raw TMA descriptor blob. Each qword is a hex string (\"0x...\") or integer. Emitted by older traces only; the current writer prefers the structured tma_transfer_info field. decode_tma_descriptor() accepts both forms."
+    },
+    "tma_param_size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Size in bytes of the captured TMA parameter handle (always emitted by the current writer)."
+    },
+    "tma_transfer_info": {
+      "type": "object",
+      "description": "NVBit 1.8+ structured TMA transfer info parsed by nvbit_parse_tma_transfer_info (is_bulk/is_tensor, src/dst memory spaces and shared-memory data/mbarrier addresses, tiled tensor map). Present only when the handle parsed successfully. Nested structure is version-dependent and intentionally not constrained here."
+    }
+  },
+  "additionalProperties": false
+}

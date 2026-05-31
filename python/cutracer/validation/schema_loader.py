@@ -9,7 +9,11 @@ message type.
 
 Schema files are located in the 'schemas/' subdirectory:
 - reg_trace.schema.json: Schema for register trace records
-- mem_trace.schema.json: Schema for memory access trace records
+- mem_trace.schema.json: Legacy memory access schema (addrs only); kept for
+  backward compatibility. Current writer emits mem_value_trace / mem_addr_trace.
+- mem_value_trace.schema.json: Schema for MSG_TYPE_MEM_VALUE_ACCESS records
+- mem_addr_trace.schema.json: Schema for MSG_TYPE_MEM_ADDR_ACCESS records
+- tma_trace.schema.json: Schema for MSG_TYPE_TMA_ACCESS records
 - opcode_only.schema.json: Schema for opcode-only trace records
 - cuda_gdb_opcode_only.schema.json: Schema for cuda-gdb opcode_only records
 """
@@ -64,15 +68,25 @@ def _load_schema(schema_name: str) -> dict[str, Any]:
 # Load schemas from JSON files
 REG_INFO_SCHEMA: dict[str, Any] = _load_schema("reg_trace")
 MEM_ACCESS_SCHEMA: dict[str, Any] = _load_schema("mem_trace")
+MEM_VALUE_TRACE_SCHEMA: dict[str, Any] = _load_schema("mem_value_trace")
+MEM_ADDR_TRACE_SCHEMA: dict[str, Any] = _load_schema("mem_addr_trace")
+TMA_TRACE_SCHEMA: dict[str, Any] = _load_schema("tma_trace")
 OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("opcode_only")
 DEBUGGER_OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("cuda_gdb_opcode_only")
 DELAY_CONFIG_SCHEMA: dict[str, Any] = _load_schema("delay_config")
 KERNEL_METADATA_SCHEMA: dict[str, Any] = _load_schema("kernel_metadata")
 
-# Mapping from type field to schema (for trace records with "type" field)
+# Mapping from type field to schema (for trace records with "type" field).
+# Keys are the exact `type` strings emitted by the C++ writer
+# (trace_writer.cpp:657-674). `mem_trace` is retained for backward
+# compatibility with old fixtures; the current writer emits the distinct
+# `mem_value_trace` / `mem_addr_trace` / `tma_trace` types.
 SCHEMAS_BY_TYPE: dict[str, dict[str, Any]] = {
     "reg_trace": REG_INFO_SCHEMA,
     "mem_trace": MEM_ACCESS_SCHEMA,
+    "mem_value_trace": MEM_VALUE_TRACE_SCHEMA,
+    "mem_addr_trace": MEM_ADDR_TRACE_SCHEMA,
+    "tma_trace": TMA_TRACE_SCHEMA,
     "opcode_only": OPCODE_ONLY_SCHEMA,
     "kernel_metadata": KERNEL_METADATA_SCHEMA,
 }

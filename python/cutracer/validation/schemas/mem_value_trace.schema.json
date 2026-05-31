@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/mem_value_trace.schema.json",
+  "title": "CUTracer Memory Value Trace Record",
+  "description": "Schema for MSG_TYPE_MEM_VALUE_ACCESS (type='mem_value_trace') - records the per-thread memory addresses AND the values read/written, captured IPOINT_AFTER (ipoint='A').",
+  "type": "object",
+  "required": [
+    "type",
+    "ctx",
+    "trace_index",
+    "timestamp",
+    "grid_launch_id",
+    "cta",
+    "warp",
+    "opcode_id",
+    "pc",
+    "ipoint",
+    "mem_space",
+    "is_load",
+    "access_size",
+    "addrs",
+    "values"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["mem_value_trace"],
+      "description": "Message type identifier"
+    },
+    "ctx": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "CUDA context pointer in hex format"
+    },
+    "sass": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SASS instruction string (injected by the Python TraceReader on read; not present in raw NDJSON)"
+    },
+    "trace_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequential index of this trace record"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Timestamp when trace was captured"
+    },
+    "grid_launch_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Kernel launch identifier"
+    },
+    "cta": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "CTA (Cooperative Thread Array) coordinates [x, y, z]"
+    },
+    "warp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Warp ID within the CTA"
+    },
+    "opcode_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Opcode identifier"
+    },
+    "pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Instruction byte offset within the kernel function (hex). This is not an absolute virtual address; combine with func_addr from kernel_metadata to get the runtime address."
+    },
+    "ipoint": {
+      "type": "string",
+      "enum": ["A"],
+      "description": "Instrumentation point: 'A' (IPOINT_AFTER) for value traces, so the read/written values are observable."
+    },
+    "mem_space": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Memory space enum index (e.g., global / shared / local) as reported by NVBit."
+    },
+    "is_load": {
+      "type": "boolean",
+      "description": "True for a load (read), false for a store (write)."
+    },
+    "access_size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Access size in bytes; determines how many 32-bit value words per thread are emitted (ceil(access_size/4), capped at 4)."
+    },
+    "addrs": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 32,
+      "maxItems": 32,
+      "description": "Memory addresses accessed by each of the 32 threads in the warp."
+    },
+    "values": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        },
+        "minItems": 1,
+        "maxItems": 4
+      },
+      "minItems": 32,
+      "maxItems": 32,
+      "description": "Per-thread value words [thread_index][word_index]; inner length = ceil(access_size/4) capped at 4."
+    }
+  },
+  "additionalProperties": false
+}
