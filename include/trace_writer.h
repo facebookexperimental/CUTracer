@@ -311,6 +311,13 @@ class TraceWriter {
   void write_json_format(const TraceRecord& record);
 
   /**
+   * @brief Build the canonical nlohmann NDJSON line for a record (no trailing
+   *        newline). Returns an empty string on error. Also used as the A/B
+   *        reference for the rapidjson serializer prototype.
+   */
+  std::string build_nlohmann_line(const TraceRecord& record);
+
+  /**
    * @brief Write CLP archive (mode 3).
    */
   void write_clp_archive();
