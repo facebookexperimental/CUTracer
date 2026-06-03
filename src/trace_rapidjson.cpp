@@ -10,9 +10,11 @@
 // Split out of trace_writer.cpp so it can be compiled into host unit tests
 // without pulling in libnvbit's CUDA-driver-bound global initializer: this TU
 // needs only nvbit *headers* (for TraceRecord's field types), never any nvbit
-// library symbol. reg/mem/opcode/mem_value emit keys in lexicographic order so
-// the output stays byte-identical to nlohmann; tma is not handled here (the
-// caller falls back to nlohmann — see D3).
+// library symbol (the InstrType enum-string tables tma uses are `constexpr` in
+// nvbit headers, not lib symbols). reg/mem/opcode/mem_value emit keys in
+// lexicographic order so the output stays byte-identical to nlohmann; tma emits
+// in natural order (validated semantically, since no consumer depends on key
+// order — matching the migration's contract).
 
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
@@ -198,15 +200,192 @@ void rj_mem_value(JW& w, const TraceRecord& rec, const mem_value_access_t* m) {
   w.EndObject();
 }
 
+// ---- tma_trace -------------------------------------------------------------
+// Mirrors the nlohmann serialize_tma_* family in trace_writer.cpp, in natural
+// (source) order. Uses only nvbit header types and the `constexpr` InstrType
+// enum-string tables, so it stays free of any nvbit library symbol.
+
+// Emit `"key":"<table[idx]>"`, falling back to the integer (as a string) when
+// out of range — matches enum_str() in trace_writer.cpp.
+template <size_t N>
+void rj_key_enum(JW& w, const char* key, const char* const (&table)[N], int idx) {
+  w.Key(key);
+  if (idx < 0 || static_cast<size_t>(idx) >= N) {
+    const std::string s = std::to_string(idx);
+    w.String(s.c_str(), static_cast<rapidjson::SizeType>(s.size()));
+  } else {
+    w.String(table[idx]);
+  }
+}
+
+void rj_key_u64_arr(JW& w, const char* key, const uint64_t* p, int n) {
+  w.Key(key);
+  w.StartArray();
+  for (int i = 0; i < n; i++) {
+    w.Uint64(p[i]);
+  }
+  w.EndArray();
+}
+
+void rj_key_u32_arr(JW& w, const char* key, const uint32_t* p, int n) {
+  w.Key(key);
+  w.StartArray();
+  for (int i = 0; i < n; i++) {
+    w.Uint(p[i]);
+  }
+  w.EndArray();
+}
+
+void rj_key_i32_arr(JW& w, const char* key, const int32_t* p, int n) {
+  w.Key(key);
+  w.StartArray();
+  for (int i = 0; i < n; i++) {
+    w.Int(p[i]);
+  }
+  w.EndArray();
+}
+
+// Shared-memory address sub-object (UTMALDG dst / UTMASTG src). Read the
+// `.shared` union member only — callers guard on the memspace being SHARED.
+void rj_tma_shared_addr(JW& w, const char* key, const TMAAddress_t& addr) {
+  w.Key(key);
+  w.StartObject();
+  w.Key("data_address");
+  w.Uint(addr.shared.data_address);
+  w.Key("data_address_offset");
+  w.Uint(addr.shared.data_address_offset);
+  w.Key("data_address_cluster_cta_id");
+  w.Uint(addr.shared.data_address_cluster_cta_id);
+  w.Key("is_mbar_valid");
+  w.Bool(addr.shared.is_mbar_valid);
+  if (addr.shared.is_mbar_valid) {
+    w.Key("mbar_address");
+    w.Uint(addr.shared.mbar_address);
+    w.Key("mbar_address_offset");
+    w.Uint(addr.shared.mbar_address_offset);
+    w.Key("mbar_address_cluster_cta_id");
+    w.Uint(addr.shared.mbar_address_cluster_cta_id);
+  }
+  w.EndObject();
+}
+
+// Tiled tensor map. Only call when is_tensor && tensor.mode == TILED.
+void rj_tma_tiled(JW& w, const TMATransferInfo_t& info) {
+  const auto& tiled = info.tensor.map.tiled;
+  w.Key("tiled");
+  w.StartObject();
+  rj_key_enum(w, "data_type", InstrType::CUtensorMapDataTypeStr, static_cast<int>(tiled.tensorDataType));
+  w.Key("data_type_id");
+  w.Int(static_cast<int>(tiled.tensorDataType));
+  w.Key("rank");
+  w.Uint(tiled.tensorRank);
+  rj_key_hex(w, "global_address", reinterpret_cast<uintptr_t>(tiled.globalAddress));
+  rj_key_u64_arr(w, "global_dim", tiled.globalDim, InstrType::MAX_TMA_DIM);
+  rj_key_u64_arr(w, "global_strides", tiled.globalStrides, InstrType::MAX_TMA_DIM - 1);
+  rj_key_u32_arr(w, "box_dim", tiled.boxDim, InstrType::MAX_TMA_DIM);
+  rj_key_u32_arr(w, "element_strides", tiled.elementStrides, InstrType::MAX_TMA_DIM);
+  rj_key_enum(w, "interleave", InstrType::CUtensorMapInterleaveStr, static_cast<int>(tiled.interleave));
+  w.Key("interleave_id");
+  w.Int(static_cast<int>(tiled.interleave));
+  rj_key_enum(w, "swizzle", InstrType::CUtensorMapSwizzleStr, static_cast<int>(tiled.swizzle));
+  w.Key("swizzle_id");
+  w.Int(static_cast<int>(tiled.swizzle));
+  rj_key_enum(w, "l2_promotion", InstrType::CUtensorMapL2promotionStr, static_cast<int>(tiled.l2Promotion));
+  rj_key_enum(w, "oob_fill", InstrType::CUtensorMapFloatOOBfillStr, static_cast<int>(tiled.oobFill));
+  w.EndObject();
+}
+
+void rj_tma_transfer_info(JW& w, const TMATransferInfo_t& info) {
+  w.Key("is_bulk");
+  w.Bool(info.is_bulk);
+  w.Key("is_tensor");
+  w.Bool(info.is_tensor);
+  w.Key("is_prefetch");
+  w.Bool(info.is_prefetch);
+  w.Key("is_multicast");
+  w.Bool(info.is_multicast);
+  w.Key("transfer_count");
+  w.Uint(info.transfer_count);
+  w.Key("transfer_size");
+  w.Uint(info.transfer_size);
+  w.Key("byte_count");
+  w.Uint64(info.byte_count);
+  w.Key("multicast_cta_mask");
+  w.Uint(info.multicast_cta_mask);
+  rj_key_enum(w, "src_memspace", InstrType::MemorySpaceStr, static_cast<int>(info.src_memspace));
+  rj_key_enum(w, "dst_memspace", InstrType::MemorySpaceStr, static_cast<int>(info.dst_memspace));
+
+  if (info.dst_memspace == InstrType::MemorySpace::SHARED ||
+      info.dst_memspace == InstrType::MemorySpace::DISTRIBUTED_SHARED) {
+    rj_tma_shared_addr(w, "dst", info.dst);
+  }
+  if (info.src_memspace == InstrType::MemorySpace::SHARED ||
+      info.src_memspace == InstrType::MemorySpace::DISTRIBUTED_SHARED) {
+    rj_tma_shared_addr(w, "src", info.src);
+  }
+
+  if (!info.is_tensor) {
+    return;
+  }
+  w.Key("tensor");
+  w.StartObject();
+  w.Key("dim");
+  w.Uint(info.tensor.dim);
+  rj_key_enum(w, "mode", InstrType::TMALoadModeStr, static_cast<int>(info.tensor.mode));
+  rj_key_i32_arr(w, "coords", info.tensor.coords, InstrType::MAX_TMA_DIM);
+  w.Key("intended_transfer_count");
+  w.Uint(info.tensor.intended_transfer_count);
+  w.Key("oob_transfer_count");
+  w.Uint(info.tensor.oob_transfer_count);
+  if (info.tensor.mode == InstrType::TMALoadMode::TILED) {
+    rj_tma_tiled(w, info);
+  }
+  w.EndObject();
+}
+
+void rj_tma(JW& w, const TraceRecord& rec, const tma_access_t* t, const TMATransferInfo_t* info) {
+  w.StartObject();
+  rj_cta(w, t->cta_id_x, t->cta_id_y, t->cta_id_z);
+  rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
+  w.Key("grid_launch_id");
+  w.Uint64(t->kernel_launch_id);
+  w.Key("opcode_id");
+  w.Int(t->opcode_id);
+  rj_key_hex(w, "pc", t->pc);
+  w.Key("timestamp");
+  w.Uint64(rec.timestamp);
+  w.Key("tma_param_size");
+  w.Uint(t->tma_param_size);
+  w.Key("trace_index");
+  w.Uint64(rec.trace_index);
+  w.Key("type");
+  w.String("tma_trace");
+  w.Key("warp");
+  w.Int(t->warp_id);
+  if (info != nullptr) {
+    w.Key("tma_transfer_info");
+    w.StartObject();
+    rj_tma_transfer_info(w, *info);
+    w.EndObject();
+    // Stable per-tensor key for downstream dedup: parsed global tensor address
+    // for tiled tensors, else the raw bulk source address.
+    if (info->is_tensor && info->tensor.mode == InstrType::TMALoadMode::TILED) {
+      rj_key_hex(w, "desc_addr", reinterpret_cast<uintptr_t>(info->tensor.map.tiled.globalAddress));
+    } else if (info->is_bulk) {
+      rj_key_hex(w, "desc_addr", info->src.global.bulk_copy_address);
+    }
+  }
+  w.EndObject();
+}
+
 }  // namespace
 
 namespace cutracer {
 
-// Serialize a record into `sb` via rapidjson. Returns false for types not
-// handled here (MSG_TYPE_TMA_ACCESS / unknown / null data) so the caller falls
-// back to nlohmann. On success `sb` holds the complete NDJSON line (no trailing
-// newline); the caller appends it directly (or, in ab mode, materializes a
-// string to compare).
+// Serialize a record into `sb` via rapidjson. Returns false only for unknown
+// types or null data so the caller falls back to nlohmann. On success `sb`
+// holds the complete NDJSON line (no trailing newline); the caller appends it
+// directly (or, in ab mode, materializes a string to compare).
 bool rj_serialize_to_buffer(const TraceRecord& rec, rapidjson::StringBuffer& sb) {
   sb.Clear();  // reuse capacity across records
   JW w(sb);
@@ -235,8 +414,14 @@ bool rj_serialize_to_buffer(const TraceRecord& rec, rapidjson::StringBuffer& sb)
       }
       rj_opcode(w, rec, rec.data.opcode_only);
       break;
+    case MSG_TYPE_TMA_ACCESS:
+      if (rec.data.tma_access == nullptr) {
+        return false;
+      }
+      rj_tma(w, rec, rec.data.tma_access, rec.tma_info);
+      break;
     default:
-      return false;  // MSG_TYPE_TMA_ACCESS and unknown → nlohmann fallback
+      return false;  // unknown type → nlohmann fallback
   }
   return true;
 }

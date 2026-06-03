@@ -15,9 +15,8 @@ namespace cutracer {
  * @brief Serialize one trace record to its NDJSON line via the rapidjson
  *        streaming writer (no trailing newline).
  *
- * Returns an empty string for record types the rapidjson path does not handle
- * (currently tma_trace, plus null/unknown data) — these fall back to nlohmann
- * in the live writer. This is a thin, engine-explicit seam over the same
+ * Returns an empty string only for unknown types or null data — these fall
+ * back to nlohmann in the live writer. This is a thin, engine-explicit seam over the same
  * serializer used by write_json_format(); it exists so unit tests (and ad-hoc
  * diagnostics) can exercise the rapidjson output directly, bypassing the
  * CUTRACER_JSON_ENGINE env dispatch and file IO.

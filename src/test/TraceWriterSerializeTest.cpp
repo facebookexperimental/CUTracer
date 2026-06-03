@@ -318,14 +318,149 @@ TEST(SerializeRecordRapidjson, MemValueTrace_RegsPerLaneClampedToFour) {
   EXPECT_EQ(out["values"][0].size(), 4u);
 }
 
-TEST(SerializeRecordRapidjson, TmaTrace_ReturnsEmptyDeferredToNlohmann) {
+// With no parsed transfer info, only the base record is emitted (no
+// tma_transfer_info / desc_addr) -- matches nlohmann's `if (info != nullptr)`.
+TEST(SerializeRecordRapidjson, TmaTrace_NoTransferInfo_BaseFieldsOnly) {
   tma_access_t t{};
   t.header.type = MSG_TYPE_TMA_ACCESS;
-  const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 0, 0, &t, nullptr);
+  t.cta_id_x = 2;
+  t.cta_id_y = 3;
+  t.cta_id_z = 4;
+  t.warp_id = 5;
+  t.opcode_id = 11;
+  t.kernel_launch_id = 6;
+  t.pc = 0x77;
+  t.tma_param_size = 128;
+  const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 9, 10, &t, nullptr);
 
-  // The rapidjson path does not yet handle tma; the live writer falls back to
-  // nlohmann. D3 ports tma and flips this expectation.
-  EXPECT_TRUE(cutracer::serialize_record_rapidjson(rec).empty());
+  nlohmann::json expected;
+  expected["type"] = "tma_trace";
+  expected["cta"] = {2, 3, 4};
+  expected["ctx"] = kCtxHex;
+  expected["grid_launch_id"] = 6;
+  expected["opcode_id"] = 11;
+  expected["pc"] = "0x77";
+  expected["timestamp"] = 10;
+  expected["tma_param_size"] = 128;
+  expected["trace_index"] = 9;
+  expected["warp"] = 5;
+
+  const nlohmann::json out = parseRj(rec);
+  EXPECT_EQ(out, expected);
+  EXPECT_FALSE(out.contains("tma_transfer_info"));
+  EXPECT_FALSE(out.contains("desc_addr"));
+}
+
+// Tiled tensor with a shared-memory destination (UTMALDG) and a valid mbar:
+// exercises the dst sub-object (with mbar keys), the tensor/tiled nesting, the
+// enum-string tables, and desc_addr from the tiled global address.
+TEST(SerializeRecordRapidjson, TmaTrace_TiledTensorWithSharedDst) {
+  tma_access_t t{};
+  t.header.type = MSG_TYPE_TMA_ACCESS;
+  t.tma_param_size = 64;
+
+  TMATransferInfo_t info{};
+  info.is_tensor = true;
+  info.transfer_count = 3;
+  info.byte_count = 0x100000000ull;  // > 2^32 -> Uint64
+  info.dst_memspace = InstrType::MemorySpace::SHARED;
+  info.dst.shared.data_address = 0x400;
+  info.dst.shared.data_address_offset = 0x10;
+  info.dst.shared.data_address_cluster_cta_id = 1;
+  info.dst.shared.is_mbar_valid = true;
+  info.dst.shared.mbar_address = 0x800;
+  info.dst.shared.mbar_address_offset = 0x20;
+  info.dst.shared.mbar_address_cluster_cta_id = 2;
+  info.tensor.dim = 2;
+  info.tensor.mode = InstrType::TMALoadMode::TILED;
+  auto& tiled = info.tensor.map.tiled;
+  tiled.tensorDataType = static_cast<CUtensorMapDataType>(2);  // CUtensorMapDataTypeStr[2]
+  tiled.tensorRank = 2;
+  tiled.globalAddress = reinterpret_cast<void*>(0xDEADBEEF000ull);
+  for (int i = 0; i < InstrType::MAX_TMA_DIM; i++) {
+    tiled.globalDim[i] = 100 + i;
+  }
+  tiled.swizzle = static_cast<CUtensorMapSwizzle>(3);  // CUtensorMapSwizzleStr[3]
+
+  const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 1, 2, &t, &info);
+  const nlohmann::json out = parseRj(rec);
+
+  ASSERT_TRUE(out.contains("tma_transfer_info"));
+  const nlohmann::json& ti = out["tma_transfer_info"];
+  EXPECT_EQ(ti["is_tensor"], nlohmann::json(true));
+  EXPECT_EQ(ti["byte_count"], nlohmann::json(0x100000000ull));
+  EXPECT_EQ(ti["dst_memspace"],
+            nlohmann::json(InstrType::MemorySpaceStr[static_cast<int>(InstrType::MemorySpace::SHARED)]));
+
+  ASSERT_TRUE(ti.contains("dst"));
+  EXPECT_EQ(ti["dst"]["data_address"], nlohmann::json(0x400));
+  EXPECT_EQ(ti["dst"]["is_mbar_valid"], nlohmann::json(true));
+  EXPECT_EQ(ti["dst"]["mbar_address"], nlohmann::json(0x800));
+  EXPECT_FALSE(ti.contains("src"));  // src memspace is not SHARED
+
+  ASSERT_TRUE(ti.contains("tensor"));
+  EXPECT_EQ(ti["tensor"]["mode"], nlohmann::json("TILED"));
+  ASSERT_TRUE(ti["tensor"].contains("tiled"));
+  const nlohmann::json& tj = ti["tensor"]["tiled"];
+  EXPECT_EQ(tj["data_type"], nlohmann::json(InstrType::CUtensorMapDataTypeStr[2]));
+  EXPECT_EQ(tj["data_type_id"], nlohmann::json(2));
+  EXPECT_EQ(tj["swizzle"], nlohmann::json(InstrType::CUtensorMapSwizzleStr[3]));
+  EXPECT_EQ(tj["global_address"], nlohmann::json("0xdeadbeef000"));
+  ASSERT_TRUE(tj["global_dim"].is_array());
+  EXPECT_EQ(tj["global_dim"].size(), static_cast<size_t>(InstrType::MAX_TMA_DIM));
+  EXPECT_EQ(tj["global_dim"][0], nlohmann::json(100));
+
+  EXPECT_EQ(out["desc_addr"], nlohmann::json("0xdeadbeef000"));  // from tiled global address
+}
+
+// Shared-memory source (UTMASTG) with an invalid mbar: the mbar keys are
+// omitted, dst is absent, and a non-tensor non-bulk transfer has no desc_addr.
+TEST(SerializeRecordRapidjson, TmaTrace_SharedSrcNoMbar) {
+  tma_access_t t{};
+  t.header.type = MSG_TYPE_TMA_ACCESS;
+  t.tma_param_size = 16;
+
+  TMATransferInfo_t info{};
+  info.src_memspace = InstrType::MemorySpace::SHARED;
+  info.src.shared.data_address = 0x10;
+  info.src.shared.is_mbar_valid = false;
+
+  const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 0, 0, &t, &info);
+  const nlohmann::json out = parseRj(rec);
+  const nlohmann::json& ti = out["tma_transfer_info"];
+
+  ASSERT_TRUE(ti.contains("src"));
+  EXPECT_EQ(ti["src"]["data_address"], nlohmann::json(0x10));
+  EXPECT_EQ(ti["src"]["is_mbar_valid"], nlohmann::json(false));
+  EXPECT_FALSE(ti["src"].contains("mbar_address"));  // omitted when invalid
+  EXPECT_FALSE(ti.contains("dst"));
+  EXPECT_FALSE(ti.contains("tensor"));
+  EXPECT_FALSE(out.contains("desc_addr"));
+}
+
+// Bulk (non-tensor) copy between global spaces: no shared sub-objects, no
+// tensor, and desc_addr falls back to the bulk source address.
+TEST(SerializeRecordRapidjson, TmaTrace_BulkNonTensorDescAddrFromBulk) {
+  tma_access_t t{};
+  t.header.type = MSG_TYPE_TMA_ACCESS;
+  t.tma_param_size = 8;
+
+  TMATransferInfo_t info{};
+  info.is_bulk = true;
+  info.is_tensor = false;
+  info.src_memspace = InstrType::MemorySpace::GLOBAL;
+  info.dst_memspace = InstrType::MemorySpace::GLOBAL;
+  info.src.global.bulk_copy_address = 0x5000;
+
+  const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 0, 0, &t, &info);
+  const nlohmann::json out = parseRj(rec);
+  const nlohmann::json& ti = out["tma_transfer_info"];
+
+  EXPECT_EQ(ti["is_bulk"], nlohmann::json(true));
+  EXPECT_FALSE(ti.contains("dst"));
+  EXPECT_FALSE(ti.contains("src"));
+  EXPECT_FALSE(ti.contains("tensor"));
+  EXPECT_EQ(out["desc_addr"], nlohmann::json("0x5000"));  // from bulk_copy_address
 }
 
 TEST(SerializeRecordRapidjson, NullData_ReturnsEmpty) {
