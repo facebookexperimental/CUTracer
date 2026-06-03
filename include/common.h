@@ -126,7 +126,7 @@ typedef struct {
  */
 struct RegIndices {
   std::vector<uint8_t> reg_indices;   // R register numbers: 0-254 (R0-R254)
-  std::vector<uint8_t> ureg_indices;  // UR register numbers: 0-62 (UR0-UR62)
+  std::vector<uint8_t> ureg_indices;  // UR register numbers (uint8_t; UR0-UR62 + special, e.g. SM100 emits UR63/UR64)
 };
 
 #endif /* __cplusplus */

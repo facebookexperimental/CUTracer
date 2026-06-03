@@ -105,9 +105,9 @@
       "items": {
         "type": "integer",
         "minimum": 0,
-        "maximum": 62
+        "maximum": 255
       },
-      "description": "Uniform register indices corresponding to uregs values (e.g., [8, 9, 12, 13] means UR8, UR9, UR12, UR13)"
+      "description": "Uniform register indices corresponding to uregs values (e.g., [8, 9, 12, 13] means UR8, UR9, UR12, UR13). uint8_t range like regs_indices; SM100/Blackwell emits high indices (e.g. UR63/UR64) for uniform-zero/special registers."
     }
   },
   "additionalProperties": false
