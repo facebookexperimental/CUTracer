@@ -311,13 +311,6 @@ class TraceWriter {
   void write_json_format(const TraceRecord& record);
 
   /**
-   * @brief Build the canonical nlohmann NDJSON line for a record (no trailing
-   *        newline). Returns an empty string on error. Also used as the A/B
-   *        reference for the rapidjson serializer prototype.
-   */
-  std::string build_nlohmann_line(const TraceRecord& record);
-
-  /**
    * @brief Write CLP archive (mode 3).
    */
   void write_clp_archive();
@@ -347,35 +340,4 @@ class TraceWriter {
    * @return true if all data written successfully, false on error
    */
   bool write_data(const char* data, size_t size, const char* data_type);
-
-  // ========== JSON serialization ==========
-
-  /**
-   * @brief Serialize reg_info_t fields to JSON object.
-   */
-  void serialize_reg_info(nlohmann::json& j, const reg_info_t* reg, const RegIndices* indices);
-
-  /**
-   * @brief Serialize mem_addr_access_t fields to JSON object.
-   */
-  void serialize_mem_access(nlohmann::json& j, const mem_addr_access_t* mem);
-
-  /**
-   * @brief Serialize opcode_only_t fields to JSON object.
-   */
-  void serialize_opcode_only(nlohmann::json& j, const opcode_only_t* opcode);
-
-  /**
-   * @brief Serialize mem_value_access_t fields to JSON object.
-   */
-  void serialize_mem_value_access(nlohmann::json& j, const mem_value_access_t* mem);
-
-  /**
-   * @brief Serialize tma_access_t fields to JSON object.
-   *
-   * @param tma Raw GPU-side TMA record (always non-null on dispatch).
-   * @param info Parsed transfer info from nvbit_parse_tma_transfer_info(); may
-   *             be null for legacy paths or when parsing failed.
-   */
-  void serialize_tma_access(nlohmann::json& j, const tma_access_t* tma, const TMATransferInfo_t* info);
 };

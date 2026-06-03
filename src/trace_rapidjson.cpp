@@ -12,9 +12,8 @@
 // needs only nvbit *headers* (for TraceRecord's field types), never any nvbit
 // library symbol (the InstrType enum-string tables tma uses are `constexpr` in
 // nvbit headers, not lib symbols). reg/mem/opcode/mem_value emit keys in
-// lexicographic order so the output stays byte-identical to nlohmann; tma emits
-// in natural order (validated semantically, since no consumer depends on key
-// order — matching the migration's contract).
+// lexicographic order and tma in natural order; no consumer depends on key
+// order (the migration's contract).
 
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
@@ -382,10 +381,9 @@ void rj_tma(JW& w, const TraceRecord& rec, const tma_access_t* t, const TMATrans
 
 namespace cutracer {
 
-// Serialize a record into `sb` via rapidjson. Returns false only for unknown
-// types or null data so the caller falls back to nlohmann. On success `sb`
-// holds the complete NDJSON line (no trailing newline); the caller appends it
-// directly (or, in ab mode, materializes a string to compare).
+// Serialize a record into `sb` via rapidjson. Returns false only for an unknown
+// type or null data (the caller skips such records). On success `sb` holds the
+// complete NDJSON line (no trailing newline); the caller appends it directly.
 bool rj_serialize_to_buffer(const TraceRecord& rec, rapidjson::StringBuffer& sb) {
   sb.Clear();  // reuse capacity across records
   JW w(sb);
@@ -423,13 +421,12 @@ bool rj_serialize_to_buffer(const TraceRecord& rec, rapidjson::StringBuffer& sb)
     default:
       return false;  // unknown type → nlohmann fallback
   }
-  return true;
+  return w.IsComplete();  // defensive: false if the writer state is incomplete/malformed
 }
 
 // Test/diagnostic seam (declared in trace_serialize.h): serialize one record
-// through the rapidjson path, bypassing the CUTRACER_JSON_ENGINE dispatch and
-// file IO. Returns "" for types the rapidjson path doesn't handle (tma / null /
-// unknown), which fall back to nlohmann in the live writer.
+// through the rapidjson path, without the TraceWriter buffer/file IO. Returns
+// "" only for an unknown type or null data (which the live writer skips).
 std::string serialize_record_rapidjson(const TraceRecord& record) {
   rapidjson::StringBuffer sb;
   if (!rj_serialize_to_buffer(record, sb)) {

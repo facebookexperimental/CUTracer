@@ -12,8 +12,8 @@
 namespace cutracer {
 
 // Serialize `record` into `sb` via the rapidjson streaming writer (no trailing
-// newline). Returns false only for unknown types or null data so the caller
-// falls back to nlohmann. Defined in trace_rapidjson.cpp.
+// newline). Returns false only for an unknown type or null data (the caller
+// skips such records). Defined in trace_rapidjson.cpp.
 //
 // Internal seam shared by the live writer (write_json_format) and the unit
 // tests. NOT included by trace_writer.h, so rapidjson never reaches the nvcc
