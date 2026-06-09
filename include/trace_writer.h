@@ -7,8 +7,10 @@
 
 #include <zstd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -214,7 +216,16 @@ class TraceWriter {
   std::string json_buffer_;
   size_t buffer_threshold_;
   TraceMode trace_mode_;
-  bool enabled_;
+  std::atomic<bool> enabled_;
+
+  // Serializes every public mutator (write_trace, write_metadata, flush,
+  // disable). TraceWriter is reachable concurrently from multiple threads:
+  // each per-CTX recv_thread_fun in analysis.cu holds only a shared_lock on
+  // the writers map and then calls write_trace() directly on the writer.
+  // Without this mutex, concurrent append/+= on json_buffer_ corrupts the
+  // std::string's internal heap allocation (libstdc++ _M_mutate double-free,
+  // reproduced deterministically by tests/unit/test_trace_writer_stress).
+  mutable std::mutex mu_;
 
   // ========== Mode 1 (Zstd compression) support ==========
   ZSTD_CCtx* zstd_ctx_;                  // Zstd compression context
@@ -271,9 +282,12 @@ class TraceWriter {
 
   /**
    * @brief Check if writer is functional.
+   *
+   * Lock-free atomic read; the value may go stale immediately after the call
+   * if another thread invokes disable(). Callers should treat it as advisory.
    */
   bool is_enabled() const {
-    return enabled_;
+    return enabled_.load(std::memory_order_acquire);
   }
 
   /**
