@@ -98,6 +98,7 @@ nvbit_release/
 *.log
 third_party/nvbit
 third_party/nlohmann
+third_party/rapidjson
 
 tests/vectoradd/vectoradd
 tests/vectoradd_smem/vectoradd_smem

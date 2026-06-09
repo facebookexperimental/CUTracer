@@ -4,8 +4,9 @@
 # Script to download and install third-party dependencies for CUTracer
 #
 # Environment Variables:
-#   NVBIT_VERSION  - NVBit version (or "latest" for latest release)
-#   JSON_VERSION   - nlohmann/json version
+#   NVBIT_VERSION       - NVBit version (or "latest" for latest release)
+#   JSON_VERSION        - nlohmann/json version
+#   RAPIDJSON_VERSION   - rapidjson release tag (header-only)
 #
 # Usage:
 #   ./install_third_party.sh                        # Use defaults
@@ -17,6 +18,7 @@
 # ============================================================
 NVBIT_VERSION="${NVBIT_VERSION:-1.8}"
 JSON_VERSION="${JSON_VERSION:-3.12.0}"
+RAPIDJSON_VERSION="${RAPIDJSON_VERSION:-1.1.0}"
 
 # ============================================================
 # Install NVBit
@@ -144,6 +146,48 @@ else
     echo "Error: Failed to download nlohmann/json."
     exit 1
 fi
+
+# ============================================================
+# Install rapidjson (header-only)
+# ============================================================
+echo ""
+echo "Downloading rapidjson ${RAPIDJSON_VERSION}..."
+RAPIDJSON_URL="https://github.com/Tencent/rapidjson/archive/refs/tags/v${RAPIDJSON_VERSION}.tar.gz"
+TEMP_FILE=$(mktemp)
+curl -L -o "$TEMP_FILE" "$RAPIDJSON_URL"
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to download rapidjson."
+    rm -f "$TEMP_FILE"
+    exit 1
+fi
+
+TEMP_DIR=$(mktemp -d)
+tar -xzf "$TEMP_FILE" -C "$TEMP_DIR"
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to extract rapidjson."
+    rm -f "$TEMP_FILE"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# rapidjson tarball layout: rapidjson-<version>/include/rapidjson/*.h
+RAPIDJSON_TOP=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d -name 'rapidjson-*' | head -1)
+RAPIDJSON_EXTRACTED="$RAPIDJSON_TOP/include/rapidjson"
+if [ -z "$RAPIDJSON_TOP" ] || [ ! -d "$RAPIDJSON_EXTRACTED" ]; then
+    echo "Error: Unable to find rapidjson headers in extracted archive."
+    rm -f "$TEMP_FILE"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Install headers to third_party/rapidjson so '#include <rapidjson/*.h>' resolves
+# via the existing '-I./third_party' include path in the Makefile.
+rm -rf third_party/rapidjson
+mv "$RAPIDJSON_EXTRACTED" third_party/rapidjson
+rm -f "$TEMP_FILE"
+rm -rf "$TEMP_DIR"
+
+echo "rapidjson ${RAPIDJSON_VERSION} has been successfully installed."
 
 echo ""
 echo "All third-party dependencies have been successfully installed."
