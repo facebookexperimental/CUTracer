@@ -12,10 +12,6 @@ name: CI Build and Test (H100)
 # Both lanes share runner (linux-gcp-h100), cu130 PyTorch, .ci/setup-h100.sh,
 # .ci/run_tests.sh + SKIP_CONDA=1. fail-fast: false so one lane's failure
 # doesn't cancel the other (canary visibility).
-#
-# Trigger surface mirrors test.yml (push branches main/develop + pull_request,
-# both with paths-ignore for docs). test.yml stays in place during cu128 ->
-# cu130 transition; will be retired once both H100 lanes are stable.
 
 on:
   push:
