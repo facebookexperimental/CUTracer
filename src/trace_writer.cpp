@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 #include "env_config.h"
@@ -136,7 +137,8 @@ TraceWriter::~TraceWriter() {
 // ============================================================================
 
 void TraceWriter::write_metadata(const nlohmann::json& metadata) {
-  if (!enabled_) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!enabled_.load(std::memory_order_relaxed)) {
     return;
   }
   // Text mode (mode 0) does not use json_buffer_; skip.
@@ -148,7 +150,8 @@ void TraceWriter::write_metadata(const nlohmann::json& metadata) {
 }
 
 bool TraceWriter::write_trace(const TraceRecord& record) {
-  if (!enabled_) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!enabled_.load(std::memory_order_relaxed)) {
     return false;
   }
 
@@ -163,6 +166,7 @@ bool TraceWriter::write_trace(const TraceRecord& record) {
 }
 
 void TraceWriter::flush() {
+  std::lock_guard<std::mutex> lk(mu_);
   // Dispatch based on trace mode
   if (trace_mode_ == TraceMode::COMPRESSED_NDJSON) {
     write_compressed();
@@ -173,8 +177,14 @@ void TraceWriter::flush() {
 }
 
 void TraceWriter::disable() {
-  flush();
-  enabled_ = false;
+  std::lock_guard<std::mutex> lk(mu_);
+  // Inlined flush() body — we already hold the lock, can't recursively re-take it.
+  if (trace_mode_ == TraceMode::COMPRESSED_NDJSON) {
+    write_compressed();
+  } else if (trace_mode_ == TraceMode::UNCOMPRESSED_NDJSON || trace_mode_ == TraceMode::CLP) {
+    write_uncompressed();
+  }
+  enabled_.store(false, std::memory_order_release);
 }
 
 size_t TraceWriter::get_file_size_bytes() const {
@@ -235,30 +245,17 @@ bool TraceWriter::write_data(const char* data, size_t size, const char* data_typ
 }
 
 void TraceWriter::write_uncompressed() {
-  if (json_buffer_.empty() || !enabled_) {
+  // Caller (write_trace / write_metadata / flush / disable) holds mu_, so
+  // json_buffer_ is stable here. The earlier "NULL bytes at line starts" /
+  // "Mode 1 unaffected" symptom was the std::string::append data race fixed
+  // by mu_ in the public mutators — not anything about pointer staleness
+  // during write_data(). The old std::move(json_buffer_) -> temp_buffer dance
+  // did not actually address that race.
+  if (json_buffer_.empty() || !enabled_.load(std::memory_order_relaxed)) {
     return;
   }
-
-  // CRITICAL FIX: Move json_buffer_ to temp to prevent data corruption
-  //
-  // Problem: Previously used json_buffer_.data() directly during write_data(),
-  // which caused random NULL bytes to appear at line starts in output files.
-  //
-  // Root cause: If json_buffer_ internal pointer becomes invalid during write
-  // (e.g., memory reallocation, or buffer state inconsistency), we'd be
-  // writing from a stale pointer. This manifested as:
-  //   - Random single NULL bytes replacing '{' at JSON line starts
-  //   - Different error lines on each run (non-deterministic)
-  //   - Mode 1 unaffected (uses separate compressed_buffer_)
-  //
-  // Solution: std::move() transfers ownership to temp_buffer BEFORE write,
-  // ensuring json_buffer_ is immediately emptied and safe for new data,
-  // regardless of write_data() success/failure.
-  std::string temp_buffer = std::move(json_buffer_);
-
-  // json_buffer_ is now empty (moved-from state)
-  // Write from the temporary buffer
-  write_data(temp_buffer.data(), temp_buffer.size(), "bytes");
+  write_data(json_buffer_.data(), json_buffer_.size(), "bytes");
+  json_buffer_.clear();
 }
 
 void TraceWriter::write_clp_archive() {
@@ -281,38 +278,26 @@ void TraceWriter::write_clp_archive() {
 }
 
 void TraceWriter::write_compressed() {
-  if (json_buffer_.empty() || !enabled_ || !zstd_ctx_) {
+  // Caller holds mu_; json_buffer_ is stable. Clear it unconditionally after
+  // attempting to compress + write so we never let buffered data grow past
+  // buffer_threshold_ on a transient compression/write failure — the prior
+  // bug of "Mode 1 lost ~50% of records" was caused by skipping the clear
+  // on error and letting the next flush exceed compressed_buffer_ capacity.
+  if (json_buffer_.empty() || !enabled_.load(std::memory_order_relaxed) || !zstd_ctx_) {
     return;
   }
 
-  // CRITICAL FIX: Move json_buffer_ to temp to prevent data loss
-  //
-  // Problem: Previously compressed json_buffer_ directly, then cleared only on
-  // write success. This caused Mode 1 to lose ~50% of records (e.g., 6,835 of
-  // 13,008 records written, 6,173 lost).
-  //
-  // Root cause: If compression or write failed, json_buffer_ wasn't cleared,
-  // causing data to accumulate beyond buffer_threshold_ (1MB). When buffer
-  // exceeded the pre-allocated compressed_buffer_ capacity, subsequent
-  // compressions failed silently, and all remaining data was lost.
-  //
-  // Solution: std::move() transfers ownership to temp_buffer BEFORE compression,
-  // ensuring json_buffer_ is immediately emptied. This prevents buffer overflow
-  // and ensures consistent behavior whether compression/write succeeds or fails.
-  std::string temp_buffer = std::move(json_buffer_);
-
-  // json_buffer_ is now empty (moved-from state)
-  // Compress from the temporary buffer
   size_t compressed_size = ZSTD_compressCCtx(zstd_ctx_, compressed_buffer_.data(), compressed_buffer_.size(),
-                                             temp_buffer.data(), temp_buffer.size(), compression_level_);
+                                             json_buffer_.data(), json_buffer_.size(), compression_level_);
 
-  // Check for compression errors
+  // Always clear the source buffer, success or fail (see comment above).
+  json_buffer_.clear();
+
   if (ZSTD_isError(compressed_size)) {
     fprintf(stderr, "TraceWriter: Zstd compression error: %s\n", ZSTD_getErrorName(compressed_size));
-    return;  // temp_buffer is automatically destroyed, json_buffer_ remains empty
+    return;
   }
 
-  // Write the compressed data
   write_data(compressed_buffer_.data(), compressed_size, "compressed bytes");
 }
 
