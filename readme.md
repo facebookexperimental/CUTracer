@@ -125,9 +125,13 @@ cutracer validate output.ndjson
     -   Default of 9 provides balanced compression speed and ratio
 - `CUTRACER_DELAY_NS`: Max delay value in nanoseconds for `random_delay` analysis (required when `random_delay` is enabled)
 - `CUTRACER_DELAY_MIN_NS`: Minimum delay in nanoseconds — floor for random mode (default: 0). Must be ≤ `CUTRACER_DELAY_NS`
-- `CUTRACER_DELAY_MODE`: Delay mode: `random` (per-thread random delay in `[min, max]`, default) or `fixed` (same delay for all threads, often masks races)
+- `CUTRACER_DELAY_MODE`: Delay mode: `random` (per-thread random, default), `fixed` (same for all threads), `cluster` (one CTA per cluster), `cluster_fixed` (fixed delay, one CTA per cluster)
 - `CUTRACER_DELAY_DUMP_PATH`: Output path for delay config JSON file (for recording instrumentation patterns)
 - `CUTRACER_DELAY_LOAD_PATH`: Input path for delay config JSON file (for replay mode - deterministic reproduction)
+- `CUTRACER_DELAY_PATTERNS`: Comma-separated SASS instruction substrings for delay injection (overrides built-in patterns). Use `"*"` to match all instructions
+- `CUTRACER_DELAY_ENABLE_PROB`: Per-PC enable probability (0.0-1.0, default: 0.5). Use `1.0` with warp targeting
+- `CUTRACER_DELAY_WARPGROUP_ID`: Warp-targeted delay: warpgroup index (>= 0 selects warps `[4N..4N+3]`, -1 = disabled)
+- `CUTRACER_DELAY_WARP_MASK`: Warp-targeted delay: hex bitmask of CTA-local warp IDs (e.g. `0xF` for warps 0-3, 0 = disabled)
 - `CUTRACER_OUTPUT_DIR`: Output directory for all CUTracer files (trace files and log files). Defaults to the current directory. The directory must exist and be writable.
 - `CUTRACER_CPU_CALLSTACK`: CPU call stack capture mode at each kernel launch (default: `auto`)
     - `auto` (default): Prefer PyTorch CapturedTraceback for Python frames, fallback to C++ backtrace if Python/PyTorch is unavailable
