@@ -13,10 +13,31 @@ Usage:
 
 import importlib.resources as resources
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 import click
+
+
+def _is_under_tempdir(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _persist_extracted_so(src: Path) -> Path:
+    cache_dir = Path(tempfile.gettempdir()) / "cutracer_so_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / "cutracer.so"
+    src_size = src.stat().st_size
+    if not dst.is_file() or dst.stat().st_size != src_size:
+        shutil.copy2(src, dst)
+        dst.chmod(0o755)
+    return dst
 
 
 def resolve_cutracer_so(explicit_path: Optional[str] = None) -> str:
@@ -54,15 +75,21 @@ def resolve_cutracer_so(explicit_path: Optional[str] = None) -> str:
 
     # Buck resource (internal): cutracer.so bundled via python_library resources.
     # Use as_file() to get a proper filesystem Path from the Traversable.
-    # For on-disk resources (Buck, pip), the path persists after context exit.
-    # For zip-packaged resources, the temp file is cleaned up and isfile() fails.
+    # For on-disk resources (buck2 run, pip install), the path persists after
+    # context exit and is returned directly. For zip-packaged resources (fbpkg
+    # fetch, PEX), the temp file is removed when the context exits — copy the
+    # bytes to a persistent cache path inside the system temp dir so the .so
+    # is still on disk when libcuda dlopen()s it via CUDA_INJECTION64_PATH.
     try:
         so_ref = resources.files("cutracer").joinpath("cutracer.so")
         with resources.as_file(so_ref) as so_path:
-            so_path_str = str(so_path)
-        if os.path.isfile(so_path_str):
-            click.echo(f"Using bundled cutracer.so: {so_path_str}")
-            return so_path_str
+            if so_path.is_file():
+                if so_path.is_absolute() and not _is_under_tempdir(so_path):
+                    click.echo(f"Using bundled cutracer.so: {so_path}")
+                    return str(so_path)
+                cached = _persist_extracted_so(so_path)
+                click.echo(f"Using bundled cutracer.so: {cached}")
+                return str(cached)
     except Exception:
         pass
 
