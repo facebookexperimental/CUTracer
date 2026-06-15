@@ -57,6 +57,7 @@ TEST(SerializeRecordRapidjson, RegTrace_BasicNoIndicesNoUregs) {
   r.pc = 0x1234;
   r.num_regs = 2;
   r.num_uregs = 0;
+  r.active_mask = 0xffffffff;
   // Distinct per (thread, reg) so the [thread][reg] -> [reg][thread] transpose
   // is actually exercised rather than mirrored.
   for (int t = 0; t < 32; t++) {
@@ -68,6 +69,7 @@ TEST(SerializeRecordRapidjson, RegTrace_BasicNoIndicesNoUregs) {
 
   nlohmann::json expected;
   expected["type"] = "reg_trace";
+  expected["active_mask"] = "0xffffffff";
   expected["cta"] = {1, 2, 3};
   expected["ctx"] = kCtxHex;
   expected["grid_launch_id"] = 5;
@@ -104,6 +106,7 @@ TEST(SerializeRecordRapidjson, RegTrace_WithIndicesAndUregs) {
   r.ureg_vals[0] = 100;
   r.ureg_vals[1] = 200;
   r.ureg_vals[2] = 300;
+  r.active_mask = 0xf;  // first 4 lanes active
 
   RegIndices idx;
   idx.reg_indices = {5};
@@ -113,6 +116,7 @@ TEST(SerializeRecordRapidjson, RegTrace_WithIndicesAndUregs) {
 
   nlohmann::json expected;
   expected["type"] = "reg_trace";
+  expected["active_mask"] = "0xf";
   expected["cta"] = {0, 0, 0};
   expected["ctx"] = kCtxHex;
   expected["grid_launch_id"] = 8;
@@ -170,6 +174,7 @@ TEST(SerializeRecordRapidjson, MemAddrTrace_AddrsAreUint64WithIpointB) {
   m.opcode_id = 8;
   m.kernel_launch_id = 2;
   m.pc = 0xDEAD;
+  m.active_mask = 0x80000001;  // lane 0 and 31 active
   for (int i = 0; i < 32; i++) {
     m.addrs[i] = 0x100000000ull + i;  // > 2^32 to exercise Uint64 width
   }
@@ -178,6 +183,7 @@ TEST(SerializeRecordRapidjson, MemAddrTrace_AddrsAreUint64WithIpointB) {
   nlohmann::json expected;
   expected["type"] = "mem_addr_trace";
   expected["ipoint"] = "B";
+  expected["active_mask"] = "0x80000001";
   nlohmann::json addrs = nlohmann::json::array();
   for (int i = 0; i < 32; i++) {
     addrs.push_back(0x100000000ull + i);
@@ -205,10 +211,12 @@ TEST(SerializeRecordRapidjson, OpcodeOnly_HasNoIpoint) {
   o.opcode_id = 99;
   o.kernel_launch_id = 3;
   o.pc = 0x40;
+  o.active_mask = 0x55555555;  // alternating lanes
   const TraceRecord rec = TraceRecord::create_opcode_trace(testCtx(), "SASS", 5, 6, &o);
 
   nlohmann::json expected;
   expected["type"] = "opcode_only";
+  expected["active_mask"] = "0x55555555";
   expected["cta"] = {7, 8, 9};
   expected["ctx"] = kCtxHex;
   expected["grid_launch_id"] = 3;
@@ -234,6 +242,7 @@ TEST(SerializeRecordRapidjson, MemValueTrace_LoadTwoRegsPerLane) {
   mv.mem_space = 1;
   mv.is_load = 1;
   mv.access_size = 8;  // regs_needed = (8 + 3) / 4 = 2
+  mv.active_mask = 0xffffffff;
   for (int i = 0; i < 32; i++) {
     mv.addrs[i] = 0x200000000ull + i;
   }
@@ -248,6 +257,7 @@ TEST(SerializeRecordRapidjson, MemValueTrace_LoadTwoRegsPerLane) {
   expected["type"] = "mem_value_trace";
   expected["ipoint"] = "A";
   expected["access_size"] = 8;
+  expected["active_mask"] = "0xffffffff";
   nlohmann::json addrs = nlohmann::json::array();
   for (int i = 0; i < 32; i++) {
     addrs.push_back(0x200000000ull + i);
@@ -331,10 +341,12 @@ TEST(SerializeRecordRapidjson, TmaTrace_NoTransferInfo_BaseFieldsOnly) {
   t.kernel_launch_id = 6;
   t.pc = 0x77;
   t.tma_param_size = 128;
+  t.active_mask = 0xffffffff;
   const TraceRecord rec = TraceRecord::create_tma_trace(testCtx(), "SASS", 9, 10, &t, nullptr);
 
   nlohmann::json expected;
   expected["type"] = "tma_trace";
+  expected["active_mask"] = "0xffffffff";
   expected["cta"] = {2, 3, 4};
   expected["ctx"] = kCtxHex;
   expected["grid_launch_id"] = 6;

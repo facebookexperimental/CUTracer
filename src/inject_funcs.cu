@@ -46,6 +46,7 @@ extern "C" __device__ __noinline__ void instrument_reg_val(int pred, int opcode_
   ri.num_uregs = num_uregs;
   ri.kernel_launch_id = kernel_launch_id;
   ri.pc = pc;
+  ri.active_mask = static_cast<uint32_t>(active_mask);
 
   if (num_regs || num_uregs) {
     // Initialize variable argument list
@@ -105,6 +106,7 @@ extern "C" __device__ __noinline__ void instrument_mem(int pred, int opcode_id, 
   ma.pc = pc;
   ma.warp_id = get_global_warp_id();
   ma.opcode_id = opcode_id;
+  ma.active_mask = static_cast<uint32_t>(active_mask);
 
   /* first active lane pushes information on the channel */
   if (first_laneid == laneid) {
@@ -134,6 +136,7 @@ extern "C" __device__ __noinline__ void instrument_opcode(int pred, int opcode_i
   oi.opcode_id = opcode_id;
   oi.kernel_launch_id = kernel_launch_id;
   oi.pc = pc;
+  oi.active_mask = static_cast<uint32_t>(active_mask);
 
   if (first_laneid == laneid) {
     ChannelDev* channel_dev = (ChannelDev*)pchannel_dev;
@@ -217,6 +220,7 @@ extern "C" __device__ __noinline__ void instrument_mem_value(int pred, int opcod
   mv.mem_space = mem_space;
   mv.is_load = is_load;
   mv.access_size = access_size;
+  mv.active_mask = static_cast<uint32_t>(active_mask);
 
   // Collect addresses from all lanes
   for (int i = 0; i < 32; i++) {

@@ -51,6 +51,7 @@ void rj_cta(JW& w, int x, int y, int z) {
 
 void rj_reg(JW& w, const TraceRecord& rec, const reg_info_t* r, const RegIndices* idx) {
   w.StartObject();
+  rj_key_hex(w, "active_mask", r->active_mask);
   rj_cta(w, r->cta_id_x, r->cta_id_y, r->cta_id_z);
   rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
   w.Key("grid_launch_id");
@@ -105,6 +106,7 @@ void rj_reg(JW& w, const TraceRecord& rec, const reg_info_t* r, const RegIndices
 
 void rj_mem_addr(JW& w, const TraceRecord& rec, const mem_addr_access_t* m) {
   w.StartObject();
+  rj_key_hex(w, "active_mask", m->active_mask);
   w.Key("addrs");
   w.StartArray();
   for (int i = 0; i < 32; i++) {
@@ -133,6 +135,7 @@ void rj_mem_addr(JW& w, const TraceRecord& rec, const mem_addr_access_t* m) {
 
 void rj_opcode(JW& w, const TraceRecord& rec, const opcode_only_t* o) {
   w.StartObject();
+  rj_key_hex(w, "active_mask", o->active_mask);
   rj_cta(w, o->cta_id_x, o->cta_id_y, o->cta_id_z);
   rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
   w.Key("grid_launch_id");
@@ -159,6 +162,7 @@ void rj_mem_value(JW& w, const TraceRecord& rec, const mem_value_access_t* m) {
   w.StartObject();
   w.Key("access_size");
   w.Int(m->access_size);
+  rj_key_hex(w, "active_mask", m->active_mask);
   w.Key("addrs");
   w.StartArray();
   for (int i = 0; i < 32; i++) {
@@ -344,6 +348,7 @@ void rj_tma_transfer_info(JW& w, const TMATransferInfo_t& info) {
 
 void rj_tma(JW& w, const TraceRecord& rec, const tma_access_t* t, const TMATransferInfo_t* info) {
   w.StartObject();
+  rj_key_hex(w, "active_mask", t->active_mask);
   rj_cta(w, t->cta_id_x, t->cta_id_y, t->cta_id_z);
   rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
   w.Key("grid_launch_id");

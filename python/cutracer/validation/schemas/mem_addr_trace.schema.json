@@ -86,6 +86,11 @@
       "minItems": 32,
       "maxItems": 32,
       "description": "Memory addresses accessed by each of the 32 threads in the warp."
+    },
+    "active_mask": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Warp-level active lane mask (32-bit) after predicate filtering, hex string format e.g. '0xffffffff'. Optional for backward compat with pre-active_mask traces. Detector treats absence as unknown; treats 0x0 as invalid (runtime predicate filter prevents zero mask)."
     }
   },
   "additionalProperties": false

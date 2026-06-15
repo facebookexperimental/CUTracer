@@ -91,6 +91,11 @@
     "tma_transfer_info": {
       "type": "object",
       "description": "NVBit 1.8+ structured TMA transfer info parsed by nvbit_parse_tma_transfer_info (is_bulk/is_tensor, src/dst memory spaces and shared-memory data/mbarrier addresses, tiled tensor map). Present only when the handle parsed successfully. Nested structure is version-dependent and intentionally not constrained here."
+    },
+    "active_mask": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Warp-level active lane mask (32-bit) after predicate filtering, hex string format e.g. '0xffffffff'. Optional for backward compat with pre-active_mask traces. Detector treats absence as unknown; treats 0x0 as invalid (runtime predicate filter prevents zero mask)."
     }
   },
   "additionalProperties": false

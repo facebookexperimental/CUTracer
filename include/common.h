@@ -52,6 +52,9 @@ typedef struct {
   uint64_t pc;                            // Instruction byte offset within the kernel (from Instr::getOffset())
   int32_t num_uregs;                      // Number of unified registers
   uint32_t ureg_vals[MAX_UREG_OPERANDS];  // Unified registers shared by all threads in the same warp
+  uint32_t active_mask;                   // Warp-level active lane mask from __ballot_sync(__activemask(), 1)
+                                          // (after predicate filtering). 0 is invalid at runtime since
+                                          // instrument functions return early when no lane is active.
 } reg_info_t;
 
 /* Based on NVIDIA mem_trace example with Meta modifications for message type support */
@@ -65,6 +68,7 @@ typedef struct {
   int warp_id;
   int opcode_id;
   uint64_t addrs[32];
+  uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
 } mem_addr_access_t;
 
 /**
@@ -91,6 +95,7 @@ typedef struct {
   int access_size;         // Access size in bytes (1, 2, 4, 8, 16)
   uint64_t addrs[32];      // Memory addresses for each lane
   uint32_t values[32][4];  // Values: [lane][reg_idx], max 128-bit (4x32-bit) per lane
+  uint32_t active_mask;    // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
 } mem_value_access_t;
 
 /**
@@ -110,6 +115,7 @@ typedef struct {
   uint64_t pc;  // Instruction byte offset within the kernel (from Instr::getOffset())
   int warp_id;
   int opcode_id;
+  uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
 } opcode_only_t;
 
 /* Host-only C++ structures */
@@ -166,6 +172,8 @@ typedef struct {
   // populated by the current GPU path.
   uint64_t desc_addr;
   uint64_t desc_raw[16];
+
+  uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
 } tma_access_t;
 
 #endif /* COMMON_H */

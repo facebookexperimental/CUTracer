@@ -108,6 +108,11 @@
         "maximum": 255
       },
       "description": "Uniform register indices corresponding to uregs values (e.g., [8, 9, 12, 13] means UR8, UR9, UR12, UR13). uint8_t range like regs_indices; SM100/Blackwell emits high indices (e.g. UR63/UR64) for uniform-zero/special registers."
+    },
+    "active_mask": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Warp-level active lane mask (32-bit) after predicate filtering, hex string format e.g. '0xffffffff'. Optional for backward compat with pre-active_mask traces. Detector treats absence as unknown; treats 0x0 as invalid (runtime predicate filter prevents zero mask)."
     }
   },
   "additionalProperties": false
