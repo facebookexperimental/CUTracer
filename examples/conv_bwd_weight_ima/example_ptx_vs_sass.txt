@@ -1,0 +1,11 @@
+# PTX: triton implements the masked X load with cp.async src-size operand (%r484).
+# When src-size=0, PTX ISA guarantees the source global address is NOT accessed.
+# ptxas miscompiles this into a predicated LDGSTS that DOES dereference the OOB address.
+
+# PTX (correct -- masked path sets src-size = 0, so no global read happens):
+104:   mov.b32   %r484, 0;
+106:   cp.async.ca.shared.global [ %r30 + 0 ], [ %rd5 + 0 ], 0x4, %r484;
+1220:  cp.async.ca.shared.global [ %r30 + 0 ], [ %rd49 + 0 ], 0x4, %r31;
+
+# SASS (ptxas output -- lowered to a predicated copy that DOES dereference R20):
+# /*2120*/  LDGSTS.E [R73+0x400], desc[UR6][R20.64], P6 ;

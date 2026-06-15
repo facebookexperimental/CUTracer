@@ -1,0 +1,70 @@
+pc=0x2120  warp=0  cta=(0,0,0)  -- SASS: LDGSTS.E [R73+0x400], desc[UR6][R20.64], P6  (masked cp.async X load)
+records at this pc (loop iterations): 82
+
+== ITER with OOB addresses (thread0 reads ~17GB past allocation) ==
+  lane 0 (thread 0): 0xfffd01c00f3c
+  lane 1 (thread 1): 0xfffd01c0133c
+  lane 2 (thread 2): 0xfffd01c0173c
+  lane 3 (thread 3): 0xfffd01c01b3c
+  lane 4 (thread 4): 0xfffd01c01f3c
+  lane 5 (thread 5): 0xfffd01c0233c
+  lane 6 (thread 6): 0xfffd01c0273c
+  lane 7 (thread 7): 0xfffd01c02b3c
+  lane 8 (thread 8): 0xfffd01c02f3c
+  lane 9 (thread 9): 0xfffd01c0333c
+  lane10 (thread 10): 0xfffd01c0373c
+  lane11 (thread 11): 0xfffd01c03b3c
+  lane12 (thread 12): 0xfffd01c03f3c
+  lane13 (thread 13): 0xfffd01c0433c
+  lane14 (thread 14): 0xfffd01c0473c
+  lane15 (thread 15): 0xfffd01c04b3c
+  lane16 (thread 16): 0xfffd01c04f3c
+  lane17 (thread 17): 0xfffd01c0533c
+  lane18 (thread 18): 0xfffd01c0573c
+  lane19 (thread 19): 0xfffd01c05b3c
+  lane20 (thread 20): 0xfffd01c05f3c
+  lane21 (thread 21): 0xfffd01c0633c
+  lane22 (thread 22): 0xfffd01c0673c
+  lane23 (thread 23): 0xfffd01c06b3c
+  lane24 (thread 24): 0xfffd01c06f3c
+  lane25 (thread 25): 0xfffd01c0733c
+  lane26 (thread 26): 0xfffd01c0773c
+  lane27 (thread 27): 0xfffd01c07b3c
+  lane28 (thread 28): 0xfffd01c07f3c
+  lane29 (thread 29): 0xfffd01c0833c
+  lane30 (thread 30): 0xfffd01c0873c
+  lane31 (thread 31): 0xfffd01c08b3c
+
+== ITER with small/base addresses (masked->base region) ==
+  lane 0 (thread 0): 0x000000000800
+  lane 1 (thread 1): 0x000000000804
+  lane 2 (thread 2): 0x000000000808
+  lane 3 (thread 3): 0x00000000080c
+  lane 4 (thread 4): 0x000000000810
+  lane 5 (thread 5): 0x000000000814
+  lane 6 (thread 6): 0x000000000818
+  lane 7 (thread 7): 0x00000000081c
+  lane 8 (thread 8): 0x000000000820
+  lane 9 (thread 9): 0x000000000824
+  lane10 (thread 10): 0x000000000828
+  lane11 (thread 11): 0x00000000082c
+  lane12 (thread 12): 0x000000000830
+  lane13 (thread 13): 0x000000000834
+  lane14 (thread 14): 0x000000000838
+  lane15 (thread 15): 0x00000000083c
+  lane16 (thread 16): 0x000000000840
+  lane17 (thread 17): 0x000000000844
+  lane18 (thread 18): 0x000000000848
+  lane19 (thread 19): 0x00000000084c
+  lane20 (thread 20): 0x000000000850
+  lane21 (thread 21): 0x000000000854
+  lane22 (thread 22): 0x000000000858
+  lane23 (thread 23): 0x00000000085c
+  lane24 (thread 24): 0x000000000860
+  lane25 (thread 25): 0x000000000864
+  lane26 (thread 26): 0x000000000868
+  lane27 (thread 27): 0x00000000086c
+  lane28 (thread 28): 0x000000000870
+  lane29 (thread 29): 0x000000000874
+  lane30 (thread 30): 0x000000000878
+  lane31 (thread 31): 0x00000000087c

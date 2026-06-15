@@ -1,0 +1,22 @@
+Address provenance for thread (0,0,0) at the faulting load (lane0, first loop iter):
+
+0x2020: regs=[(24, '0x0'), (25, '0xffffffff'), (255, '0x0')]
+       IMAD.SHL.U32 R24,R25,4    -> R24 = R25*4
+
+0x20d0: regs=[(16, '0x0'), (35, '0xfffffff0'), (18, '0x61c00000')]
+       IMAD.WIDE R16,R35,4,R18   -> R16:R17 = R35(index)*4 + R18(X base). R35=0xfffffff0 = -16 (neg padding halo index)
+
+0x20e0: regs=[(20, '0xfffffff0'), (16, '0x61bfffc0'), (24, '0xfffffffc'), (255, '0x0')]
+       IADD3 R20,R16,R24         -> R20(addr low) = 0x61bfffbc
+
+0x20f0: regs=[(21, '0xfffa'), (17, '0xfffa'), (25, '0x3')]
+       IMAD.X R21,R17,1,R25      -> R21(addr high)=0xfffa  (CORRUPTED: base high should be 0xfff8)
+
+0x2100: regs=[(26, '0x0'), (255, '0x0')]
+       ISETP.NE.U32 P6,R26,RZ    -> predicate for the load
+
+0x2110: regs=[(16, '0x61bfffc0'), (35, '0xfffffff0'), (22, '0x61c20000')]
+       IMAD.WIDE R16,R35,4,R22
+
+0x2120: regs=[(73, '0x400'), (20, '0x61bfffbc')]
+       LDGSTS.E [R73+0x400],desc[UR6][R20.64],P6  -> dereferences R21:R20 = 0xfffa_61bfffbc  (OOB ~17GB)
