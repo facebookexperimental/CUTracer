@@ -1040,6 +1040,33 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
     md["instructions"] = instr_table;
   }
 
+  // Effective enabled instrument modes (post init_analysis() if/else
+  // precedence: e.g. proton_instr_histogram forces opcode_only,
+  // deadlock_detection forces reg_trace). Order follows insertion order in
+  // enabled_instrument_types_ordered for reproducibility. Detectors consume
+  // this to verify the trace contract (e.g. ProxyFenceDetector requires
+  // reg_trace + tma_trace) before running.
+  nlohmann::json modes = nlohmann::json::array();
+  for (InstrumentType t : enabled_instrument_types_ordered) {
+    modes.push_back(instrument_type_to_name(t));
+  }
+  md["instrument_modes"] = modes;
+
+  // Effective instruction-category filter (post init_instr_categories()).
+  // null when CUTRACER_INSTR_CATEGORIES is unset -> no filter (all
+  // categories instrumented); otherwise an array of lowercase category
+  // tokens matching the env-var convention. Iterated in stable enum order
+  // for reproducible JSON output (the underlying set is unordered).
+  if (enabled_instr_categories.empty()) {
+    md["instr_categories"] = nullptr;
+  } else {
+    nlohmann::json cats = nlohmann::json::array();
+    if (enabled_instr_categories.count(InstrCategory::MMA)) cats.push_back("mma");
+    if (enabled_instr_categories.count(InstrCategory::TMA)) cats.push_back("tma");
+    if (enabled_instr_categories.count(InstrCategory::SYNC)) cats.push_back("sync");
+    md["instr_categories"] = cats;
+  }
+
   return md;
 }
 

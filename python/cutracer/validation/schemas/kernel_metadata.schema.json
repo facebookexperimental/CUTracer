@@ -126,6 +126,22 @@
         },
         "required": ["sass"]
       }
+    },
+    "instrument_modes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["opcode_only", "reg_trace", "mem_addr_trace", "mem_value_trace", "tma_trace", "random_delay"]
+      },
+      "description": "Effective enabled instrumentation modes after init_analysis() if/else precedence (e.g. proton_instr_histogram auto-adds opcode_only, deadlock_detection auto-adds reg_trace). Reflects what the trace actually contains, not what the user typed. Optional for backward compat with pre-Diff-2 traces; absence is treated as 'unknown' by contract_check (INFO exit + rerun guidance)."
+    },
+    "instr_categories": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "string",
+        "enum": ["mma", "tma", "sync"]
+      },
+      "description": "Effective instruction-category filter (post init_instr_categories). null when CUTRACER_INSTR_CATEGORIES is unset -> no filter (all categories instrumented); otherwise an array of lowercase tokens matching the env-var convention. Optional for backward compat. ProxyFenceDetector and similar broad-coverage detectors require null."
     }
   },
   "additionalProperties": false

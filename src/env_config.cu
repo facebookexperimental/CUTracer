@@ -256,10 +256,9 @@ static void get_var_str(std::string& var, const char* env_name, const std::strin
   loprintf("%s = %s (%s)\n", env_name, var.c_str(), description);
 }
 
-/**
- * @brief Helper function to convert InstrumentType to its string name (forward declaration)
- */
-static const char* instrument_type_to_name(InstrumentType type);
+// Forward declaration; definition is non-static so kernel_metadata writers
+// (src/cutracer.cu) can dump the effective enabled modes.
+const char* instrument_type_to_name(InstrumentType type);
 
 /**
  * @brief Helper to add an instrument type (avoids duplicates via map check)
@@ -681,7 +680,7 @@ bool has_category_filter_enabled() {
 /**
  * @brief Helper function to convert InstrumentType to its string name
  */
-static const char* instrument_type_to_name(InstrumentType type) {
+const char* instrument_type_to_name(InstrumentType type) {
   switch (type) {
     case InstrumentType::OPCODE_ONLY:
       return "opcode_only";

@@ -85,6 +85,10 @@ bool is_instrument_type_enabled(InstrumentType type);
 // Check if any instrumentation type is enabled
 bool has_any_instrumentation_enabled();
 
+// Stable name for an InstrumentType (matches CUTRACER_INSTRUMENT token; used by
+// kernel_metadata writers to dump effective enabled modes).
+const char* instrument_type_to_name(InstrumentType type);
+
 // Check if a specific analysis type is enabled
 bool is_analysis_type_enabled(AnalysisType type);
 
