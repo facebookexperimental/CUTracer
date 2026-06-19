@@ -73,8 +73,13 @@ def warp_summary_command(
     except FileNotFoundError as e:
         raise click.ClickException(str(e))
 
-    # Group records by warp and get all records per group
-    grouper = StreamingGrouper(reader.iter_records(), "warp")
+    # Group records by warp and get all records per group. Records without a
+    # "warp" field (e.g. the leading kernel_metadata header, or callstack/
+    # launch metadata) must be excluded: otherwise they get bucketed under a
+    # None key, and the integer warp-id handling in compute_warp_summary would
+    # treat the whole trace as unusable.
+    warp_records = (r for r in reader.iter_records() if r.get("warp") is not None)
+    grouper = StreamingGrouper(warp_records, "warp")
     groups = grouper.all_per_group()
 
     if not groups:
@@ -83,8 +88,8 @@ def warp_summary_command(
     summary = compute_warp_summary(groups)
     if summary is None:
         raise click.ClickException(
-            "Could not compute warp summary. "
-            "Make sure records have integer 'warp' field."
+            "No warp records found in trace file "
+            "(no records with an integer 'warp' field)."
         )
 
     if output_format == "json":

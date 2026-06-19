@@ -47,6 +47,46 @@ class AnalyzeWarpSummaryTest(unittest.TestCase):
         self.assertIn("Completed (EXIT)", result.output)
         self.assertIn("In-progress", result.output)
 
+    def test_warp_summary_with_kernel_metadata_header(self):
+        """Regression: a real trace starts with a kernel_metadata record that
+        has no 'warp' field, and reg_trace records carry opcode_id (not inline
+        sass). Previously the metadata record was bucketed under a None key and
+        int(None) aborted the command with a misleading error. The header must
+        be skipped, and sass must be resolved via the instruction table so EXIT
+        detection still works.
+        """
+        trace_file = Path(self.temp_dir) / "trace_with_meta.ndjson"
+        records = [
+            {
+                "type": "kernel_metadata",
+                "mangled_name": "_Z3fooPf",
+                "instructions": {
+                    "0": {"sass": "MOV R1, R0 ;"},
+                    "1": {"sass": "EXIT ;"},
+                },
+            },
+            {"type": "reg_trace", "warp": 0, "opcode_id": 0, "pc": "0x0"},
+            {"type": "reg_trace", "warp": 0, "opcode_id": 1, "pc": "0x10"},
+            {"type": "reg_trace", "warp": 1, "opcode_id": 0, "pc": "0x0"},
+        ]
+        with open(trace_file, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+        result = self.runner.invoke(
+            main,
+            ["analyze", "warp-summary", str(trace_file), "--format", "json"],
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        output = json.loads(result.output)
+        # Only warps 0 and 1 are counted — the kernel_metadata header is skipped.
+        self.assertEqual(output["total_observed"], 2)
+        # warp 0's last instruction (opcode_id 1) resolves to EXIT via the
+        # instruction table -> completed; warp 1 ends on MOV -> in-progress.
+        self.assertEqual(output["completed"]["count"], 1)
+        self.assertEqual(output["in_progress"]["count"], 1)
+
     def test_warp_summary_json_format(self):
         """Test warp-summary with JSON output."""
         result = self.runner.invoke(

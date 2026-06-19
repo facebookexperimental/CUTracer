@@ -138,6 +138,23 @@ class TestComputeWarpSummary(unittest.TestCase):
         result = compute_warp_summary(groups)
         self.assertIsNone(result)
 
+    def test_skips_none_key_among_integers(self):
+        """A None key (e.g. a kernel_metadata record with no 'warp' field)
+        is skipped rather than aborting the whole summary."""
+        groups = {
+            None: [{"type": "kernel_metadata"}],
+            0: [{"sass": "EXIT;"}],
+            1: [{"sass": "MOV R1, R0;"}],
+        }
+        result = compute_warp_summary(groups)
+        self.assertIsNotNone(result)
+        # The None group is excluded from the observed-warp count.
+        self.assertEqual(result.total_observed, 2)
+        self.assertEqual(result.min_warp_id, 0)
+        self.assertEqual(result.max_warp_id, 1)
+        self.assertEqual(result.completed_warp_ids, [0])
+        self.assertEqual(result.inprogress_warp_ids, [1])
+
     def test_all_completed(self):
         """Test all warps completed."""
         groups = {

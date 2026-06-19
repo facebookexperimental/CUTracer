@@ -115,24 +115,26 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
         groups: Dict mapping warp ID to list of records
 
     Returns:
-        WarpSummary object, or None if groups is empty or warp IDs are not integers
+        WarpSummary object, or None if groups is empty or contains no
+        integer-keyed warp groups
     """
     if not groups:
         return None
 
-    try:
-        warp_ids = [int(k) for k in groups.keys()]
-    except (ValueError, TypeError):
-        return None
-
-    min_warp = min(warp_ids)
-    max_warp = max(warp_ids)
-
+    # Tolerate non-integer group keys: a trace may include records without a
+    # "warp" field (e.g. a kernel_metadata header), which get bucketed under a
+    # None key by the grouper. Skip those groups rather than discarding the
+    # whole summary; only bail out if there are no integer warp ids at all.
+    warp_ids = []
     completed_ids = []
     inprogress_ids = []
 
     for warp_id, records in groups.items():
-        warp_int = int(warp_id)
+        try:
+            warp_int = int(warp_id)
+        except (ValueError, TypeError):
+            continue
+        warp_ids.append(warp_int)
         if records:
             last_record = records[-1]
             if is_exit_instruction(last_record):
@@ -140,12 +142,18 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
             else:
                 inprogress_ids.append(warp_int)
 
+    if not warp_ids:
+        return None
+
+    min_warp = min(warp_ids)
+    max_warp = max(warp_ids)
+
     observed_set = set(warp_ids)
     all_expected = set(range(0, max_warp + 1))
     missing_ids = sorted(all_expected - observed_set)
 
     return WarpSummary(
-        total_observed=len(groups),
+        total_observed=len(warp_ids),
         min_warp_id=min_warp,
         max_warp_id=max_warp,
         completed_warp_ids=sorted(completed_ids),
