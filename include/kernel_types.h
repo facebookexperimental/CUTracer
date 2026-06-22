@@ -21,9 +21,15 @@ struct WarpKey {
 
   // Operator for map comparison
   bool operator<(const WarpKey& other) const {
-    if (cta_id_x != other.cta_id_x) return cta_id_x < other.cta_id_x;
-    if (cta_id_y != other.cta_id_y) return cta_id_y < other.cta_id_y;
-    if (cta_id_z != other.cta_id_z) return cta_id_z < other.cta_id_z;
+    if (cta_id_x != other.cta_id_x) {
+      return cta_id_x < other.cta_id_x;
+    }
+    if (cta_id_y != other.cta_id_y) {
+      return cta_id_y < other.cta_id_y;
+    }
+    if (cta_id_z != other.cta_id_z) {
+      return cta_id_z < other.cta_id_z;
+    }
     return warp_id < other.warp_id;
   }
 
