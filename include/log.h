@@ -17,8 +17,8 @@
 #include "cuda.h"
 
 // Forward declarations - use void* to avoid conflicts with CUDA types
-typedef void* CUcontext_ptr;
-typedef void* CUfunction_ptr;
+using CUcontext_ptr = void*;
+using CUfunction_ptr = void*;
 
 /* ===== Logging Functions ===== */
 
