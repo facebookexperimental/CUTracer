@@ -21,22 +21,22 @@
 #define MAX_UREG_OPERANDS 16
 
 /* Message type enum to identify different message types */
-typedef enum {
+enum message_type_t {
   MSG_TYPE_REG_INFO = 0,
   MSG_TYPE_MEM_ADDR_ACCESS = 1,
   MSG_TYPE_OPCODE_ONLY = 2,
   MSG_TYPE_MEM_VALUE_ACCESS = 3,  // Memory access with value tracing
   MSG_TYPE_TMA_ACCESS = 4         // TMA (Tensor Memory Accelerator) access
-} message_type_t;
+};
 
 /* Common header for all message types */
-typedef struct {
+struct message_header_t {
   message_type_t type;  // Type of the message
-} message_header_t;
+};
 
 /* Based on NVIDIA record_reg_vals example with Meta modifications for message type support and adds CUTracer specific
  * extensions */
-typedef struct {
+struct reg_info_t {
   message_header_t header;  // Common header with type=MSG_TYPE_REG_INFO
   int32_t cta_id_x;
   int32_t cta_id_y;
@@ -55,10 +55,10 @@ typedef struct {
   uint32_t active_mask;                   // Warp-level active lane mask from __ballot_sync(__activemask(), 1)
                                           // (after predicate filtering). 0 is invalid at runtime since
                                           // instrument functions return early when no lane is active.
-} reg_info_t;
+};
 
 /* Based on NVIDIA mem_trace example with Meta modifications for message type support */
-typedef struct {
+struct mem_addr_access_t {
   message_header_t header;  // Common header with type=MSG_TYPE_MEM_ADDR_ACCESS
   uint64_t kernel_launch_id;
   int cta_id_x;
@@ -69,7 +69,7 @@ typedef struct {
   int opcode_id;
   uint64_t addrs[32];
   uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
-} mem_addr_access_t;
+};
 
 /**
  * @brief Memory access with value tracing structure.
@@ -81,7 +81,7 @@ typedef struct {
  * Used when CUTRACER_INSTRUMENT=mem_value_trace is enabled.
  * Always captured at IPOINT_AFTER for consistent timing semantics.
  */
-typedef struct {
+struct mem_value_access_t {
   message_header_t header;  // type=MSG_TYPE_MEM_VALUE_ACCESS
   uint64_t kernel_launch_id;
   int cta_id_x;
@@ -96,7 +96,7 @@ typedef struct {
   uint64_t addrs[32];      // Memory addresses for each lane
   uint32_t values[32][4];  // Values: [lane][reg_idx], max 128-bit (4x32-bit) per lane
   uint32_t active_mask;    // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
-} mem_value_access_t;
+};
 
 /**
  * @brief A lightweight data packet for instruction histogram analysis.
@@ -106,7 +106,7 @@ typedef struct {
  * to identify an instruction and its execution context without the overhead
  * of register or memory data.
  */
-typedef struct {
+struct opcode_only_t {
   message_header_t header;  // Common header with type=MSG_TYPE_OPCODE_ONLY
   uint64_t kernel_launch_id;
   int cta_id_x;
@@ -116,7 +116,7 @@ typedef struct {
   int warp_id;
   int opcode_id;
   uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
-} opcode_only_t;
+};
 
 /* Host-only C++ structures */
 #ifdef __cplusplus
@@ -152,7 +152,7 @@ struct RegIndices {
  *
  * Enabled via CUTRACER_INSTRUMENT=tma_trace.
  */
-typedef struct {
+struct tma_access_t {
   message_header_t header;  // type=MSG_TYPE_TMA_ACCESS
   uint64_t kernel_launch_id;
   int cta_id_x;
@@ -174,6 +174,6 @@ typedef struct {
   uint64_t desc_raw[16];
 
   uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
-} tma_access_t;
+};
 
 #endif /* COMMON_H */
