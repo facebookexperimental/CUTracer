@@ -14,6 +14,7 @@ from cutracer.analyze.cli import analyze_command
 from cutracer.query.cli import query_command, sass_command
 from cutracer.reduce.cli import reduce_command
 from cutracer.runner import trace_command
+from cutracer.sanitize.cli import sanitize_command
 from cutracer.validation.cli import compare_command, validate_command
 
 
@@ -60,6 +61,7 @@ main.add_command(analyze_command)
 main.add_command(compare_command)
 main.add_command(query_command)
 main.add_command(reduce_command)
+main.add_command(sanitize_command)
 main.add_command(sass_command)
 main.add_command(trace_command)
 main.add_command(validate_command)
