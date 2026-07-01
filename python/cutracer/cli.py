@@ -23,7 +23,18 @@ def _get_package_version() -> str:
     try:
         return version("cutracer")
     except PackageNotFoundError:
-        return "0+unknown"
+        pass
+    # Buck-built binaries carry no .dist-info for importlib.metadata to read;
+    # fall back to the fbpkg build stamp (internal only).
+    from cutracer.shared_vars import is_fbcode
+
+    if is_fbcode():
+        from cutracer.fb.version import get_build_version
+
+        build_version = get_build_version()
+        if build_version:
+            return build_version
+    return "0+unknown"
 
 
 EXAMPLES = """
