@@ -34,8 +34,9 @@ CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX:-$HOME/opt}
 CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX%/}
 CUDA_VERSION=${CUDA_VERSION:-12.8}
 NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.4.5}
+CUDA_CUPTI_VERSION=${CUDA_CUPTI_VERSION:-13.3.75}
 INSTALL_NCCL=${INSTALL_NCCL:-1}
-NCCL_VERSION=${NCCL_VERSION:-v2.29.7-1}
+NCCL_VERSION=${NCCL_VERSION:-v2.30.7-1}
 
 # Minimum required disk space in GB (can be overridden)
 REQUIRED_DISK_SPACE_GB=${REQUIRED_DISK_SPACE_GB:-15}
@@ -83,6 +84,12 @@ USER_TMPDIR="/tmp/${USER}/cuda_install"
 mkdir -p "${USER_TMPDIR}"
 export TMPDIR="${USER_TMPDIR}"
 
+# USER_TMPDIR persists across runs, so drop the CUPTI marker from any previous
+# run up front. install_cupti_headers only runs for CUDA 13.x, and the summary
+# keys off this file; without clearing it a later non-13.x run would report a
+# stale "CUPTI ... (headers)" line it never installed.
+rm -f "${USER_TMPDIR}/cupti_version.txt"
+
 # Error handling function
 function error_exit {
   echo "❌ ERROR: $1" >&2
@@ -106,6 +113,7 @@ function cleanup_temp_dirs {
   [ -d "${base_dir}/tmp_cudnn" ] && rm -rf "${base_dir}/tmp_cudnn"
   [ -d "${base_dir}/nccl" ] && rm -rf "${base_dir}/nccl"
   [ -d "${base_dir}/tmp_nvshmem" ] && rm -rf "${base_dir}/tmp_nvshmem"
+  [ -d "${base_dir}/tmp_cupti" ] && rm -rf "${base_dir}/tmp_cupti"
 
   # Also clean up in USER_TMPDIR if different from base_dir
   if [ "${USER_TMPDIR}" != "${base_dir}" ]; then
@@ -113,6 +121,7 @@ function cleanup_temp_dirs {
     [ -d "${USER_TMPDIR}/tmp_cudnn" ] && rm -rf "${USER_TMPDIR}/tmp_cudnn"
     [ -d "${USER_TMPDIR}/nccl" ] && rm -rf "${USER_TMPDIR}/nccl"
     [ -d "${USER_TMPDIR}/tmp_nvshmem" ] && rm -rf "${USER_TMPDIR}/tmp_nvshmem"
+    [ -d "${USER_TMPDIR}/tmp_cupti" ] && rm -rf "${USER_TMPDIR}/tmp_cupti"
   fi
 
   touch "${USER_TMPDIR}/cleanup_completed"
@@ -531,6 +540,53 @@ function install_nvshmem {
   return 0
 }
 
+# CUPTI headers installation function
+# The CUDA toolkit runfile ships an older CUPTI than the standalone redist
+# archive, so stage the newer headers in a separate directory where the build
+# can pick them up. The headers are architecture independent, so always grab
+# the x86_64 archive.
+# Synced with PyTorch .ci/docker/common/install_cuda.sh
+function install_cupti_headers {
+  local cupti_version=$1                 # e.g. "13.3.75"
+  local major_minor=${cupti_version%.*}  # e.g. "13.3"
+  local target_dir="${CUDA_INSTALL_PREFIX}/cupti-headers-${major_minor}"
+
+  echo "Installing CUPTI ${cupti_version} headers..."
+  mkdir -p tmp_cupti
+  pushd tmp_cupti || error_exit "Failed to enter CUPTI temporary directory"
+
+  local redist_url="https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/linux-x86_64"
+  local archive="cuda_cupti-linux-x86_64-${cupti_version}-archive"
+
+  echo "Downloading CUPTI headers: ${archive}.tar.xz"
+  # Use -c for resume support, -t 3 for retry
+  if ! wget -c -t 3 -q "${redist_url}/${archive}.tar.xz"; then
+    popd
+    rm -rf tmp_cupti
+    error_exit "CUPTI headers download failed: ${archive}.tar.xz"
+  fi
+
+  echo "CUPTI download complete, preparing to extract..."
+  if ! tar xf "${archive}.tar.xz"; then
+    popd
+    rm -rf tmp_cupti
+    error_exit "CUPTI headers extraction failed: ${archive}.tar.xz"
+  fi
+
+  echo "CUPTI extraction complete, installing headers..."
+  mkdir -p "${target_dir}"
+  cp -a "${archive}/include/"* "${target_dir}/"
+
+  popd
+  rm -rf tmp_cupti
+
+  echo "${cupti_version}" >"${USER_TMPDIR}/cupti_version.txt"
+  touch "${USER_TMPDIR}/cupti_${cupti_version}_installed"
+
+  echo "CUPTI ${cupti_version} headers installed to ${target_dir}."
+  return 0
+}
+
 # Generic CUDA version installation function
 # Uses version configuration from associative arrays defined at the top
 function install_cuda_version {
@@ -584,6 +640,15 @@ function install_cuda_version {
   echo "💾 STEP 5: Installing nvSHMEM..."
   if ! install_nvshmem "${cuda_major}"; then
     error_exit "nvSHMEM installation failed"
+  fi
+
+  # CUPTI headers are only staged for CUDA 13.x, matching upstream which calls
+  # install_cupti_headers from install_130 / install_132 only.
+  if [[ "${cuda_major}" == "13" ]]; then
+    echo "🧩 STEP 6: Installing CUPTI headers..."
+    if ! install_cupti_headers "${CUDA_CUPTI_VERSION}"; then
+      error_exit "CUPTI headers installation failed"
+    fi
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
@@ -694,6 +759,10 @@ else
   echo "  cuSparseLt  : (not found)"
 fi
 echo "  nvSHMEM     : ${NVSHMEM_VERSION}"
+if [ -f "${USER_TMPDIR}/cupti_version.txt" ]; then
+  CUPTI_VERSION_PRINT=$(cat "${USER_TMPDIR}/cupti_version.txt")
+  echo "  CUPTI       : ${CUPTI_VERSION_PRINT} (headers)"
+fi
 echo "🔗 -----------------------------------------"
 echo "📁  Install Path : ${CUDA_INSTALL_PREFIX}/cuda"
 echo "💡  Usage:"
