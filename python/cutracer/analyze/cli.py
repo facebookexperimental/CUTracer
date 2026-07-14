@@ -21,7 +21,37 @@ from cutracer.shared_vars import is_fbcode
 from tritonparse._json_compat import dumps
 
 
-@click.group(name="analyze")
+class _AnalyzeGroup(click.Group):
+    """Click group that runs a default subcommand for a bare trace path.
+
+    ``cutracer analyze`` is the unified entry point for schedule-sensitive
+    concurrency-defect analysis. When the first argument is a trace file
+    rather than a known subcommand, we inject ``default_command`` so that
+    ``cutracer analyze <trace>`` runs the default detector bundle instead of
+    erroring with "no such command". Explicit subcommands, options (e.g.
+    ``--help``), and the no-argument case (which still shows usage/help) are
+    all left untouched.
+
+    ``default_command`` stays ``None`` in open-source builds, where the
+    concurrency detectors are not shipped; it is set to ``"all"`` only when the
+    internal detectors are registered below, so this shared file carries no
+    hard dependency on the internal ``all`` command.
+    """
+
+    default_command: Optional[str] = None
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if (
+            self.default_command is not None
+            and args
+            and not args[0].startswith("-")
+            and args[0] not in self.commands
+        ):
+            args = [self.default_command, *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(name="analyze", cls=_AnalyzeGroup)
 def analyze_command() -> None:
     """
     Analyze trace data for patterns and insights.
@@ -119,3 +149,17 @@ if is_fbcode():
     analyze_command.add_command(mma_command)
     analyze_command.add_command(deadlock_command)
     analyze_command.add_command(all_command)
+
+    # Unified entry point: a bare ``cutracer analyze <trace>`` (no subcommand)
+    # runs the full schedule-sensitive concurrency-defect bundle (deadlock +
+    # data-race), equivalent to ``analyze all``. Explicit subcommands remain
+    # available as single-detector opt-ins / back-compat filters.
+    analyze_command.default_command = "all"
+    analyze_command.help = (
+        (analyze_command.help or "").rstrip()
+        + "\n\nDefault: running 'cutracer analyze <trace>' with no subcommand "
+        "runs all applicable schedule-sensitive concurrency-defect detectors "
+        "(deadlock + data-race) together and labels each finding by bug class "
+        "(equivalent to 'analyze all'). Pass a subcommand to run a single "
+        "detector."
+    )

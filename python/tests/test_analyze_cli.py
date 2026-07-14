@@ -356,6 +356,54 @@ class AnalyzeTMAJsonTest(unittest.TestCase):
         self.assertIn("sass", desc)
 
 
+@unittest.skipUnless(
+    is_fbcode(), "Unified default bundle requires internal concurrency detectors"
+)
+class AnalyzeUnifiedDefaultTest(unittest.TestCase):
+    """Bare ``analyze <trace>`` (no subcommand) runs the full concurrency-defect
+    bundle with class-labeled output; explicit subcommands still work.
+    """
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.temp_dir = tempfile.mkdtemp()
+        self.trace_file = Path(self.temp_dir) / "trace.ndjson"
+        record = {
+            "type": "mem_trace",
+            "cta": [0, 0, 0],
+            "warp": 0,
+            "pc": "0x100",
+            "sass": "MOV R1, R2",
+            "trace_index": 0,
+        }
+        with open(self.trace_file, "w") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def test_bare_analyze_runs_all_detectors_with_class_labels(self):
+        """No subcommand -> deadlock + data-race, each tagged by bug class."""
+        result = self.runner.invoke(main, ["analyze", str(self.trace_file)])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        # Both detector reports are present ...
+        self.assertIn("Deadlock/Hang Detection Report", result.output)
+        self.assertIn("Data Race Detection Report", result.output)
+        # ... and each is explicitly tagged by bug class.
+        self.assertIn("BUG CLASS: DEADLOCK", result.output)
+        self.assertIn("BUG CLASS: DATA-RACE", result.output)
+
+    def test_explicit_deadlock_subcommand_still_works(self):
+        """Back-compat: single-detector opt-in produces only its own report."""
+        result = self.runner.invoke(main, ["analyze", "deadlock", str(self.trace_file)])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("Deadlock/Hang Detection Report", result.output)
+        self.assertNotIn("Data Race Detection Report", result.output)
+
+    def test_analyze_help_documents_default(self):
+        """--help advertises the new no-subcommand default."""
+        result = self.runner.invoke(main, ["analyze", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Default:", result.output)
+
+
 class AnalyzeIntegrationTest(unittest.TestCase):
     """Integration tests for analyze command with compressed files."""
 
