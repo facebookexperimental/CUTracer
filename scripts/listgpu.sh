@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # Script to list all GPU processes with detailed process information
 

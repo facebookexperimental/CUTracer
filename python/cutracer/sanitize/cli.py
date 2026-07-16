@@ -1,4 +1,4 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
 """``cutracer sanitize`` — run a target under NVIDIA Compute Sanitizer.
 
