@@ -102,6 +102,12 @@ void instrument_opcode_only(Instr* instr, int opcode_id, CTXstate* ctx_state) {
  *    separating it from the main instruction iteration loop in `cutracer.cu`.
  */
 void instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, const OperandLists& operands) {
+  if (operands.reg_nums.size() > MAX_REG_OPERANDS || operands.ureg_nums.size() > MAX_UREG_OPERANDS) {
+    loprintf("ERROR: skipping reg_trace for opcode_id=%d: %zu R operands and %zu UR operands exceed limits %d/%d\n",
+             opcode_id, operands.reg_nums.size(), operands.ureg_nums.size(), MAX_REG_OPERANDS, MAX_UREG_OPERANDS);
+    return;
+  }
+
   /* insert call to the instrumentation function with its arguments */
   nvbit_insert_call(instr, "instrument_reg_val", get_ipoint_from_config(InstrumentType::REG_TRACE, IPOINT_BEFORE));
   /* guard predicate value */

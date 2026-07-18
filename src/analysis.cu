@@ -315,6 +315,23 @@ static uint64_t get_kernel_launch_id(const message_header_t* header) {
   }
 }
 
+static size_t get_message_size(message_type_t type) {
+  switch (type) {
+    case MSG_TYPE_REG_INFO:
+      return sizeof(reg_info_t);
+    case MSG_TYPE_OPCODE_ONLY:
+      return sizeof(opcode_only_t);
+    case MSG_TYPE_MEM_ADDR_ACCESS:
+      return sizeof(mem_addr_access_t);
+    case MSG_TYPE_MEM_VALUE_ACCESS:
+      return sizeof(mem_value_access_t);
+    case MSG_TYPE_TMA_ACCESS:
+      return sizeof(tma_access_t);
+    default:
+      return 0;
+  }
+}
+
 /**
  * @brief Computes a canonical signature for a sequence of PCs to detect loops.
  *
@@ -843,8 +860,33 @@ void* recv_thread_fun(void* args) {
 
       uint32_t num_processed_bytes = 0;
       while (num_processed_bytes < num_recv_bytes) {
+        const uint32_t remaining = num_recv_bytes - num_processed_bytes;
+        if (remaining < sizeof(message_header_t)) {
+          loprintf("ERROR: truncated channel header: remaining=%u expected=%zu\n", remaining, sizeof(message_header_t));
+          break;
+        }
+
         // First read the message header to determine the message type
         message_header_t* header = (message_header_t*)&recv_buffer[num_processed_bytes];
+        int32_t raw_type;
+        memcpy(&raw_type, header, sizeof(raw_type));
+        if (raw_type < MSG_TYPE_REG_INFO || raw_type > MSG_TYPE_TMA_ACCESS) {
+          loprintf("ERROR: unknown channel message type %d at offset %u/%u\n", raw_type, num_processed_bytes,
+                   num_recv_bytes);
+          break;
+        }
+        const message_type_t message_type = static_cast<message_type_t>(raw_type);
+        const size_t message_size = get_message_size(message_type);
+        if (message_size == 0) {
+          loprintf("ERROR: unsupported channel message type %d at offset %u/%u\n", raw_type, num_processed_bytes,
+                   num_recv_bytes);
+          break;
+        }
+        if (remaining < message_size) {
+          loprintf("ERROR: truncated channel message type %d: remaining=%u expected=%zu\n", raw_type, remaining,
+                   message_size);
+          break;
+        }
 
         uint64_t current_launch_id = get_kernel_launch_id(header);
         bool is_new_kernel = false;
@@ -877,6 +919,7 @@ void* recv_thread_fun(void* args) {
                 it->second->flush();
                 delete it->second;
                 ctx_state->trace_writers.erase(it);
+                ctx_state->trace_index_by_kernel.erase(last_seen_kernel_launch_id);
                 loprintf_v("Closed TraceWriter for launch_id %lu\n", last_seen_kernel_launch_id);
               }
             }
@@ -903,6 +946,15 @@ void* recv_thread_fun(void* args) {
 
         if (header->type == MSG_TYPE_REG_INFO) {
           reg_info_t* ri = (reg_info_t*)&recv_buffer[num_processed_bytes];
+          if (ri->num_regs < 0 || ri->num_regs > MAX_REG_OPERANDS || ri->num_uregs < 0 ||
+              ri->num_uregs > MAX_UREG_OPERANDS) {
+            loprintf(
+                "ERROR: invalid reg_info_t counts: launch_id=%lu opcode_id=%d num_regs=%d num_uregs=%d "
+                "active_mask=0x%x\n",
+                ri->kernel_launch_id, ri->opcode_id, ri->num_regs, ri->num_uregs, ri->active_mask);
+            num_processed_bytes += sizeof(reg_info_t);
+            continue;
+          }
 
           if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
             WarpKey key = {ri->cta_id_x, ri->cta_id_y, ri->cta_id_z, ri->warp_id};
@@ -960,9 +1012,11 @@ void* recv_thread_fun(void* args) {
           {
             std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
             auto it = ctx_state->trace_writers.find(ri->kernel_launch_id);
-            if (it != ctx_state->trace_writers.end() && it->second) {
+            auto index_it = ctx_state->trace_index_by_kernel.find(ri->kernel_launch_id);
+            if (it != ctx_state->trace_writers.end() && it->second &&
+                index_it != ctx_state->trace_index_by_kernel.end()) {
               // Get trace_index (monotonically increasing per kernel)
-              uint64_t trace_idx = ctx_state->trace_index_by_kernel[ri->kernel_launch_id]++;
+              uint64_t trace_idx = index_it->second++;
 
               // Get timestamp
               uint64_t timestamp = get_timestamp_ns();
@@ -997,8 +1051,10 @@ void* recv_thread_fun(void* args) {
           {
             std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
             auto it = ctx_state->trace_writers.find(oi->kernel_launch_id);
-            if (it != ctx_state->trace_writers.end() && it->second) {
-              uint64_t trace_idx = ctx_state->trace_index_by_kernel[oi->kernel_launch_id]++;
+            auto index_it = ctx_state->trace_index_by_kernel.find(oi->kernel_launch_id);
+            if (it != ctx_state->trace_writers.end() && it->second &&
+                index_it != ctx_state->trace_index_by_kernel.end()) {
+              uint64_t trace_idx = index_it->second++;
               uint64_t timestamp = get_timestamp_ns();
               auto record = TraceRecord::create_opcode_trace(ctx, sass_str_cpp, trace_idx, timestamp, oi);
               it->second->write_trace(record);
@@ -1026,8 +1082,10 @@ void* recv_thread_fun(void* args) {
           {
             std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
             auto it = ctx_state->trace_writers.find(mem->kernel_launch_id);
-            if (it != ctx_state->trace_writers.end() && it->second) {
-              uint64_t trace_idx = ctx_state->trace_index_by_kernel[mem->kernel_launch_id]++;
+            auto index_it = ctx_state->trace_index_by_kernel.find(mem->kernel_launch_id);
+            if (it != ctx_state->trace_writers.end() && it->second &&
+                index_it != ctx_state->trace_index_by_kernel.end()) {
+              uint64_t trace_idx = index_it->second++;
               uint64_t timestamp = get_timestamp_ns();
               auto record = TraceRecord::create_mem_trace(ctx, sass_str_cpp, trace_idx, timestamp, mem);
               it->second->write_trace(record);
@@ -1056,8 +1114,10 @@ void* recv_thread_fun(void* args) {
           {
             std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
             auto it = ctx_state->trace_writers.find(mem_value->kernel_launch_id);
-            if (it != ctx_state->trace_writers.end() && it->second) {
-              uint64_t trace_idx = ctx_state->trace_index_by_kernel[mem_value->kernel_launch_id]++;
+            auto index_it = ctx_state->trace_index_by_kernel.find(mem_value->kernel_launch_id);
+            if (it != ctx_state->trace_writers.end() && it->second &&
+                index_it != ctx_state->trace_index_by_kernel.end()) {
+              uint64_t trace_idx = index_it->second++;
               uint64_t timestamp = get_timestamp_ns();
               auto record = TraceRecord::create_mem_value_trace(ctx, sass_str_cpp, trace_idx, timestamp, mem_value);
               it->second->write_trace(record);
@@ -1067,6 +1127,12 @@ void* recv_thread_fun(void* args) {
           num_processed_bytes += sizeof(mem_value_access_t);
         } else if (header->type == MSG_TYPE_TMA_ACCESS) {
           tma_access_t* tma = (tma_access_t*)&recv_buffer[num_processed_bytes];
+          if (tma->tma_param_size > TMA_PARAM_HANDLE_MAX_BYTES) {
+            loprintf("ERROR: invalid tma_access_t size: launch_id=%lu opcode_id=%d size=%u max=%d\n",
+                     tma->kernel_launch_id, tma->opcode_id, tma->tma_param_size, TMA_PARAM_HANDLE_MAX_BYTES);
+            num_processed_bytes += sizeof(tma_access_t);
+            continue;
+          }
 
           // Get SASS string for trace output
           std::string sass_str_cpp;
@@ -1122,8 +1188,10 @@ void* recv_thread_fun(void* args) {
           {
             std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
             auto it = ctx_state->trace_writers.find(tma->kernel_launch_id);
-            if (it != ctx_state->trace_writers.end() && it->second) {
-              uint64_t trace_idx = ctx_state->trace_index_by_kernel[tma->kernel_launch_id]++;
+            auto index_it = ctx_state->trace_index_by_kernel.find(tma->kernel_launch_id);
+            if (it != ctx_state->trace_writers.end() && it->second &&
+                index_it != ctx_state->trace_index_by_kernel.end()) {
+              uint64_t trace_idx = index_it->second++;
               uint64_t timestamp = get_timestamp_ns();
               auto record = TraceRecord::create_tma_trace(ctx, sass_str_cpp, trace_idx, timestamp, tma,
                                                           tma_info_valid ? &tma_info : nullptr);
@@ -1135,13 +1203,11 @@ void* recv_thread_fun(void* args) {
 
           num_processed_bytes += sizeof(tma_access_t);
         } else {
-          // Unknown message type, print error and break loop
-          // TODO: handle error message in our current log mechanism
-          fprintf(stderr,
-                  "ERROR: Unknown message type %d received in recv_thread_fun. "
-                  "Stopping processing of this chunk.\n",
-                  header->type);
-          continue;
+          // get_message_size() rejects unknown values above. Keep this branch
+          // terminating in case a new type is added without a parser here.
+          loprintf("ERROR: unhandled channel message type %d at offset %u/%u\n", header->type, num_processed_bytes,
+                   num_recv_bytes);
+          break;
         }
       }
     }
@@ -1210,6 +1276,7 @@ void* recv_thread_fun(void* args) {
         it->second->flush();
         delete it->second;
         ctx_state->trace_writers.erase(it);
+        ctx_state->trace_index_by_kernel.erase(last_seen_kernel_launch_id);
         loprintf_v("Closed final TraceWriter for launch_id %lu\n", last_seen_kernel_launch_id);
       }
     }

@@ -1224,10 +1224,11 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, uint64_t& kernel
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       ctx_state->trace_writers[current_launch_id] = new TraceWriter(base_filename, trace_format);
+      // The receiver reads and increments this map while holding writers_mutex.
+      // Publish the writer and its index atomically to avoid concurrent
+      // unordered_map insertion/lookup across the callback and receiver threads.
+      ctx_state->trace_index_by_kernel[current_launch_id] = 0;
     }
-
-    // Initialize trace_index for this kernel
-    ctx_state->trace_index_by_kernel[current_launch_id] = 0;
 
     // Write kernel_metadata as the first JSON line in the trace file.
     auto metadata =
@@ -1466,6 +1467,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
       }
     }
     ctx_state->trace_writers.clear();
+    ctx_state->trace_index_by_kernel.clear();
   }
 
   // Clean up any remaining kernel mapping entries
@@ -1567,8 +1569,8 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       ctx_state->trace_writers[global_kernel_launch_id] = new TraceWriter(base_filename, trace_format);
+      ctx_state->trace_index_by_kernel[global_kernel_launch_id] = 0;
     }
-    ctx_state->trace_index_by_kernel[global_kernel_launch_id] = 0;
 
     // Write kernel_metadata for graph node launch trace files
     auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cpu_callstack, callstack_source,
