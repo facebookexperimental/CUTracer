@@ -14,11 +14,52 @@ Usage:
 import importlib.resources as resources
 import os
 import shutil
+import subprocess
 import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 import click
+
+RunTarget = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+@dataclass(frozen=True)
+class InstrumentationConfig:
+    """Programmatic configuration for one CUTracer-instrumented target run."""
+
+    cutracer_so: Optional[str] = None
+    instrument: Optional[str] = None
+    analysis: Optional[str] = None
+    kernel_filters: Optional[str] = None
+    instr_categories: Optional[str] = None
+    trace_format: Optional[str] = None
+    output_dir: Optional[str] = None
+    verbose: Optional[int] = None
+    zstd_level: Optional[int] = None
+    delay_ns: Optional[int] = None
+    delay_min_ns: Optional[int] = None
+    delay_enable_prob: Optional[float] = None
+    delay_mode: Optional[str] = None
+    delay_cluster_cta_id: Optional[int] = None
+    delay_warpgroup_id: Optional[int] = None
+    delay_warp_mask: Optional[str] = None
+    delay_patterns: Optional[str] = None
+    delay_dump_path: Optional[str] = None
+    delay_load_path: Optional[str] = None
+    cpu_callstack: Optional[str] = None
+    channel_records: Optional[int] = None
+    kernel_events: Optional[str] = None
+    dump_cubin: bool = False
+    trace_size_limit_mb: int = 0
+    kernel_timeout_s: int = 0
+    no_data_timeout_s: int = 15
+    cwd: Optional[str] = None
+    timeout: Optional[int] = None
+    base_env: Optional[Mapping[str, str]] = None
+    capture_output: bool = True
+    shell: bool = False
 
 
 def _is_under_tempdir(path: Path) -> bool:
@@ -110,7 +151,7 @@ def resolve_cutracer_so(explicit_path: Optional[str] = None) -> str:
     )
 
 
-def _build_cutracer_env(
+def build_cutracer_env(
     cutracer_so: str,
     instrument: Optional[str],
     analysis: Optional[str],
@@ -137,9 +178,10 @@ def _build_cutracer_env(
     trace_size_limit_mb: int = 0,
     kernel_timeout_s: int = 0,
     no_data_timeout_s: int = 15,
+    base_env: Optional[Mapping[str, str]] = None,
 ) -> dict:
     """Build environment dict with CUTracer variables."""
-    env = os.environ.copy()
+    env = dict(os.environ if base_env is None else base_env)
     env["CUDA_INJECTION64_PATH"] = cutracer_so
 
     if instrument is not None:
@@ -206,6 +248,80 @@ def _build_cutracer_env(
         pass
 
     return env
+
+
+# Compatibility for existing callers while the public API rolls through the stack.
+_build_cutracer_env = build_cutracer_env
+
+
+def _resolve_and_build_env(config: InstrumentationConfig) -> tuple[str, dict]:
+    """Resolve cutracer.so and assemble the CUTracer environment for a config.
+
+    Shared by the ``trace`` CLI path and the programmatic run path so both
+    resolve the library and build env vars identically.
+    """
+    so_path = resolve_cutracer_so(config.cutracer_so)
+    run_env = build_cutracer_env(
+        cutracer_so=so_path,
+        instrument=config.instrument,
+        analysis=config.analysis,
+        kernel_filters=config.kernel_filters,
+        instr_categories=config.instr_categories,
+        trace_format=config.trace_format,
+        output_dir=config.output_dir,
+        verbose=config.verbose,
+        zstd_level=config.zstd_level,
+        delay_ns=config.delay_ns,
+        delay_min_ns=config.delay_min_ns,
+        delay_enable_prob=config.delay_enable_prob,
+        delay_mode=config.delay_mode,
+        delay_cluster_cta_id=config.delay_cluster_cta_id,
+        delay_warpgroup_id=config.delay_warpgroup_id,
+        delay_warp_mask=config.delay_warp_mask,
+        delay_patterns=config.delay_patterns,
+        delay_dump_path=config.delay_dump_path,
+        delay_load_path=config.delay_load_path,
+        cpu_callstack=config.cpu_callstack,
+        channel_records=config.channel_records,
+        kernel_events=config.kernel_events,
+        dump_cubin=config.dump_cubin,
+        trace_size_limit_mb=config.trace_size_limit_mb,
+        kernel_timeout_s=config.kernel_timeout_s,
+        no_data_timeout_s=config.no_data_timeout_s,
+        base_env=config.base_env,
+    )
+    return so_path, run_env
+
+
+def run_instrumented_target(
+    argv: Sequence[str],
+    config: InstrumentationConfig,
+    *,
+    runner: Optional[RunTarget] = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run a target with the CUTracer library bundled with this Python package."""
+    if not argv:
+        raise ValueError("instrumented target argv must not be empty")
+
+    _so_path, run_env = _resolve_and_build_env(config)
+    command: object
+    if config.shell:
+        import shlex
+
+        command = shlex.join(argv)
+    else:
+        command = list(argv)
+    run = runner or subprocess.run
+    return run(
+        command,
+        shell=config.shell,
+        env=run_env,
+        cwd=config.cwd,
+        timeout=config.timeout,
+        capture_output=config.capture_output,
+        text=True,
+        check=False,
+    )
 
 
 def _print_config_summary(env: dict) -> None:
@@ -533,15 +649,13 @@ def trace_command(
             err=True,
         )
 
-    so_path = resolve_cutracer_so(cutracer_so)
-
     # Auto-enable cubin dumping when instrumentation is active, unless
     # the user explicitly passed --no-dump-cubin.
     if dump_cubin is None:
         dump_cubin = instrument is not None
 
-    run_env = _build_cutracer_env(
-        cutracer_so=so_path,
+    config = InstrumentationConfig(
+        cutracer_so=cutracer_so,
         instrument=instrument,
         analysis=analysis,
         kernel_filters=kernel_filters,
@@ -567,22 +681,24 @@ def trace_command(
         trace_size_limit_mb=trace_size_limit_mb,
         kernel_timeout_s=kernel_timeout_s,
         no_data_timeout_s=no_data_timeout_s,
+        capture_output=False,
+        shell=True,
     )
+
+    so_path, run_env = _resolve_and_build_env(config)
 
     _print_config_summary(run_env)
 
-    # Join all args into a single shell command string and execute via bash.
-    # This lets shell-style syntax work naturally:
-    #   VAR=value cmd args    (env var assignment)
-    #   cmd1 | cmd2           (pipes)
-    #   cmd1 && cmd2          (chaining)
     import shlex
-    import subprocess
+
+    # The CLI preserves shell execution for environment-assignment compatibility.
+    # Operators are intentionally quoted as argv tokens; callers that need pipes
+    # or chaining must pass an explicit shell command such as `sh -c 'a | b'`.
     import sys
 
     cmd_string = shlex.join(cmd)
     click.echo(f"Running: {cmd_string}")
     click.echo("=" * 60)
 
-    result = subprocess.run(cmd_string, shell=True, env=run_env)
+    result = run_instrumented_target(cmd, replace(config, cutracer_so=so_path))
     sys.exit(result.returncode)

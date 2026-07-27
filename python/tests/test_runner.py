@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
-from cutracer.runner import _build_cutracer_env, resolve_cutracer_so
+from cutracer.runner import (
+    _build_cutracer_env,
+    InstrumentationConfig,
+    resolve_cutracer_so,
+    run_instrumented_target,
+)
 
 
 class ResolveCutracerSoExplicitPathTest(unittest.TestCase):
@@ -211,3 +216,60 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_TRACE_SIZE_LIMIT_MB"], "0")
         self.assertEqual(env["CUTRACER_KERNEL_TIMEOUT_S"], "0")
         self.assertEqual(env["CUTRACER_NO_DATA_TIMEOUT_S"], "15")
+
+
+class RunInstrumentedTargetTest(unittest.TestCase):
+    def test_programmatic_runner_uses_structured_argv_and_explicit_runtime(
+        self,
+    ) -> None:
+        calls = []
+
+        def fake_runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with tempfile.NamedTemporaryFile(suffix=".so") as so:
+            result = run_instrumented_target(
+                ["python", "test.py"],
+                InstrumentationConfig(
+                    cutracer_so=so.name,
+                    instrument="random_delay",
+                    analysis="random_delay",
+                    delay_load_path="/tmp/replay.json",
+                    base_env={"KEEP": "yes"},
+                    cwd="/tmp",
+                    timeout=12,
+                ),
+                runner=fake_runner,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        command, kwargs = calls[0]
+        self.assertEqual(command, ["python", "test.py"])
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["cwd"], "/tmp")
+        self.assertEqual(kwargs["timeout"], 12)
+        self.assertEqual(kwargs["env"]["KEEP"], "yes")
+        self.assertEqual(kwargs["env"]["CUTRACER_INSTRUMENT"], "random_delay")
+        self.assertEqual(
+            kwargs["env"]["CUTRACER_DELAY_LOAD_PATH"],
+            str(Path("/tmp/replay.json").resolve()),
+        )
+
+    def test_shell_mode_requires_explicit_shell_for_operators(self) -> None:
+        calls = []
+
+        def fake_runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with tempfile.NamedTemporaryFile(suffix=".so") as so:
+            run_instrumented_target(
+                ["sh", "-c", "producer | consumer"],
+                InstrumentationConfig(cutracer_so=so.name, shell=True),
+                runner=fake_runner,
+            )
+
+        command, kwargs = calls[0]
+        self.assertEqual(command, "sh -c 'producer | consumer'")
+        self.assertTrue(kwargs["shell"])
