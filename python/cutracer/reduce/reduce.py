@@ -73,6 +73,10 @@ class ReplayResult:
 class ReplayExecutionError(RuntimeError):
     """Raised when a reducer candidate could not be evaluated reliably."""
 
+    def __init__(self, message: str, outcome: ReplayOutcome) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+
 
 class ConfigDoesNotTriggerError(ValueError):
     """Raised when the initial config does not reproduce the race.
@@ -251,7 +255,10 @@ def _candidate_is_interesting(config: ReduceConfig, config_path: str) -> bool:
         )
         if result.outcome in (ReplayOutcome.INFRA_ERROR, ReplayOutcome.TIMED_OUT):
             detail = result.error or result.stderr or result.outcome.value
-            raise ReplayExecutionError(f"could not evaluate replay candidate: {detail}")
+            raise ReplayExecutionError(
+                f"could not evaluate replay candidate: {detail}",
+                result.outcome,
+            )
         return result.interesting
     if config.test_script is not None:
         return run_test(config.test_script, config_path, config.verbose)
@@ -280,6 +287,7 @@ def _test_point_essentiality(
     point: DelayPoint,
     mutator: DelayConfigMutator,
     config: ReduceConfig,
+    confidence_runs: int = 1,
 ) -> tuple[bool, str]:
     """
     Test if a point is essential by disabling it and running the test.
@@ -296,7 +304,9 @@ def _test_point_essentiality(
 
     test_config_path = test_mutator.save()
     try:
-        race_occurs = _candidate_is_interesting(config, test_config_path)
+        race_occurs = _run_test_with_confidence(
+            config, test_config_path, confidence_runs
+        )
     except Exception:
         _cleanup_temp_file(test_config_path)
         raise
@@ -347,6 +357,7 @@ def _validate_initial_config(
 
 def reduce_delay_points(
     config: ReduceConfig,
+    confidence_runs: int = 1,
     progress_callback: Optional[Callable[[int, int, DelayPoint, bool], None]] = None,
 ) -> ReduceResult:
     """
@@ -360,6 +371,8 @@ def reduce_delay_points(
 
     Args:
         config: Reduction configuration.
+        confidence_runs: Number of test runs per point for majority voting
+            (default: 1). Use odd numbers (3, 5) for probabilistic races.
         progress_callback: Optional callback for progress updates.
             Called with (current_iteration, total, point, is_essential).
 
@@ -380,7 +393,7 @@ def reduce_delay_points(
 
         try:
             is_essential, test_config_path = _test_point_essentiality(
-                point, mutator, config
+                point, mutator, config, confidence_runs
             )
         except Exception:
             _cleanup_temp_file(initial_config_path)

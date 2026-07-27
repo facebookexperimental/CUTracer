@@ -952,6 +952,10 @@ class ReduceExperimentResult:
     )
     duration_s: float = 0.0
     error: Optional[str] = None
+    # Free-form advisory note on a successful reduction (e.g. a 0-essential-point
+    # result that reproduces without any injected delay). Distinct from ``error``,
+    # which is reserved for failures.
+    note: str = ""
 
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.REDUCE_DELAY_CONFIG, init=False
@@ -974,6 +978,7 @@ class ReduceExperimentResult:
             "essential_points": [x.to_dict() for x in self.essential_points],
             "duration_s": self.duration_s,
             "error": self.error,
+            "note": self.note,
         }
 
     @classmethod
@@ -995,6 +1000,7 @@ class ReduceExperimentResult:
             ],
             duration_s=float(d.get("duration_s", 0.0)),
             error=d.get("error"),
+            note=d.get("note", ""),
         )
 
 
