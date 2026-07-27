@@ -15,6 +15,7 @@ from cutracer.compute_sanitizer.cli import compute_sanitizer_command
 from cutracer.query.cli import query_command, sass_command
 from cutracer.reduce.cli import reduce_command
 from cutracer.runner import trace_command
+from cutracer.stress.cli import stress_command
 from cutracer.validation.cli import compare_command, validate_command
 
 
@@ -70,10 +71,11 @@ def main(ctx: click.Context) -> None:
 # Register subcommands
 main.add_command(analyze_command)
 main.add_command(compare_command)
+main.add_command(compute_sanitizer_command)
 main.add_command(query_command)
 main.add_command(reduce_command)
-main.add_command(compute_sanitizer_command)
 main.add_command(sass_command)
+main.add_command(stress_command)
 main.add_command(trace_command)
 main.add_command(validate_command)
 
