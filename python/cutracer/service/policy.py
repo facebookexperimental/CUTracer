@@ -39,6 +39,21 @@ def _fingerprint(kind: ExperimentKind, discriminator: str = "") -> str:
     return f"{kind.value}:{discriminator}"
 
 
+def experiment_spec_fingerprint(spec: ExperimentSpec) -> str:
+    """Fingerprint a planned spec with the identical key the guard dedups on.
+
+    Mirrors the per-kind discriminator that ``ExperimentGuardPolicy.expand``
+    derives from a request, so a later follow-up that repeats an already-planned
+    experiment collides with this key and is rejected.
+    """
+    discriminator = ""
+    if spec.kind == ExperimentKind.COMPUTE_SANITIZER:
+        discriminator = spec.sanitizer_tool or ""
+    elif spec.kind == ExperimentKind.REDUCE_DELAY_CONFIG and spec.reduction is not None:
+        discriminator = spec.reduction.triggering_config.artifact.uri
+    return _fingerprint(spec.kind, discriminator)
+
+
 @dataclasses.dataclass(frozen=True)
 class CampaignPlan:
     experiments: tuple[ExperimentSpec, ...]
