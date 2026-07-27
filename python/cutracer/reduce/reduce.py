@@ -11,12 +11,77 @@ Implements two strategies:
 import os
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, Optional
+from enum import Enum
+from typing import Callable, Mapping, Optional, Sequence
 
+from click import ClickException
 from cutracer.cutracer_logger import get_logger
 from cutracer.reduce.config_mutator import DelayConfigMutator, DelayPoint
+from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
 
 logger = get_logger("reduce")
+
+
+class ReplayOutcome(str, Enum):
+    """Classification of one deterministic delay-config replay."""
+
+    INTERESTING = "interesting"
+    NOT_INTERESTING = "not_interesting"
+    INFRA_ERROR = "infra_error"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    """Inputs needed to replay a candidate with this CUTracer build."""
+
+    oracle_argv: Sequence[str]
+    cutracer_so: Optional[str] = None
+    kernel_filters: Optional[str] = None
+    delay_mode: Optional[str] = None
+    delay_warpgroup_id: Optional[int] = None
+    delay_warp_mask: Optional[str] = None
+    output_dir: Optional[str] = None
+    timeout: int = 300
+    cwd: Optional[str] = None
+    base_env: Optional[Mapping[str, str]] = None
+    capture_output: bool = True
+    # Exact non-zero oracle codes that mean a valid non-reproduction. An empty
+    # tuple makes every non-zero code unexpected rather than accepting all.
+    not_interesting_exit_codes: tuple[int, ...] = (1,)
+
+    def __post_init__(self) -> None:
+        if self.timeout <= 0:
+            raise ValueError("replay timeout must be positive")
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """Structured result of one deterministic delay-config replay."""
+
+    outcome: ReplayOutcome
+    returncode: Optional[int]
+    stdout: str = ""
+    stderr: str = ""
+    error: Optional[str] = None
+
+    @property
+    def interesting(self) -> bool:
+        return self.outcome == ReplayOutcome.INTERESTING
+
+
+class ReplayExecutionError(RuntimeError):
+    """Raised when a reducer candidate could not be evaluated reliably."""
+
+
+class ConfigDoesNotTriggerError(ValueError):
+    """Raised when the initial config does not reproduce the race.
+
+    Subclasses ``ValueError`` so callers that catch ``ValueError`` keep working,
+    while in-process callers (e.g. the service) can match this stale-config case
+    with ``except ConfigDoesNotTriggerError`` instead of string-matching the
+    human-readable message.
+    """
 
 
 @dataclass
@@ -55,10 +120,90 @@ class ReduceConfig:
     """Configuration for reduction."""
 
     config_path: str
-    test_script: str
+    test_script: Optional[str] = None
     output_path: Optional[str] = None
     verbose: bool = False
     validate_schema: bool = True
+    replay: Optional[ReplayConfig] = None
+    replay_runner: Optional[RunTarget] = None
+
+
+def _replay_delay_ns(config_path: str) -> int:
+    mutator = DelayConfigMutator(config_path, validate=False)
+    delay_ns = int(mutator.config.get("delay_ns", 0))
+    if delay_ns <= 0:
+        delay_ns = max((point.delay_ns for point in mutator.delay_points), default=0)
+    if delay_ns <= 0:
+        raise ValueError(f"delay config has no positive delay value: {config_path}")
+    return delay_ns
+
+
+def run_replay(
+    config_path: str,
+    config: ReplayConfig,
+    *,
+    runner: Optional[RunTarget] = None,
+) -> ReplayResult:
+    """Replay one candidate using the CUTracer library from this Python package."""
+    if not config.oracle_argv:
+        return ReplayResult(
+            outcome=ReplayOutcome.INFRA_ERROR,
+            returncode=None,
+            error="replay oracle argv must not be empty",
+        )
+
+    try:
+        proc = run_instrumented_target(
+            config.oracle_argv,
+            InstrumentationConfig(
+                cutracer_so=config.cutracer_so,
+                instrument="random_delay",
+                analysis="random_delay",
+                kernel_filters=config.kernel_filters,
+                output_dir=config.output_dir,
+                delay_ns=_replay_delay_ns(config_path),
+                delay_mode=config.delay_mode,
+                delay_warpgroup_id=config.delay_warpgroup_id,
+                delay_warp_mask=config.delay_warp_mask,
+                delay_load_path=config_path,
+                cwd=config.cwd,
+                timeout=config.timeout,
+                base_env=config.base_env,
+                capture_output=config.capture_output,
+            ),
+            runner=runner,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return ReplayResult(
+            outcome=ReplayOutcome.TIMED_OUT,
+            returncode=None,
+            error=str(exc),
+        )
+    except (ClickException, OSError, TypeError, ValueError) as exc:
+        return ReplayResult(
+            outcome=ReplayOutcome.INFRA_ERROR,
+            returncode=None,
+            error=str(exc),
+        )
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if proc.returncode == 0:
+        outcome = ReplayOutcome.INTERESTING
+        error = None
+    elif proc.returncode in config.not_interesting_exit_codes:
+        outcome = ReplayOutcome.NOT_INTERESTING
+        error = None
+    else:
+        outcome = ReplayOutcome.INFRA_ERROR
+        error = f"oracle exited with unexpected code {proc.returncode}"
+    return ReplayResult(
+        outcome=outcome,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        error=error,
+    )
 
 
 def run_test(
@@ -97,6 +242,22 @@ def run_test(
         return False
 
 
+def _candidate_is_interesting(config: ReduceConfig, config_path: str) -> bool:
+    if config.replay is not None:
+        result = run_replay(
+            config_path,
+            config.replay,
+            runner=config.replay_runner,
+        )
+        if result.outcome in (ReplayOutcome.INFRA_ERROR, ReplayOutcome.TIMED_OUT):
+            detail = result.error or result.stderr or result.outcome.value
+            raise ReplayExecutionError(f"could not evaluate replay candidate: {detail}")
+        return result.interesting
+    if config.test_script is not None:
+        return run_test(config.test_script, config_path, config.verbose)
+    raise ValueError("reduce requires either replay config or test_script")
+
+
 def _cleanup_temp_file(path: str) -> None:
     """Safely remove a temporary file."""
     try:
@@ -118,8 +279,7 @@ def _find_point_in_mutator(
 def _test_point_essentiality(
     point: DelayPoint,
     mutator: DelayConfigMutator,
-    test_script: str,
-    verbose: bool,
+    config: ReduceConfig,
 ) -> tuple[bool, str]:
     """
     Test if a point is essential by disabling it and running the test.
@@ -135,7 +295,11 @@ def _test_point_essentiality(
         test_mutator.set_point_enabled(cloned_point, False)
 
     test_config_path = test_mutator.save()
-    race_occurs = run_test(test_script, test_config_path, verbose)
+    try:
+        race_occurs = _candidate_is_interesting(config, test_config_path)
+    except Exception:
+        _cleanup_temp_file(test_config_path)
+        raise
     is_essential = not race_occurs
 
     return is_essential, test_config_path
@@ -152,7 +316,9 @@ def _validate_initial_config(
         Path to the saved initial config.
 
     Raises:
-        ValueError: If no enabled points or initial config doesn't trigger race.
+        ValueError: If there are no enabled delay points.
+        ConfigDoesNotTriggerError: If the initial config does not trigger the
+            race (a ``ValueError`` subclass).
     """
     enabled_points = mutator.enabled_points
 
@@ -162,10 +328,16 @@ def _validate_initial_config(
     logger.debug(f"Loaded {len(enabled_points)} enabled delay points")
 
     initial_config_path = mutator.save()
-    if not run_test(config.test_script, initial_config_path, config.verbose):
-        raise ValueError(
+    try:
+        initial_is_interesting = _candidate_is_interesting(config, initial_config_path)
+    except Exception:
+        _cleanup_temp_file(initial_config_path)
+        raise
+    if not initial_is_interesting:
+        _cleanup_temp_file(initial_config_path)
+        raise ConfigDoesNotTriggerError(
             "Initial config does not trigger the race! "
-            "Test script must return 0 (race) with the original config."
+            "Oracle must return 0 (race) with the original config."
         )
 
     logger.debug("Initial config triggers the race")
@@ -206,9 +378,13 @@ def reduce_delay_points(
 
         logger.debug(f"[{iteration}/{len(points_to_test)}] Testing: {point.sass}")
 
-        is_essential, test_config_path = _test_point_essentiality(
-            point, mutator, config.test_script, config.verbose
-        )
+        try:
+            is_essential, test_config_path = _test_point_essentiality(
+                point, mutator, config
+            )
+        except Exception:
+            _cleanup_temp_file(initial_config_path)
+            raise
 
         if is_essential:
             logger.debug("   -> Race disappears (point IS essential)")
@@ -245,31 +421,28 @@ def reduce_delay_points(
 
 
 def _run_test_with_confidence(
-    test_script: str,
+    config: ReduceConfig,
     config_path: str,
     confidence_runs: int,
-    verbose: bool = False,
 ) -> bool:
     """
     Run test multiple times and use majority voting for probabilistic races.
 
     Args:
-        test_script: Path to the test script.
+        config: Reduction configuration containing the replay oracle.
         config_path: Path to the delay config JSON file.
         confidence_runs: Number of times to run the test (must be odd).
-        verbose: Whether to print test output.
-
     Returns:
         True if data race occurred in majority of runs.
     """
     if confidence_runs <= 1:
-        return run_test(test_script, config_path, verbose)
+        return _candidate_is_interesting(config, config_path)
 
     race_count = 0
     threshold = confidence_runs // 2 + 1
 
     for i in range(confidence_runs):
-        if run_test(test_script, config_path, verbose):
+        if _candidate_is_interesting(config, config_path):
             race_count += 1
             if race_count >= threshold:
                 return True
@@ -310,9 +483,8 @@ def _make_config_with_points(
 def _test_subset(
     base_mutator: DelayConfigMutator,
     points: list[DelayPoint],
-    test_script: str,
+    config: ReduceConfig,
     confidence_runs: int,
-    verbose: bool,
 ) -> bool:
     """
     Test if a subset of points triggers the race.
@@ -323,9 +495,7 @@ def _test_subset(
     mutator = _make_config_with_points(base_mutator, points)
     config_path = mutator.save()
     try:
-        return _run_test_with_confidence(
-            test_script, config_path, confidence_runs, verbose
-        )
+        return _run_test_with_confidence(config, config_path, confidence_runs)
     finally:
         _cleanup_temp_file(config_path)
 
@@ -404,9 +574,7 @@ def reduce_bisect(
                 f"({len(chunk)} points alone)..."
             )
 
-            if _test_subset(
-                base_mutator, chunk, config.test_script, confidence_runs, config.verbose
-            ):
+            if _test_subset(base_mutator, chunk, config, confidence_runs):
                 logger.debug(
                     f"-> Chunk {i + 1} alone triggers race! "
                     f"Recursing on {len(chunk)} points"
@@ -433,9 +601,8 @@ def reduce_bisect(
             if _test_subset(
                 base_mutator,
                 complement,
-                config.test_script,
+                config,
                 confidence_runs,
-                config.verbose,
             ):
                 logger.debug(
                     f"-> Complement triggers race! "

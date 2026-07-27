@@ -12,15 +12,24 @@ Tests cover:
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from cutracer.reduce.config_mutator import DelayConfigMutator, DelayPoint
-from cutracer.reduce.reduce import reduce_delay_points, ReduceConfig, ReduceResult
+from cutracer.reduce.reduce import (
+    ConfigDoesNotTriggerError,
+    reduce_delay_points,
+    ReduceConfig,
+    ReduceResult,
+    ReplayConfig,
+    ReplayExecutionError,
+    ReplayOutcome,
+    run_replay,
+)
 from cutracer.reduce.report import format_report_text, generate_report
-
 
 # Sample delay config for testing (matches DELAY_CONFIG_SCHEMA)
 SAMPLE_DELAY_CONFIG = {
@@ -214,6 +223,101 @@ class DelayConfigMutatorTest(unittest.TestCase):
         self.assertEqual(len(mutator.delay_points), 1)
 
 
+class ReplayTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.config_path = self.temp_dir / "replay.json"
+        self.config_path.write_text(json.dumps(SAMPLE_DELAY_CONFIG))
+        self.cutracer_so = self.temp_dir / "cutracer.so"
+        self.cutracer_so.touch()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_replay_config_rejects_non_positive_timeout(self):
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout must be positive"):
+                    ReplayConfig(oracle_argv=["oracle"], timeout=timeout)
+
+    def test_replay_uses_current_runtime_and_structured_argv(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, "oracle output", "")
+
+        result = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["python", "oracle.py", "--case", "one two"],
+                cutracer_so=str(self.cutracer_so),
+                base_env={
+                    "PATH": "/bin",
+                    "CUDA_INJECTION64_PATH": "/feature-installed/cutracer.so",
+                },
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual(result.outcome, ReplayOutcome.INTERESTING)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv, ["python", "oracle.py", "--case", "one two"])
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["env"]["CUDA_INJECTION64_PATH"], str(self.cutracer_so))
+        self.assertEqual(kwargs["env"]["CUTRACER_DELAY_NS"], "100")
+        self.assertEqual(
+            kwargs["env"]["CUTRACER_DELAY_LOAD_PATH"], str(self.config_path)
+        )
+
+    def test_replay_classifies_oracle_and_infra_exit_codes(self):
+        def result_for(returncode):
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, returncode, "", "failure")
+
+            return run_replay(
+                str(self.config_path),
+                ReplayConfig(
+                    oracle_argv=["./oracle"],
+                    cutracer_so=str(self.cutracer_so),
+                ),
+                runner=runner,
+            )
+
+        self.assertEqual(result_for(1).outcome, ReplayOutcome.NOT_INTERESTING)
+        self.assertEqual(result_for(2).outcome, ReplayOutcome.INFRA_ERROR)
+
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "failure")
+
+        empty_allowlist = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                not_interesting_exit_codes=(),
+            ),
+            runner=runner,
+        )
+        self.assertEqual(empty_allowlist.outcome, ReplayOutcome.INFRA_ERROR)
+
+    def test_reducer_aborts_on_replay_infra_error(self):
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 2, "", "launch failed")
+
+        config = ReduceConfig(
+            config_path=str(self.config_path),
+            validate_schema=False,
+            replay=ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+            ),
+            replay_runner=runner,
+        )
+        with self.assertRaises(ReplayExecutionError):
+            reduce_delay_points(config)
+
+
 class ReduceDelayPointsTest(unittest.TestCase):
     """Tests for reduce_delay_points function and ReduceResult."""
 
@@ -298,7 +402,7 @@ class ReduceDelayPointsTest(unittest.TestCase):
 
         # Test: Initial config doesn't trigger race
         mock_run_test.return_value = False
-        with self.assertRaises(ValueError) as context:
+        with self.assertRaises(ConfigDoesNotTriggerError) as context:
             reduce_delay_points(reduce_config)
         self.assertIn(
             "Initial config does not trigger the race", str(context.exception)

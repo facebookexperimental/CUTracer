@@ -8,6 +8,23 @@ sets that trigger data races.
 """
 
 from cutracer.reduce.config_mutator import DelayConfigMutator
-from cutracer.reduce.reduce import reduce_bisect, reduce_delay_points
+from cutracer.reduce.reduce import (
+    ConfigDoesNotTriggerError,
+    reduce_bisect,
+    reduce_delay_points,
+    ReplayConfig,
+    ReplayOutcome,
+    ReplayResult,
+    run_replay,
+)
 
-__all__ = ["reduce_delay_points", "reduce_bisect", "DelayConfigMutator"]
+__all__ = [
+    "ConfigDoesNotTriggerError",
+    "DelayConfigMutator",
+    "ReplayConfig",
+    "ReplayOutcome",
+    "ReplayResult",
+    "reduce_bisect",
+    "reduce_delay_points",
+    "run_replay",
+]

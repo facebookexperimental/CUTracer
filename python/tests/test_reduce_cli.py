@@ -17,6 +17,8 @@ class ReduceCliTest(unittest.TestCase):
 
     def setUp(self):
         self.runner = CliRunner()
+        self.isolated_filesystem = self.runner.isolated_filesystem()
+        self.isolated_filesystem.__enter__()
         self.temp_dir = tempfile.mkdtemp()
 
         # Create a test delay config file matching DELAY_CONFIG_SCHEMA
@@ -80,6 +82,7 @@ class ReduceCliTest(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
+        self.isolated_filesystem.__exit__(None, None, None)
 
     def test_reduce_help(self):
         """Test reduce --help shows usage information."""
@@ -107,6 +110,39 @@ class ReduceCliTest(unittest.TestCase):
         )
 
         self.assertNotEqual(result.exit_code, 0)
+
+    def test_reduce_requires_config_option(self):
+        """Test reduce never discovers or synthesizes a config implicitly."""
+        result = self.runner.invoke(
+            main,
+            [
+                "reduce",
+                "--test",
+                str(self.test_script_race),
+            ],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Missing option '--config'", result.output)
+
+    def test_reduce_rejects_non_positive_timeout(self):
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout):
+                result = self.runner.invoke(
+                    main,
+                    [
+                        "reduce",
+                        "--config",
+                        str(self.config_file),
+                        "--test",
+                        str(self.test_script_race),
+                        "--timeout",
+                        str(timeout),
+                    ],
+                )
+
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertIn("not in the range", result.output)
 
     def test_reduce_missing_test_script(self):
         """Test reduce fails with missing test script."""
@@ -233,6 +269,8 @@ class ReduceCliEmptyConfigTest(unittest.TestCase):
 
     def setUp(self):
         self.runner = CliRunner()
+        self.isolated_filesystem = self.runner.isolated_filesystem()
+        self.isolated_filesystem.__enter__()
         self.temp_dir = tempfile.mkdtemp()
 
         # Create test script
@@ -242,6 +280,7 @@ class ReduceCliEmptyConfigTest(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
+        self.isolated_filesystem.__exit__(None, None, None)
 
     def test_reduce_empty_config(self):
         """Test reduce with config that has no delay points."""

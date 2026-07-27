@@ -7,6 +7,8 @@ Provides command-line interface for reducing delay injection configurations.
 """
 
 import logging
+import os
+import shlex
 import sys
 from typing import NoReturn
 
@@ -18,6 +20,7 @@ from cutracer.reduce.reduce import (
     reduce_delay_points,
     ReduceConfig,
     ReduceResult,
+    ReplayConfig,
 )
 from cutracer.reduce.report import generate_report, save_report
 
@@ -90,7 +93,23 @@ def _run_reduction(
     "-t",
     required=True,
     type=str,
-    help="Test script. Returns 0 if race occurs, non-zero if no race.",
+    help="Oracle command, parsed with shlex.split and run directly as an argv "
+    "list (NOT through a shell). Exit 0 if the race occurs, 1 if it does not. "
+    "Shell composition (&&, |, globs, $VAR) must live inside a wrapper script "
+    "that exits 0 on manifest, e.g. the issue1996_pytest_race.sh convention.",
+)
+@click.option(
+    "--cutracer-so",
+    default=None,
+    help="Path to cutracer.so (default: bundled / auto-discovered).",
+)
+@click.option("-k", "--kernel-filters", default=None, help="Kernel name filter.")
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=1),
+    default=300,
+    show_default=True,
+    help="Per-replay timeout (s).",
 )
 @click.option(
     "--output",
@@ -136,6 +155,9 @@ def _run_reduction(
 def reduce_command(
     config: str,
     test: str,
+    cutracer_so: str | None,
+    kernel_filters: str | None,
+    timeout: int,
     output: str,
     minimal_config: str,
     strategy: str,
@@ -154,11 +176,17 @@ def reduce_command(
       - bisect: ddmin-style bisection. Much faster, splits points in half
         and recursively narrows down. Use --confidence-runs for probabilistic races.
 
-    Test script convention (same as llvm-reduce):
+    Oracle convention (same as llvm-reduce):
 
     \b
       - Exit 0: Interesting (race occurred)
-      - Exit 1+: Not interesting (no race)
+      - Exit 1: Not interesting (no race)
+      - Other exits: Infrastructure error
+
+    The oracle (-t) is parsed with shlex.split and run directly as an argv list,
+    NOT through a shell. Shell composition (&&, |, globs, $VAR) must live inside
+    a wrapper script that exits 0 on manifest (the issue1996_pytest_race.sh
+    convention).
 
     Examples:
 
@@ -180,13 +208,25 @@ def reduce_command(
         click.echo(f"Confidence runs: {confidence_runs}")
     click.echo("")
 
-    # Create reduce config
+    oracle_argv = shlex.split(test)
+    if not oracle_argv:
+        raise click.UsageError("--test must contain a non-empty oracle command")
+
+    # The oracle runs under this package's CUTracer runtime. It must not invoke
+    # another `cutracer` binary to load the replay config.
     reduce_config = ReduceConfig(
         config_path=config,
-        test_script=test,
         output_path=minimal_config,
         verbose=verbose,
         validate_schema=not no_validate_schema,
+        replay=ReplayConfig(
+            oracle_argv=oracle_argv,
+            cutracer_so=cutracer_so,
+            kernel_filters=kernel_filters,
+            output_dir=os.path.dirname(os.path.abspath(minimal_config)),
+            timeout=timeout,
+            capture_output=not verbose,
+        ),
     )
 
     # Run reduction
