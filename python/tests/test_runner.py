@@ -219,6 +219,28 @@ class BuildCutracerEnvTest(unittest.TestCase):
 
 
 class RunInstrumentedTargetTest(unittest.TestCase):
+    @patch("cutracer.runner.resolve_cutracer_so", return_value="/current/cutracer.so")
+    def test_programmatic_runner_overrides_inherited_injection(self, resolve) -> None:
+        calls = []
+
+        def fake_runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        run_instrumented_target(
+            ["./oracle"],
+            InstrumentationConfig(
+                instrument="random_delay",
+                base_env={"CUDA_INJECTION64_PATH": "/feature/cutracer.so"},
+            ),
+            runner=fake_runner,
+        )
+
+        resolve.assert_called_once_with(None, reject_inherited_injection=False)
+        self.assertEqual(
+            calls[0][1]["env"]["CUDA_INJECTION64_PATH"], "/current/cutracer.so"
+        )
+
     def test_programmatic_runner_uses_structured_argv_and_explicit_runtime(
         self,
     ) -> None:

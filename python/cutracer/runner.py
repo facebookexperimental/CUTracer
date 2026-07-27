@@ -81,7 +81,11 @@ def _persist_extracted_so(src: Path) -> Path:
     return dst
 
 
-def resolve_cutracer_so(explicit_path: Optional[str] = None) -> str:
+def resolve_cutracer_so(
+    explicit_path: Optional[str] = None,
+    *,
+    reject_inherited_injection: bool = True,
+) -> str:
     """Resolve cutracer.so path.
 
     Resolution order:
@@ -102,7 +106,9 @@ def resolve_cutracer_so(explicit_path: Optional[str] = None) -> str:
 
     # Fail if CUDA_INJECTION64_PATH is already set — cutracer trace sets
     # this variable itself, and a conflicting value indicates a misconfiguration.
-    env_injection = os.environ.get("CUDA_INJECTION64_PATH")
+    env_injection = (
+        os.environ.get("CUDA_INJECTION64_PATH") if reject_inherited_injection else None
+    )
     if env_injection:
         raise click.ClickException(
             f"CUDA_INJECTION64_PATH is set in your environment:\n"
@@ -254,13 +260,23 @@ def build_cutracer_env(
 _build_cutracer_env = build_cutracer_env
 
 
-def _resolve_and_build_env(config: InstrumentationConfig) -> tuple[str, dict]:
+def _resolve_and_build_env(
+    config: InstrumentationConfig,
+    *,
+    reject_inherited_injection: bool = True,
+) -> tuple[str, dict]:
     """Resolve cutracer.so and assemble the CUTracer environment for a config.
 
     Shared by the ``trace`` CLI path and the programmatic run path so both
-    resolve the library and build env vars identically.
+    resolve the library and build env vars identically. Programmatic callers
+    pass ``reject_inherited_injection=False`` because they intentionally own
+    the child environment and overwrite CUDA_INJECTION64_PATH; the CLI path
+    keeps the stricter inherited-environment diagnostic for direct invocations.
     """
-    so_path = resolve_cutracer_so(config.cutracer_so)
+    so_path = resolve_cutracer_so(
+        config.cutracer_so,
+        reject_inherited_injection=reject_inherited_injection,
+    )
     run_env = build_cutracer_env(
         cutracer_so=so_path,
         instrument=config.instrument,
@@ -303,7 +319,7 @@ def run_instrumented_target(
     if not argv:
         raise ValueError("instrumented target argv must not be empty")
 
-    _so_path, run_env = _resolve_and_build_env(config)
+    _so_path, run_env = _resolve_and_build_env(config, reject_inherited_injection=False)
     command: object
     if config.shell:
         import shlex

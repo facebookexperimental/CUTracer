@@ -74,6 +74,10 @@ class StressResult:
     reproduction_rate: float
     triggering: Optional[TriggeringConfig]
     log_path: Optional[str] = None
+    # Attempts whose repro command hung (timed out). Counted separately from
+    # ``infra_errors`` so a caller can tell "the workload hangs" apart from a
+    # generic launch/tooling failure.
+    timed_out: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +85,7 @@ class StressResult:
             "completed_trials": self.completed_trials,
             "reproductions": self.reproductions,
             "infra_errors": self.infra_errors,
+            "timed_out": self.timed_out,
             "reproduction_rate": self.reproduction_rate,
             "triggering_config": (
                 None if self.triggering is None else self.triggering.to_dict()
@@ -95,6 +100,7 @@ class _AttemptResult:
     infra_errors: int
     triggering: Optional[TriggeringConfig]
     log: str
+    timed_out: int = 0
 
 
 def _unlink(path: str) -> None:
@@ -164,7 +170,7 @@ def _run_attempt(
         return _AttemptResult(
             0,
             0,
-            1,
+            0,
             None,
             _attempt_log(
                 delay_ns=delay_ns,
@@ -172,6 +178,7 @@ def _run_attempt(
                 attempt=attempt,
                 error=f"timed out: {exc}",
             ),
+            timed_out=1,
         )
 
     log = _attempt_log(
@@ -212,7 +219,7 @@ def _run_attempt(
 def run_stress(
     config: StressConfig,
     *,
-    cutracer_so: str,
+    cutracer_so: Optional[str] = None,
     runner: Optional[RunTarget] = None,
 ) -> StressResult:
     """Sweep the delay ladder under random injection until the oracle reproduces.
@@ -225,6 +232,7 @@ def run_stress(
     completed = 0
     reproductions = 0
     infra_errors = 0
+    timed_out = 0
     triggering: Optional[TriggeringConfig] = None
     log_parts: List[str] = []
     stop = False
@@ -246,6 +254,7 @@ def run_stress(
                 completed += outcome.completed_trials
                 reproductions += outcome.reproductions
                 infra_errors += outcome.infra_errors
+                timed_out += outcome.timed_out
                 log_parts.append(outcome.log)
                 if outcome.triggering is not None:
                     if triggering is None:
@@ -277,6 +286,7 @@ def run_stress(
         reproduction_rate=rate,
         triggering=triggering,
         log_path=log_path,
+        timed_out=timed_out,
     )
 
 
