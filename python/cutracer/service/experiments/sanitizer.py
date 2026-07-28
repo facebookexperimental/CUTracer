@@ -9,7 +9,7 @@ import time
 from typing import Callable, List, Optional
 
 from click import ClickException
-from cutracer.analyze.fb.compute_sanitizer.parser import (
+from cutracer.compute_sanitizer.parser import (
     parse_racecheck_log as parse_canonical_racecheck_log,
 )
 from cutracer.compute_sanitizer.run import (
@@ -44,28 +44,16 @@ def parse_racecheck_log(text: str) -> List[FindingRecord]:
     """Convert the canonical CUTracer parser output to service wire records."""
     records: List[FindingRecord] = []
     for finding in parse_canonical_racecheck_log(text).findings:
-        payload = finding.payload
-        accesses = payload.get("accesses", [])
-        primary = accesses[0] if isinstance(accesses, list) and accesses else {}
-        if not isinstance(primary, dict):
-            primary = {}
-
-        file = primary.get("file")
-        line = primary.get("line")
-        source = None
-        if isinstance(file, str) and isinstance(line, int):
-            source = SourceLoc(file=file, line=line)
-
-        kernel = primary.get("func")
-        count = payload.get("max_hazards", 1)
+        primary = finding.accesses[0]
+        count = finding.max_hazards
         records.append(
             FindingRecord(
                 source_tool="compute_sanitizer/racecheck",
                 error_type="race-condition",
-                kernel_name=kernel if isinstance(kernel, str) else None,
-                source=source,
-                count=count if isinstance(count, int) else 1,
-                raw=str(payload.get("raw_block", "")),
+                kernel_name=primary.function,
+                source=SourceLoc(file=primary.file, line=primary.line),
+                count=count if count is not None else 1,
+                raw=finding.raw_block,
             )
         )
     return records
