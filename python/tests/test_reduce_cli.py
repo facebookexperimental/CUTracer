@@ -20,6 +20,9 @@ class ReduceCliTest(unittest.TestCase):
         self.isolated_filesystem = self.runner.isolated_filesystem()
         self.isolated_filesystem.__enter__()
         self.temp_dir = tempfile.mkdtemp()
+        self.cutracer_so = Path(self.temp_dir) / "cutracer.so"
+        self.cutracer_so.touch()
+        self.runtime_args = ["--cutracer-so", str(self.cutracer_so)]
 
         # Create a test delay config file matching DELAY_CONFIG_SCHEMA
         self.config_file = Path(self.temp_dir) / "delay_config.json"
@@ -150,6 +153,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
@@ -159,6 +163,7 @@ class ReduceCliTest(unittest.TestCase):
 
         # Should fail when trying to run the nonexistent test script
         self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No such file or directory", result.output)
 
     def test_reduce_basic_with_race(self):
         """Test basic reduce command with race always detected."""
@@ -169,6 +174,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
@@ -193,6 +199,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
@@ -201,7 +208,7 @@ class ReduceCliTest(unittest.TestCase):
         )
 
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("Error", result.output)
+        self.assertIn("Initial config does not trigger the race", result.output)
 
     def test_reduce_verbose_output(self):
         """Test reduce with verbose output."""
@@ -209,6 +216,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
@@ -227,6 +235,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
@@ -250,6 +259,7 @@ class ReduceCliTest(unittest.TestCase):
             main,
             [
                 "reduce",
+                *self.runtime_args,
                 "--config",
                 str(self.config_file),
                 "--test",
