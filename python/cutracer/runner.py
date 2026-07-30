@@ -11,11 +11,14 @@ Usage:
     cutracer trace --instrument=tma_trace --instr-categories=tma -- python -m pytest test.py
 """
 
+import hashlib
 import importlib.resources as resources
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
@@ -62,6 +65,15 @@ class InstrumentationConfig:
     shell: bool = False
 
 
+@dataclass(frozen=True)
+class _BundledCudaTools:
+    """Filesystem paths for CUDA host tools bundled with CUTracer."""
+
+    bin_dir: Path
+    nvdisasm: Path
+    cuobjdump: Path
+
+
 def _is_under_tempdir(path: Path) -> bool:
     try:
         path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
@@ -79,6 +91,106 @@ def _persist_extracted_so(src: Path) -> Path:
         shutil.copy2(src, dst)
         dst.chmod(0o755)
     return dst
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _host_arch() -> str:
+    machine = platform.machine().lower()
+    return {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+
+
+def _persist_extracted_cuda_tools(
+    extracted: Mapping[str, Path],
+) -> _BundledCudaTools:
+    """Copy temporary fbpkg resources into an immutable runtime cache.
+
+    ``importlib.resources.as_file`` removes files extracted from a zip/PEX when
+    its context exits. NVBit starts later in a child process, so the bundled
+    host tools must outlive that context. The host architecture and content
+    digest keep x86_64/aarch64 packages and CUTracer releases isolated.
+    """
+    tool_digests = {name: _file_sha256(path) for name, path in extracted.items()}
+    bundle_digest = hashlib.sha256()
+    for name in sorted(tool_digests):
+        bundle_digest.update(name.encode())
+        bundle_digest.update(b"\0")
+        bundle_digest.update(tool_digests[name].encode())
+        bundle_digest.update(b"\0")
+
+    cache_root = (
+        Path(tempfile.gettempdir())
+        / f"cutracer_runtime_{os.getuid()}"
+        / _host_arch()
+        / bundle_digest.hexdigest()
+        / "bin"
+    )
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    for name, source in extracted.items():
+        destination = cache_root / name
+        if destination.is_file() and _file_sha256(destination) == tool_digests[name]:
+            continue
+
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=str(cache_root))
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.chmod(0o755)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    return _BundledCudaTools(
+        bin_dir=cache_root,
+        nvdisasm=cache_root / "nvdisasm",
+        cuobjdump=cache_root / "cuobjdump",
+    )
+
+
+def _resolve_bundled_cuda_tools() -> Optional[_BundledCudaTools]:
+    """Resolve bundled nvdisasm/cuobjdump to paths valid for child processes."""
+    try:
+        package = resources.files("cutracer")
+    except (FileNotFoundError, ModuleNotFoundError):
+        return None
+
+    tool_refs = {
+        name: package.joinpath(f"bin/{name}") for name in ("nvdisasm", "cuobjdump")
+    }
+    if not all(ref.is_file() for ref in tool_refs.values()):
+        return None
+
+    try:
+        with ExitStack() as stack:
+            extracted = {
+                name: stack.enter_context(resources.as_file(ref))
+                for name, ref in tool_refs.items()
+            }
+
+            parents = {path.parent for path in extracted.values()}
+            if len(parents) == 1 and not any(
+                _is_under_tempdir(path) for path in extracted.values()
+            ):
+                bin_dir = parents.pop()
+                return _BundledCudaTools(
+                    bin_dir=bin_dir,
+                    nvdisasm=bin_dir / "nvdisasm",
+                    cuobjdump=bin_dir / "cuobjdump",
+                )
+
+            return _persist_extracted_cuda_tools(extracted)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Failed to prepare bundled CUDA tools: {exc}"
+        ) from exc
 
 
 def resolve_cutracer_so(
@@ -241,17 +353,19 @@ def build_cutracer_env(
     env["CUTRACER_KERNEL_TIMEOUT_S"] = str(kernel_timeout_s)
     env["CUTRACER_NO_DATA_TIMEOUT_S"] = str(no_data_timeout_s)
 
-    # Add bundled CUDA tools (nvdisasm, cuobjdump) to PATH so NVBit can find them.
-    # These are bundled as buck resources from fbsource's third-party CUDA,
-    # matching the CUDA version specified via -c fbcode.platform010_cuda_version.
-    try:
-        bin_ref = resources.files("cutracer").joinpath("bin/nvdisasm")
-        with resources.as_file(bin_ref) as bin_path:
-            bin_dir = str(bin_path.parent)
-        if os.path.isdir(bin_dir):
-            env["PATH"] = bin_dir + ":" + env.get("PATH", "")
-    except Exception:
-        pass
+    # NVBit launches nvdisasm after importlib's resource context has exited.
+    # Zip/PEX resources therefore need a persistent path, not the temporary
+    # path returned directly by resources.as_file(). Set the absolute override
+    # as well as PATH so both NVBit and other CUDA-tool consumers resolve the
+    # host-architecture binaries bundled in this CUTracer package. NVBit has an
+    # explicit NVDISASM override but invokes cuobjdump by name, so cuobjdump is
+    # intentionally provided through PATH.
+    cuda_tools = _resolve_bundled_cuda_tools()
+    if cuda_tools is not None:
+        env["NVDISASM"] = str(cuda_tools.nvdisasm)
+        env["PATH"] = os.pathsep.join(
+            p for p in (str(cuda_tools.bin_dir), env.get("PATH")) if p
+        )
 
     return env
 
@@ -344,6 +458,7 @@ def _print_config_summary(env: dict) -> None:
     """Print a summary of the active CUTracer configuration."""
     cutracer_keys = [
         "CUDA_INJECTION64_PATH",
+        "NVDISASM",
         "CUTRACER_INSTRUMENT",
         "CUTRACER_ANALYSIS",
         "KERNEL_FILTERS",

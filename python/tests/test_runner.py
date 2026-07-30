@@ -4,14 +4,19 @@
 """Tests for cutracer.runner module."""
 
 import os
+import shutil
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
 from cutracer.runner import (
     _build_cutracer_env,
+    _BundledCudaTools,
+    _persist_extracted_cuda_tools,
+    _resolve_bundled_cuda_tools,
     InstrumentationConfig,
     resolve_cutracer_so,
     run_instrumented_target,
@@ -62,7 +67,9 @@ class ResolveCutracerSoCwdAutoDiscoveryTest(unittest.TestCase):
                 os.chdir(tmpdir)
                 with patch.dict(os.environ, {}, clear=True):
                     with patch("cutracer.runner.resources") as mock_resources:
-                        mock_resources.files.side_effect = Exception("no resource")
+                        mock_resources.files.side_effect = ModuleNotFoundError(
+                            "no resource"
+                        )
                         result = resolve_cutracer_so()
                 self.assertEqual(result, so_file)
             finally:
@@ -77,7 +84,7 @@ class ResolveCutracerSoAllFailTest(unittest.TestCase):
         self, mock_resources: MagicMock
     ) -> None:
         """When no resolution method works, raises ClickException with help."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # CWD has no lib/cutracer.so
@@ -99,7 +106,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_sets_cuda_injection_path(self, mock_resources: MagicMock) -> None:
         """CUDA_INJECTION64_PATH is set to the provided cutracer_so path."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument=None,
@@ -117,7 +124,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_sets_instrument_env_var(self, mock_resources: MagicMock) -> None:
         """CUTRACER_INSTRUMENT is set when instrument is provided."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument="tma_trace",
@@ -135,7 +142,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_omits_none_values(self, mock_resources: MagicMock) -> None:
         """None-valued parameters are not set in the environment."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument=None,
@@ -155,7 +162,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_sets_all_delay_params(self, mock_resources: MagicMock) -> None:
         """All delay-related parameters are set correctly."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument="random_delay",
@@ -181,7 +188,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_dump_cubin_flag(self, mock_resources: MagicMock) -> None:
         """CUTRACER_DUMP_CUBIN is set to '1' when dump_cubin is True."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument=None,
@@ -200,7 +207,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
     @patch("cutracer.runner.resources")
     def test_default_timeout_values(self, mock_resources: MagicMock) -> None:
         """Default timeout values are set correctly."""
-        mock_resources.files.side_effect = Exception("no resource")
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
         env = _build_cutracer_env(
             cutracer_so="/path/to/cutracer.so",
             instrument=None,
@@ -216,6 +223,113 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_TRACE_SIZE_LIMIT_MB"], "0")
         self.assertEqual(env["CUTRACER_KERNEL_TIMEOUT_S"], "0")
         self.assertEqual(env["CUTRACER_NO_DATA_TIMEOUT_S"], "15")
+
+    @patch("cutracer.runner._resolve_bundled_cuda_tools")
+    def test_sets_persistent_cuda_tool_paths(self, resolve_tools) -> None:
+        resolve_tools.return_value = _BundledCudaTools(
+            bin_dir=Path("/cache/aarch64/digest/bin"),
+            nvdisasm=Path("/cache/aarch64/digest/bin/nvdisasm"),
+            cuobjdump=Path("/cache/aarch64/digest/bin/cuobjdump"),
+        )
+        env = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument=None,
+            analysis=None,
+            kernel_filters=None,
+            instr_categories=None,
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=None,
+            base_env={"PATH": "/usr/bin"},
+        )
+
+        self.assertEqual(env["NVDISASM"], "/cache/aarch64/digest/bin/nvdisasm")
+        self.assertEqual(env["PATH"], "/cache/aarch64/digest/bin:/usr/bin")
+
+
+class PersistExtractedCudaToolsTest(unittest.TestCase):
+    def _write_tools(self, directory: Path, suffix: bytes = b"v1") -> dict[str, Path]:
+        directory.mkdir(parents=True)
+        tools = {
+            "nvdisasm": directory / "nvdisasm",
+            "cuobjdump": directory / "cuobjdump",
+        }
+        for name, path in tools.items():
+            path.write_bytes(name.encode() + suffix)
+        return tools
+
+    def test_tools_outlive_extracted_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            extracted_dir = root / "extracted"
+            extracted = self._write_tools(extracted_dir)
+            with patch("cutracer.runner.tempfile.gettempdir", return_value=tmpdir):
+                with patch("cutracer.runner.platform.machine", return_value="x86_64"):
+                    persisted = _persist_extracted_cuda_tools(extracted)
+
+            shutil.rmtree(extracted_dir)
+            self.assertEqual(persisted.nvdisasm.read_bytes(), b"nvdisasmv1")
+            self.assertEqual(persisted.cuobjdump.read_bytes(), b"cuobjdumpv1")
+            self.assertTrue(os.access(persisted.nvdisasm, os.X_OK))
+            self.assertIn("x86_64", persisted.bin_dir.parts)
+
+    def test_host_arch_and_content_have_distinct_cache_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            extracted = self._write_tools(root / "extracted")
+            with patch("cutracer.runner.tempfile.gettempdir", return_value=tmpdir):
+                with patch("cutracer.runner.platform.machine", return_value="x86_64"):
+                    x86 = _persist_extracted_cuda_tools(extracted)
+                with patch("cutracer.runner.platform.machine", return_value="aarch64"):
+                    arm = _persist_extracted_cuda_tools(extracted)
+
+                extracted["nvdisasm"].write_bytes(b"nvdisasmv2")
+                with patch("cutracer.runner.platform.machine", return_value="x86_64"):
+                    updated = _persist_extracted_cuda_tools(extracted)
+
+            self.assertNotEqual(x86.bin_dir, arm.bin_dir)
+            self.assertNotEqual(x86.bin_dir, updated.bin_dir)
+
+    @patch("cutracer.runner.resources")
+    def test_missing_bundled_tools_are_optional(self, mock_resources) -> None:
+        package = mock_resources.files.return_value
+        package.joinpath.return_value.is_file.return_value = False
+
+        self.assertIsNone(_resolve_bundled_cuda_tools())
+        mock_resources.as_file.assert_not_called()
+
+    @patch("cutracer.runner._persist_extracted_cuda_tools")
+    @patch("cutracer.runner.resources")
+    def test_persistence_failure_is_not_swallowed(
+        self, mock_resources, persist_tools
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nvdisasm = Path(tmpdir) / "nvdisasm"
+            cuobjdump = Path(tmpdir) / "cuobjdump"
+            nvdisasm.touch()
+            cuobjdump.touch()
+
+            tool_refs = {
+                "bin/nvdisasm": MagicMock(),
+                "bin/cuobjdump": MagicMock(),
+            }
+            for ref in tool_refs.values():
+                ref.is_file.return_value = True
+            package = mock_resources.files.return_value
+            package.joinpath.side_effect = tool_refs.__getitem__
+            mock_resources.as_file.side_effect = [
+                nullcontext(nvdisasm),
+                nullcontext(cuobjdump),
+            ]
+            persist_tools.side_effect = PermissionError("read-only cache")
+
+            with self.assertRaises(click.ClickException) as ctx:
+                _resolve_bundled_cuda_tools()
+
+        self.assertIn("Failed to prepare bundled CUDA tools", ctx.exception.message)
+        self.assertIn("read-only cache", ctx.exception.message)
 
 
 class RunInstrumentedTargetTest(unittest.TestCase):
