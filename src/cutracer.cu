@@ -147,6 +147,53 @@ static bool extract_cluster_dim_from_launch_ex(nvbit_api_cuda_t cbid, void* para
   return false;
 }
 
+enum class ClusterDimSource {
+  UNKNOWN,
+  LAUNCH_ATTRIBUTE,
+  REQUIRED_FUNCTION_ATTRIBUTE,
+};
+
+struct ClusterLaunchInfo {
+  unsigned int x = 1;
+  unsigned int y = 1;
+  unsigned int z = 1;
+  ClusterDimSource source = ClusterDimSource::UNKNOWN;
+
+  unsigned int size() const {
+    return x * y * z;
+  }
+};
+
+static const char* cluster_dim_source_name(ClusterDimSource source) {
+  switch (source) {
+    case ClusterDimSource::LAUNCH_ATTRIBUTE:
+      return "launch_attribute";
+    case ClusterDimSource::REQUIRED_FUNCTION_ATTRIBUTE:
+      return "required_function_attribute";
+    case ClusterDimSource::UNKNOWN:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static ClusterLaunchInfo resolve_cluster_launch_info(CUfunction func, bool has_dynamic_dim = false,
+                                                     unsigned int dynamic_x = 0, unsigned int dynamic_y = 0,
+                                                     unsigned int dynamic_z = 0) {
+  if (has_dynamic_dim && dynamic_x > 0 && dynamic_y > 0 && dynamic_z > 0) {
+    return {dynamic_x, dynamic_y, dynamic_z, ClusterDimSource::LAUNCH_ATTRIBUTE};
+  }
+
+  int required_x = 0, required_y = 0, required_z = 0;
+  if (cuFuncGetAttribute(&required_x, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, func) != CUDA_SUCCESS) required_x = 0;
+  if (cuFuncGetAttribute(&required_y, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, func) != CUDA_SUCCESS) required_y = 0;
+  if (cuFuncGetAttribute(&required_z, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, func) != CUDA_SUCCESS) required_z = 0;
+  if (required_x > 0 || required_y > 0 || required_z > 0) {
+    return {required_x > 0 ? (unsigned int)required_x : 1, required_y > 0 ? (unsigned int)required_y : 1,
+            required_z > 0 ? (unsigned int)required_z : 1, ClusterDimSource::REQUIRED_FUNCTION_ATTRIBUTE};
+  }
+  return {};
+}
+
 /**
  * @brief Log cluster dimensions for a kernel under --delay-mode cluster, once
  *        per CUfunction.
@@ -410,11 +457,7 @@ std::map<uint64_t, KernelDimensions> kernel_launch_to_dimensions_map;
 // launch path see the launch-time cluster dim that Triton sets via
 // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION, which cuFuncGetAttribute can't see
 // because Triton doesn't use the static __cluster_dims__ kernel attribute.
-struct ObservedClusterDim {
-  unsigned int x = 0, y = 0, z = 0;
-};
-
-std::unordered_map<CUfunction, ObservedClusterDim> g_func_to_observed_cluster;
+std::unordered_map<CUfunction, ClusterLaunchInfo> g_func_to_observed_cluster;
 pthread_mutex_t g_cluster_obs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // map to store the iteration count for each kernel
@@ -980,7 +1023,7 @@ void init_context_state(CUcontext ctx) {
  * collected once during instrumentation.
  */
 static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta, const KernelDimensions& dims,
-                                                 unsigned int dynamic_shmem,
+                                                 unsigned int dynamic_shmem, const ClusterLaunchInfo& cluster,
                                                  const std::vector<std::string>& cpu_callstack = {},
                                                  const std::string& callstack_source = "", CUfunction func = nullptr,
                                                  CTXstate* ctx_state = nullptr) {
@@ -989,6 +1032,9 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
   md["grid"] = {dims.gridDimX, dims.gridDimY, dims.gridDimZ};
   md["block"] = {dims.blockDimX, dims.blockDimY, dims.blockDimZ};
   md["shmem_dynamic"] = dynamic_shmem;
+  md["cluster_dim"] = {cluster.x, cluster.y, cluster.z};
+  md["cluster_size"] = cluster.size();
+  md["cluster_dim_source"] = cluster_dim_source_name(cluster.source);
   if (!cpu_callstack.empty()) {
     md["cpu_callstack"] = cpu_callstack;
     if (!callstack_source.empty()) {
@@ -1099,20 +1145,20 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, uint64_t& kernel
 
   CTXstate* ctx_state = ctx_state_map[ctx];
 
-  // Cluster targeting only: record cluster dim from launch attrs (including
-  // during stream capture) so graph-node launches can later look up the runtime
-  // cluster dim Triton set via CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION. The map
-  // is only read inside other `g_delay_cta_target == 1` branches, so skipping
-  // the mutex/insert when targeting all CTAs saves work on every launch.
-  if (g_delay_cta_target == 1) {
-    unsigned int cx = 0, cy = 0, cz = 0;
-    if (extract_cluster_dim_from_launch_ex(cbid, params, cx, cy, cz)) {
-      ObservedClusterDim d{cx, cy, cz};
-      pthread_mutex_lock(&g_cluster_obs_mutex);
-      g_func_to_observed_cluster[func] = d;
-      pthread_mutex_unlock(&g_cluster_obs_mutex);
-    }
+  // Record dynamic cluster geometry for every launch, including stream capture,
+  // so normal traces and graph-node replays can serialize the launch contract.
+  unsigned int dynamic_cluster_x = 0, dynamic_cluster_y = 0, dynamic_cluster_z = 0;
+  bool has_dynamic_cluster =
+      extract_cluster_dim_from_launch_ex(cbid, params, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
+  if (has_dynamic_cluster) {
+    ClusterLaunchInfo observed =
+        resolve_cluster_launch_info(func, true, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
+    pthread_mutex_lock(&g_cluster_obs_mutex);
+    g_func_to_observed_cluster[func] = observed;
+    pthread_mutex_unlock(&g_cluster_obs_mutex);
   }
+  ClusterLaunchInfo cluster =
+      resolve_cluster_launch_info(func, has_dynamic_cluster, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
 
   // no need to sync during stream capture or manual graph build, since no
   // kernel is actually launched.
@@ -1166,8 +1212,9 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, uint64_t& kernel
     // Cluster targeting: log cluster dimensions once per function (see
     // log_cluster_info_once for details).
     if (should_instrument && g_delay_cta_target == 1) {
-      unsigned int dyn_cx = 0, dyn_cy = 0, dyn_cz = 0;
-      extract_cluster_dim_from_launch_ex(cbid, params, dyn_cx, dyn_cy, dyn_cz);
+      unsigned int dyn_cx = has_dynamic_cluster ? cluster.x : 0;
+      unsigned int dyn_cy = has_dynamic_cluster ? cluster.y : 0;
+      unsigned int dyn_cz = has_dynamic_cluster ? cluster.z : 0;
       log_cluster_info_once(ctx, func, func_name, dyn_cx, dyn_cy, dyn_cz);
     }
 
@@ -1231,8 +1278,8 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, uint64_t& kernel
     }
 
     // Write kernel_metadata as the first JSON line in the trace file.
-    auto metadata =
-        build_kernel_metadata_json(meta, dims, dynamic_shmem, cpu_callstack, callstack_source, func, ctx_state);
+    auto metadata = build_kernel_metadata_json(meta, dims, dynamic_shmem, cluster, cpu_callstack, callstack_source,
+                                               func, ctx_state);
     ctx_state->trace_writers[current_launch_id]->write_metadata(metadata);
 
     loprintf_v("Created TraceWriter for launch_id %lu, mode %d, file: %s\n", current_launch_id, trace_format,
@@ -1515,6 +1562,19 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   nvbit_set_at_launch(ctx, func, (uint64_t)global_kernel_launch_id, stream, launch_handle);
   nvbit_get_func_config(ctx, func, &config);
 
+  ClusterLaunchInfo cluster;
+  bool has_observed_cluster = false;
+  pthread_mutex_lock(&g_cluster_obs_mutex);
+  auto cluster_it = g_func_to_observed_cluster.find(func);
+  if (cluster_it != g_func_to_observed_cluster.end()) {
+    cluster = cluster_it->second;
+    has_observed_cluster = true;
+  }
+  pthread_mutex_unlock(&g_cluster_obs_mutex);
+  if (!has_observed_cluster) {
+    cluster = resolve_cluster_launch_info(func);
+  }
+
   loprintf(
       "CUTracer: CTX 0x%016lx - LAUNCH - Kernel pc 0x%016lx - "
       "Kernel name %s - grid launch id %ld - grid size %d,%d,%d "
@@ -1530,15 +1590,9 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   // node). Falls back to the kernel-declared __cluster_dims__ inside the
   // helper if neither source has dynamic info.
   if (g_delay_cta_target == 1) {
-    unsigned int dyn_cx = 0, dyn_cy = 0, dyn_cz = 0;
-    pthread_mutex_lock(&g_cluster_obs_mutex);
-    auto it = g_func_to_observed_cluster.find(func);
-    if (it != g_func_to_observed_cluster.end()) {
-      dyn_cx = it->second.x;
-      dyn_cy = it->second.y;
-      dyn_cz = it->second.z;
-    }
-    pthread_mutex_unlock(&g_cluster_obs_mutex);
+    unsigned int dyn_cx = cluster.source == ClusterDimSource::LAUNCH_ATTRIBUTE ? cluster.x : 0;
+    unsigned int dyn_cy = cluster.source == ClusterDimSource::LAUNCH_ATTRIBUTE ? cluster.y : 0;
+    unsigned int dyn_cz = cluster.source == ClusterDimSource::LAUNCH_ATTRIBUTE ? cluster.z : 0;
     log_cluster_info_once(ctx, func, func_name, dyn_cx, dyn_cy, dyn_cz);
   }
 
@@ -1573,8 +1627,8 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     }
 
     // Write kernel_metadata for graph node launch trace files
-    auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cpu_callstack, callstack_source,
-                                               func, ctx_state);
+    auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cluster, cpu_callstack,
+                                               callstack_source, func, ctx_state);
     ctx_state->trace_writers[global_kernel_launch_id]->write_metadata(metadata);
 
     loprintf_v("Created TraceWriter for graph node launch_id %lu, file: %s\n", global_kernel_launch_id,

@@ -58,6 +58,18 @@ class SchemaTest(unittest.TestCase):
         self.assertIn("type", MEM_ACCESS_SCHEMA["properties"])
         self.assertIn("addrs", MEM_ACCESS_SCHEMA["properties"])
 
+    def test_mem_addr_trace_reserves_dsm_attribution_fields(self):
+        schema = SCHEMAS_BY_TYPE["mem_addr_trace"]
+        for field in (
+            "static_memory_space",
+            "cluster_shared_mask",
+            "issuer_cluster_rank",
+            "target_cluster_ranks",
+            "cluster_attribution",
+        ):
+            self.assertIn(field, schema["properties"])
+            self.assertNotIn(field, schema["required"])
+
     def test_opcode_only_schema_structure(self):
         """Test that opcode_only schema has required structure."""
         self.assertIn("properties", OPCODE_ONLY_SCHEMA)
@@ -142,6 +154,24 @@ class KernelMetadataSchemaTest(unittest.TestCase):
                 "cudaLaunchKernel+0x1a2",
                 "main+0x45",
             ],
+        }
+        jsonschema.validate(valid_record, KERNEL_METADATA_SCHEMA)
+
+    def test_valid_kernel_metadata_with_cluster_dimensions_passes(self):
+        valid_record = {
+            "type": "kernel_metadata",
+            "mangled_name": "_Z6kernelPfS_i",
+            "unmangled_name": "kernel(float*, float*, int)",
+            "kernel_checksum": "a1b2c3d4e5f67890",
+            "func_addr": "0x7f1234567890",
+            "nregs": 32,
+            "shmem_static": 0,
+            "grid": [128, 1, 1],
+            "block": [256, 1, 1],
+            "shmem_dynamic": 0,
+            "cluster_dim": [2, 1, 1],
+            "cluster_size": 2,
+            "cluster_dim_source": "launch_attribute",
         }
         jsonschema.validate(valid_record, KERNEL_METADATA_SCHEMA)
 

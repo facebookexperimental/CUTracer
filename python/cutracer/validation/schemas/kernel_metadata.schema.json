@@ -81,6 +81,26 @@
       "minimum": 0,
       "description": "Dynamic shared memory size in bytes"
     },
+    "cluster_dim": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "Per-launch cluster dimensions [x, y, z]. Optional for compatibility with older traces."
+    },
+    "cluster_size": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Product of cluster_dim. Optional for compatibility with older traces."
+    },
+    "cluster_dim_source": {
+      "type": "string",
+      "enum": ["launch_attribute", "required_function_attribute", "unknown"],
+      "description": "Source used to resolve cluster_dim. Optional for compatibility with older traces."
+    },
     "sm_family": {
       "type": "integer",
       "minimum": 0,

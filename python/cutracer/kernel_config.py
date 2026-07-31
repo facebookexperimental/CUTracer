@@ -45,6 +45,8 @@ class KernelConfig:
     nregs: int = 0
     cubin_path: str = ""  # Only set when dump_cubin is enabled
     sm_family: int = 0  # SM architecture family (e.g., 90=Hopper, 100=Blackwell)
+    cluster_dims: tuple[int, int, int] = (1, 1, 1)
+    cluster_dim_source: str = "unknown"
 
     @property
     def threads_per_cta(self) -> int:
@@ -70,6 +72,11 @@ class KernelConfig:
     def total_ctas(self) -> int:
         """Total CTAs in grid (grid_dims product)."""
         return self.grid_dims[0] * self.grid_dims[1] * self.grid_dims[2]
+
+    @property
+    def cluster_size(self) -> int:
+        """Number of CTAs in one launch cluster."""
+        return self.cluster_dims[0] * self.cluster_dims[1] * self.cluster_dims[2]
 
 
 def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
@@ -97,6 +104,7 @@ def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
 
     block = record.get("block", [0, 0, 0])
     grid = record.get("grid", [0, 0, 0])
+    cluster = record.get("cluster_dim", [1, 1, 1])
 
     return KernelConfig(
         kernel_name=record.get("unmangled_name", record.get("mangled_name", "")),
@@ -108,4 +116,6 @@ def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
         nregs=record.get("nregs", 0),
         cubin_path=record.get("cubin_path", ""),
         sm_family=record.get("sm_family", 0),
+        cluster_dims=(cluster[0], cluster[1], cluster[2]),
+        cluster_dim_source=record.get("cluster_dim_source", "unknown"),
     )

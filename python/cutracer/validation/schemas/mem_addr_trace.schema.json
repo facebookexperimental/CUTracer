@@ -91,6 +91,33 @@
       "type": "string",
       "pattern": "^0x[0-9a-fA-F]+$",
       "description": "Warp-level active lane mask (32-bit) after predicate filtering, hex string format e.g. '0xffffffff'. Optional for backward compat with pre-active_mask traces. Detector treats absence as unknown; treats 0x0 as invalid (runtime predicate filter prevents zero mask)."
+    },
+    "static_memory_space": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "NVBit's static Instr::getMemorySpace() value. Generic-address instructions still require runtime attribution. Optional for backward compatibility."
+    },
+    "cluster_shared_mask": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$",
+      "description": "Active lanes whose effective address is in cluster shared memory. Optional for traces without DSM attribution."
+    },
+    "issuer_cluster_rank": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Issuing CTA's rank within its cluster. Optional for traces without DSM attribution."
+    },
+    "target_cluster_ranks": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 },
+      "minItems": 32,
+      "maxItems": 32,
+      "description": "Per-lane target CTA rank; non-cluster and inactive lanes use the writer-defined sentinel. Optional for backward compatibility."
+    },
+    "cluster_attribution": {
+      "type": "string",
+      "enum": ["supported", "unsupported_arch", "unavailable"],
+      "description": "Availability of runtime DSM address attribution for this event. Optional for backward compatibility."
     }
   },
   "additionalProperties": false
