@@ -164,6 +164,8 @@ void instrument_memory_addr_trace(Instr* instr, int opcode_id, CTXstate* ctx_sta
   nvbit_add_call_arg_const_val32(instr, opcode_id);
   /* memory reference 64 bit address */
   nvbit_add_call_arg_mref_addr64(instr, mref_idx);
+  /* static memory space is diagnostic context; generic addresses are refined at runtime */
+  nvbit_add_call_arg_const_val32(instr, static_cast<uint32_t>(instr->getMemorySpace()));
   /* add "space" for kernel function pointer that will be set
    * at launch time (64 bit value at offset 0 of the dynamic
    * arguments). it is used to pass global kernel launch id*/

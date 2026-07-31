@@ -29,6 +29,16 @@ enum message_type_t {
   MSG_TYPE_TMA_ACCESS = 4         // TMA (Tensor Memory Accelerator) access
 };
 
+/* Availability of per-lane distributed shared-memory attribution. */
+enum cluster_attribution_t {
+  CLUSTER_ATTRIBUTION_UNAVAILABLE = 0,
+  CLUSTER_ATTRIBUTION_SUPPORTED = 1,
+  CLUSTER_ATTRIBUTION_UNSUPPORTED_ARCH = 2,
+};
+
+/* Per-lane target rank used for inactive and non-cluster-shared lanes. */
+#define CLUSTER_RANK_INVALID UINT32_MAX
+
 /* Common header for all message types */
 struct message_header_t {
   message_type_t type;  // Type of the message
@@ -67,8 +77,13 @@ struct mem_addr_access_t {
   uint64_t pc;  // Instruction byte offset within the kernel (from Instr::getOffset())
   int warp_id;
   int opcode_id;
+  int32_t static_memory_space;  // Instr::getMemorySpace(); diagnostic only for generic-address instructions.
   uint64_t addrs[32];
-  uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
+  uint32_t active_mask;          // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
+  uint32_t cluster_shared_mask;  // Active lanes whose effective address is in cluster shared memory.
+  uint32_t issuer_cluster_rank;
+  uint32_t target_cluster_ranks[32];
+  cluster_attribution_t cluster_attribution;
 };
 
 /**

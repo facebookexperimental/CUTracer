@@ -64,7 +64,8 @@ void instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state,
 /**
  * @brief Insert memory access tracing instrumentation
  *
- * Collects memory access information for memory pattern analysis.
+ * Collects memory addresses, static memory-space diagnostics, and runtime
+ * distributed shared-memory target attribution at IPOINT_BEFORE.
  *
  * @param instr The instruction to instrument
  * @param opcode_id The opcode identifier for this instruction

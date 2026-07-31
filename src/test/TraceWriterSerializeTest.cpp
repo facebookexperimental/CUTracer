@@ -175,15 +175,24 @@ TEST(SerializeRecordRapidjson, MemAddrTrace_AddrsAreUint64WithIpointB) {
   m.kernel_launch_id = 2;
   m.pc = 0xDEAD;
   m.active_mask = 0x80000001;  // lane 0 and 31 active
+  m.static_memory_space = 2;
+  m.cluster_shared_mask = 0x80000001;
+  m.issuer_cluster_rank = 0;
+  m.cluster_attribution = CLUSTER_ATTRIBUTION_SUPPORTED;
   for (int i = 0; i < 32; i++) {
     m.addrs[i] = 0x100000000ull + i;  // > 2^32 to exercise Uint64 width
+    m.target_cluster_ranks[i] = CLUSTER_RANK_INVALID;
   }
+  m.target_cluster_ranks[0] = 0;
+  m.target_cluster_ranks[31] = 1;
   const TraceRecord rec = TraceRecord::create_mem_trace(testCtx(), "SASS", 3, 4, &m);
 
   nlohmann::json expected;
   expected["type"] = "mem_addr_trace";
   expected["ipoint"] = "B";
   expected["active_mask"] = "0x80000001";
+  expected["cluster_attribution"] = "supported";
+  expected["cluster_shared_mask"] = "0x80000001";
   nlohmann::json addrs = nlohmann::json::array();
   for (int i = 0; i < 32; i++) {
     addrs.push_back(0x100000000ull + i);
@@ -192,13 +201,37 @@ TEST(SerializeRecordRapidjson, MemAddrTrace_AddrsAreUint64WithIpointB) {
   expected["cta"] = {4, 5, 6};
   expected["ctx"] = kCtxHex;
   expected["grid_launch_id"] = 2;
+  expected["issuer_cluster_rank"] = 0;
   expected["opcode_id"] = 8;
   expected["pc"] = "0xdead";  // lowercase, no leading zeros
+  expected["static_memory_space"] = 2;
+  nlohmann::json target_cluster_ranks = nlohmann::json::array();
+  target_cluster_ranks.push_back(0);
+  for (int i = 1; i < 31; i++) {
+    target_cluster_ranks.push_back(CLUSTER_RANK_INVALID);
+  }
+  target_cluster_ranks.push_back(1);
+  expected["target_cluster_ranks"] = target_cluster_ranks;
   expected["timestamp"] = 4;
   expected["trace_index"] = 3;
   expected["warp"] = 3;
 
   EXPECT_EQ(parseRj(rec), expected);
+}
+
+TEST(SerializeRecordRapidjson, MemAddrTrace_UnsupportedAttributionOmitsRankEvidence) {
+  mem_addr_access_t m{};
+  m.header.type = MSG_TYPE_MEM_ADDR_ACCESS;
+  m.static_memory_space = 3;
+  m.cluster_attribution = CLUSTER_ATTRIBUTION_UNSUPPORTED_ARCH;
+  const TraceRecord rec = TraceRecord::create_mem_trace(testCtx(), "STG.E", 0, 0, &m);
+
+  const nlohmann::json out = parseRj(rec);
+  EXPECT_EQ(out["cluster_attribution"], "unsupported_arch");
+  EXPECT_EQ(out["static_memory_space"], 3);
+  EXPECT_FALSE(out.contains("cluster_shared_mask"));
+  EXPECT_FALSE(out.contains("issuer_cluster_rank"));
+  EXPECT_FALSE(out.contains("target_cluster_ranks"));
 }
 
 TEST(SerializeRecordRapidjson, OpcodeOnly_HasNoIpoint) {

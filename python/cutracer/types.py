@@ -83,6 +83,11 @@ class TraceRecord(TypedDict, total=False):
 
     # mem_trace specific
     addrs: list[int]  # 32 memory addresses (one per thread in warp)
+    static_memory_space: int
+    cluster_shared_mask: str
+    issuer_cluster_rank: int
+    target_cluster_ranks: list[int]
+    cluster_attribution: str
 
     # tma_trace specific
     desc_addr: str  # TMA descriptor address (hex string "0x...")

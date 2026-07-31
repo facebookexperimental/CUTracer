@@ -79,7 +79,7 @@ extern "C" __device__ __noinline__ void instrument_reg_val(int pred, int opcode_
 }
 
 /* Based on NVIDIA NVBit mem_trace example with Meta modifications for message type */
-extern "C" __device__ __noinline__ void instrument_mem(int pred, int opcode_id, uint64_t addr,
+extern "C" __device__ __noinline__ void instrument_mem(int pred, int opcode_id, uint64_t addr, int static_memory_space,
                                                        uint64_t kernel_launch_id, uint64_t pc, uint64_t pchannel_dev) {
   /* if thread is predicated off, return */
   if (!pred) {
@@ -106,7 +106,40 @@ extern "C" __device__ __noinline__ void instrument_mem(int pred, int opcode_id, 
   ma.pc = pc;
   ma.warp_id = get_global_warp_id();
   ma.opcode_id = opcode_id;
+  ma.static_memory_space = static_memory_space;
   ma.active_mask = static_cast<uint32_t>(active_mask);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const void* ptr = reinterpret_cast<const void*>(addr);
+  const bool is_cluster_shared = __isClusterShared(ptr) != 0;
+  uint32_t target_cluster_rank = CLUSTER_RANK_INVALID;
+  if (is_cluster_shared) {
+    const uint32_t cluster_shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm("getctarank.shared::cluster.u32 %0, %1;" : "=r"(target_cluster_rank) : "r"(cluster_shared_addr) :);
+  }
+
+  ma.cluster_shared_mask = static_cast<uint32_t>(__ballot_sync(active_mask, is_cluster_shared));
+  ma.issuer_cluster_rank = CLUSTER_RANK_INVALID;
+  if (ma.cluster_shared_mask != 0) {
+    const int4 cluster_cta = get_cluster_ctaid();
+    const int4 cluster_shape = get_cluster_nctaid();
+    ma.issuer_cluster_rank =
+        static_cast<uint32_t>(cluster_cta.x + cluster_shape.x * (cluster_cta.y + cluster_shape.y * cluster_cta.z));
+  }
+  for (int i = 0; i < 32; i++) {
+    ma.target_cluster_ranks[i] = (ma.cluster_shared_mask & (1U << i)) != 0
+                                     ? __shfl_sync(active_mask, target_cluster_rank, i)
+                                     : CLUSTER_RANK_INVALID;
+  }
+  ma.cluster_attribution = CLUSTER_ATTRIBUTION_SUPPORTED;
+#else
+  ma.cluster_shared_mask = 0;
+  ma.issuer_cluster_rank = CLUSTER_RANK_INVALID;
+  for (int i = 0; i < 32; i++) {
+    ma.target_cluster_ranks[i] = CLUSTER_RANK_INVALID;
+  }
+  ma.cluster_attribution = CLUSTER_ATTRIBUTION_UNSUPPORTED_ARCH;
+#endif
 
   /* first active lane pushes information on the channel */
   if (first_laneid == laneid) {

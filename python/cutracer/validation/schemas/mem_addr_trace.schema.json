@@ -112,7 +112,7 @@
       "items": { "type": "integer", "minimum": 0 },
       "minItems": 32,
       "maxItems": 32,
-      "description": "Per-lane target CTA rank; non-cluster and inactive lanes use the writer-defined sentinel. Optional for backward compatibility."
+      "description": "Per-lane target CTA rank; non-cluster and inactive lanes use UINT32_MAX (4294967295). Optional for backward compatibility."
     },
     "cluster_attribution": {
       "type": "string",

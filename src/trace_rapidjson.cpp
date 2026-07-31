@@ -113,6 +113,30 @@ void rj_mem_addr(JW& w, const TraceRecord& rec, const mem_addr_access_t* m) {
     w.Uint64(m->addrs[i]);
   }
   w.EndArray();
+  w.Key("cluster_attribution");
+  switch (m->cluster_attribution) {
+    case CLUSTER_ATTRIBUTION_SUPPORTED:
+      w.String("supported");
+      break;
+    case CLUSTER_ATTRIBUTION_UNSUPPORTED_ARCH:
+      w.String("unsupported_arch");
+      break;
+    case CLUSTER_ATTRIBUTION_UNAVAILABLE:
+    default:
+      w.String("unavailable");
+      break;
+  }
+  if (m->cluster_attribution == CLUSTER_ATTRIBUTION_SUPPORTED) {
+    rj_key_hex(w, "cluster_shared_mask", m->cluster_shared_mask);
+    w.Key("issuer_cluster_rank");
+    w.Uint(m->issuer_cluster_rank);
+    w.Key("target_cluster_ranks");
+    w.StartArray();
+    for (int i = 0; i < 32; i++) {
+      w.Uint(m->target_cluster_ranks[i]);
+    }
+    w.EndArray();
+  }
   rj_cta(w, m->cta_id_x, m->cta_id_y, m->cta_id_z);
   rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
   w.Key("grid_launch_id");
@@ -122,6 +146,8 @@ void rj_mem_addr(JW& w, const TraceRecord& rec, const mem_addr_access_t* m) {
   w.Key("opcode_id");
   w.Int(m->opcode_id);
   rj_key_hex(w, "pc", m->pc);
+  w.Key("static_memory_space");
+  w.Int(m->static_memory_space);
   w.Key("timestamp");
   w.Uint64(rec.timestamp);
   w.Key("trace_index");
