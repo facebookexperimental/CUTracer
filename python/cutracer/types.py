@@ -52,6 +52,7 @@ class TraceRecord(TypedDict, total=False):
     warp: int  # Warp ID
     opcode_id: int
     pc: str  # Hex string "0x..."
+    ipoint: str  # "B" (before) or "A" (after), on memory trace records
 
     # cuda-gdb opcode_only specific fields. These are emitted by the debugger
     # sampler, not by NVBit reg_trace/mem_trace/tma_trace records.
