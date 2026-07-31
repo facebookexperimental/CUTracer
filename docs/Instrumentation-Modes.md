@@ -10,10 +10,18 @@
 - Instrument via: `CUTRACER_INSTRUMENT=reg_trace`
 
 ## mem_addr_trace (heavy) 🧠
-- Emits: 32-lane memory addresses for memory-reference instructions
+- Emits: 32-lane memory addresses for memory-reference instructions at
+  `IPOINT_BEFORE`
+- On SM90+: also emits static memory space, a cluster-shared lane mask, issuer
+  cluster rank, and 32 lane-indexed target CTA ranks. CUDA 12.8 is the minimum
+  supported toolkit for this runtime DSM attribution path.
+- On pre-SM90: emits `cluster_attribution="unsupported_arch"`; the device
+  variant does not reference cluster PTX.
 - Use for: memory access pattern analysis
 - Instrument via: `CUTRACER_INSTRUMENT=mem_addr_trace`
-- Record size: ~300 bytes per record
+- Binary channel record size: 456 bytes (320 bytes before DSM attribution).
+  NDJSON size varies with numeric values; a supported record retains all 32
+  target-rank slots so lane indices remain stable.
 
 ## mem_value_trace (heaviest) 💾
 - Emits: 32-lane memory addresses **and** values (up to 128-bit per lane)

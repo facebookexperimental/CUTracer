@@ -165,6 +165,11 @@ TEST(SerializeRecordRapidjson, RegTrace_UregsPresentButUregIndicesEmpty) {
 }
 
 TEST(SerializeRecordRapidjson, MemAddrTrace_AddrsAreUint64WithIpointB) {
+  // The Case 28 attribution payload grows the binary channel record from 320
+  // to 456 bytes. Keep this explicit so future field additions trigger a
+  // deliberate channel-capacity and trace-overhead review.
+  EXPECT_EQ(sizeof(mem_addr_access_t), 456);
+
   mem_addr_access_t m{};
   m.header.type = MSG_TYPE_MEM_ADDR_ACCESS;
   m.cta_id_x = 4;

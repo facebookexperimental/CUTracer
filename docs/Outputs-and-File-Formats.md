@@ -45,12 +45,34 @@ Each line in an NDJSON trace file is a self-contained JSON object. The `type` fi
 | `type` value | Instrumentation Mode | Key Fields |
 |--------------|---------------------|------------|
 | `"reg_trace"` | `reg_trace` | `regs[reg][thread]`, `regs_indices`, `uregs`, `uregs_indices` |
-| `"mem_addr_trace"` | `mem_addr_trace` | `addrs[32]`, `ipoint: "B"` |
+| `"mem_addr_trace"` | `mem_addr_trace` | `addrs[32]`, `ipoint: "B"`, optional DSM attribution fields |
 | `"mem_value_trace"` | `mem_value_trace` | `addrs[32]`, `values[32][N]`, `mem_space`, `is_load`, `access_size`, `ipoint: "A"` |
 | `"opcode_only"` | `opcode_only` | (common fields only) |
 | `"tma_trace"` | `tma_trace` | `desc_addr`, `desc_raw[16]` |
 
 All records share common fields: `ctx`, `grid_launch_id`, `cta`, `warp`, `opcode_id`, `pc`, `sass`, `trace_index`, `timestamp`.
+
+### `mem_addr_trace` DSM attribution
+
+Current SM90+ captures add these backward-compatible fields:
+
+| Field | Meaning |
+| --- | --- |
+| `static_memory_space` | NVBit's static memory-space value; diagnostic only for generic `ST.E` |
+| `cluster_attribution` | `supported`, `unsupported_arch`, or `unavailable` |
+| `cluster_shared_mask` | Active lanes whose effective address belongs to cluster shared memory |
+| `issuer_cluster_rank` | Issuing CTA's linear rank in the dynamic cluster |
+| `target_cluster_ranks[32]` | Target rank per lane; inactive/non-DSM lanes use `4294967295` |
+
+The rank vector is serialized only when attribution is `supported`. It remains
+fixed-width so element `N` always describes lane `N`; use `active_mask` and
+`cluster_shared_mask` to select meaningful lanes. Older traces omit all of
+these fields and remain valid.
+
+Kernel metadata records cluster geometry once per launch as `cluster_dim`,
+`cluster_size`, and `cluster_dim_source` (`launch_attribute`,
+`required_function_attribute`, or `unknown`). Direct and CUDA Graph launches
+share this contract.
 
 ### NDJSON Example
 

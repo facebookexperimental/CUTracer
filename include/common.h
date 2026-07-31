@@ -90,8 +90,8 @@ struct mem_addr_access_t {
  * @brief Memory access with value tracing structure.
  *
  * This structure captures both memory addresses AND values for detailed
- * data flow analysis. It is larger than mem_addr_access_t (~820 bytes vs ~300 bytes)
- * due to the values array.
+ * data flow analysis. It is larger than mem_addr_access_t (~820 bytes vs
+ * 456 bytes) due to the values array.
  *
  * Used when CUTRACER_INSTRUMENT=mem_value_trace is enabled.
  * Always captured at IPOINT_AFTER for consistent timing semantics.
