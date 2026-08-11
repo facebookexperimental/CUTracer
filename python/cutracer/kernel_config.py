@@ -78,6 +78,26 @@ class KernelConfig:
         """Number of CTAs in one launch cluster."""
         return self.cluster_dims[0] * self.cluster_dims[1] * self.cluster_dims[2]
 
+    def global_warps_for_cta(self, cta: tuple[int, int, int]) -> range:
+        """Return NVBit's grid-global warp-id range for one CTA.
+
+        NVBit's ``get_global_warp_id`` linearizes CTAs x-fastest, then
+        reserves ``ceil(block_threads / 32)`` consecutive ids per CTA.
+
+        Raises:
+            ValueError: If launch dimensions are unavailable or ``cta`` lies
+                outside the configured grid.
+        """
+        if any(dimension <= 0 for dimension in (*self.block_dims, *self.grid_dims)):
+            raise ValueError("block and grid dimensions must be positive")
+        grid_x, grid_y, grid_z = self.grid_dims
+        cta_x, cta_y, cta_z = cta
+        if not (0 <= cta_x < grid_x and 0 <= cta_y < grid_y and 0 <= cta_z < grid_z):
+            raise ValueError(f"CTA {cta} lies outside launch grid {self.grid_dims}")
+        linear_cta = cta_x + cta_y * grid_x + cta_z * grid_x * grid_y
+        first_warp = linear_cta * self.warps_per_cta
+        return range(first_warp, first_warp + self.warps_per_cta)
+
 
 def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
     """
