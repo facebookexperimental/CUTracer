@@ -160,7 +160,6 @@ class TestRandomDelayDataRace(unittest.TestCase):
             f"Expected >= 50% race detection rate across {max_attempts} independent "
             f"random delay configurations, but only {detected}/{max_attempts} detected. "
             f"Random delay should expose the late-barrier-A data race.\n"
-            # pyrefly: ignore [missing-attribute]
             f"STDOUT: {last_result.stdout}\nSTDERR: {last_result.stderr}",
         )
 
@@ -199,7 +198,6 @@ class TestRandomDelayDataRace(unittest.TestCase):
             f"Expected >= 50% race detection rate across {max_attempts} independent "
             f"random delay configurations, but only {detected}/{max_attempts} detected. "
             f"Random delay should expose the missing-barrier-B data race.\n"
-            # pyrefly: ignore [missing-attribute]
             f"STDOUT: {last_result.stdout}\nSTDERR: {last_result.stderr}",
         )
 
