@@ -727,8 +727,8 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     uint32_t cnt = 0;
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
-      if (cnt < instr_begin_interval || cnt >= instr_end_interval) {
-        cnt++;
+      const uint32_t instr_index = cnt++;
+      if (instr_index < instr_begin_interval || instr_index >= instr_end_interval) {
         continue;
       }
       if (verbose) {
