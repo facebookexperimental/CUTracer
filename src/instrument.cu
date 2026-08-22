@@ -299,7 +299,7 @@ void instrument_memory_value_trace(Instr* instr, int opcode_id, CTXstate* ctx_st
   nvbit_add_call_arg_mref_addr64(instr, mref_idx);
   // Access size in bytes
   nvbit_add_call_arg_const_val32(instr, access_size);
-  // Memory space type (GLOBAL=1, SHARED=4, LOCAL=5)
+  // Memory space type (InstrType::MemorySpace as an int)
   nvbit_add_call_arg_const_val32(instr, mem_space);
   // Is load operation (1=load, 0=store)
   nvbit_add_call_arg_const_val32(instr, is_load ? 1 : 0);
@@ -309,8 +309,7 @@ void instrument_memory_value_trace(Instr* instr, int opcode_id, CTXstate* ctx_st
   int num_regs = 0;
   std::vector<int> value_reg_nums;
 
-  // InstrType::MemorySpace::SHARED = 4
-  if (mem_space != 4) {
+  if (mem_space != static_cast<int>(InstrType::MemorySpace::SHARED)) {
     // Find the register operand that holds the value
     // For load: destination register (usually first REG operand)
     // For store: source register (usually last REG operand that's not part of address)

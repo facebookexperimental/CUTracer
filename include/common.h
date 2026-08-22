@@ -105,7 +105,7 @@ struct mem_value_access_t {
   uint64_t pc;  // Instruction byte offset within the kernel (from Instr::getOffset())
   int warp_id;
   int opcode_id;
-  int mem_space;           // Memory space: GLOBAL=1, SHARED=4, LOCAL=5 (matches InstrType::MemorySpace)
+  int mem_space;           // InstrType::MemorySpace as an int: LOCAL=1, GENERIC=2, GLOBAL=3, SHARED=4
   int is_load;             // 1=load, 0=store
   int access_size;         // Access size in bytes (1, 2, 4, 8, 16)
   uint64_t addrs[32];      // Memory addresses for each lane

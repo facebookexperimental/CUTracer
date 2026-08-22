@@ -199,11 +199,13 @@ __device__ __forceinline__ uint32_t loadSmemValue32(uint64_t smemAddr) {
   return value;
 }
 
-/* Memory space constants matching InstrType::MemorySpace */
+/* Memory space constants matching InstrType::MemorySpace declaration order in
+ * third-party/nvbit/core/instr_types.h. */
 #define MEM_SPACE_NONE 0
-#define MEM_SPACE_GLOBAL 1
+#define MEM_SPACE_LOCAL 1
+#define MEM_SPACE_GENERIC 2
+#define MEM_SPACE_GLOBAL 3
 #define MEM_SPACE_SHARED 4
-#define MEM_SPACE_LOCAL 5
 
 /**
  * @brief Device function to trace memory access with values.
@@ -218,7 +220,7 @@ __device__ __forceinline__ uint32_t loadSmemValue32(uint64_t smemAddr) {
  * @param opcode_id The opcode identifier for this instruction
  * @param addr Memory address accessed by this thread
  * @param access_size Access size in bytes (1, 2, 4, 8, 16)
- * @param mem_space Memory space type (GLOBAL=1, SHARED=4, LOCAL=5)
+ * @param mem_space Memory space type (InstrType::MemorySpace as an int)
  * @param is_load 1 for load operations, 0 for store operations
  * @param num_regs Number of register values following (variadic)
  * @param pchannel_dev Pointer to the channel device

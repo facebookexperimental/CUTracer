@@ -85,7 +85,7 @@
     "mem_space": {
       "type": "integer",
       "minimum": 0,
-      "description": "Memory space enum index (e.g., global / shared / local) as reported by NVBit."
+      "description": "NVBit InstrType::MemorySpace as an integer, using that enum's declaration order: 0=NONE, 1=LOCAL, 2=GENERIC, 3=GLOBAL, 4=SHARED, 5=CONSTANT, 6=GLOBAL_TO_SHARED, and so on."
     },
     "is_load": {
       "type": "boolean",
