@@ -1,4 +1,3 @@
-# pyre-strict
 """Structured session reasoner shared by Local and Sandcastle jobs."""
 
 from __future__ import annotations

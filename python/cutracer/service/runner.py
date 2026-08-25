@@ -1,4 +1,3 @@
-# pyre-strict
 """Backend drivers for the shared analysis-session state machine."""
 
 from __future__ import annotations

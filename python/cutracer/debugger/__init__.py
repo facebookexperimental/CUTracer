@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-strict
 
 from cutracer.debugger.cuda_hang_analysis import (
     analyze_cuda_samples,

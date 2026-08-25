@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-strict
 
 """Parse NVIDIA Compute Sanitizer racecheck output into neutral records.
 

@@ -1,4 +1,3 @@
-# pyre-strict
 """Wire contracts for the CUTracer automated diagnosis service.
 
 This module is the service-layer handoff schema. It is pure stdlib and has zero

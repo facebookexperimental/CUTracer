@@ -1,4 +1,3 @@
-# pyre-strict
 """Pure, backend-independent analysis-session state machine."""
 
 from __future__ import annotations

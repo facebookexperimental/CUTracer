@@ -1,4 +1,3 @@
-# pyre-strict
 """Register and memory-value trace experiment adapter."""
 
 from __future__ import annotations

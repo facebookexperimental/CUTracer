@@ -1,4 +1,3 @@
-# pyre-strict
 """Event-driven ports for the MAST/Sandcastle deployment driver."""
 
 from __future__ import annotations

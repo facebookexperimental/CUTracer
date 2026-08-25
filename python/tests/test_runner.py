@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-strict
 
 """Tests for cutracer.runner module."""
 

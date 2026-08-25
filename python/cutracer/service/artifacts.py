@@ -1,4 +1,3 @@
-# pyre-strict
 """Artifact helpers shared by CUTracer service experiment adapters."""
 
 from __future__ import annotations

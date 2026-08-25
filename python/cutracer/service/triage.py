@@ -1,4 +1,3 @@
-# pyre-strict
 """Cross-source correlation over initial evidence."""
 
 from __future__ import annotations

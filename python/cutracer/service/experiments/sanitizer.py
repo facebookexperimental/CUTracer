@@ -1,4 +1,3 @@
-# pyre-strict
 """Compute Sanitizer experiment adapter."""
 
 from __future__ import annotations

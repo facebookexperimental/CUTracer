@@ -1,4 +1,3 @@
-# pyre-strict
 """Delay-config replay and reduction experiment adapter."""
 
 from __future__ import annotations

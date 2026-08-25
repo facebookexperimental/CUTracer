@@ -1,4 +1,3 @@
-# pyre-strict
 """Initial campaign planning and guarded AI follow-up expansion."""
 
 from __future__ import annotations

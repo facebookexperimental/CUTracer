@@ -1,4 +1,3 @@
-# pyre-strict
 """Random-delay stress experiment adapter."""
 
 from __future__ import annotations
