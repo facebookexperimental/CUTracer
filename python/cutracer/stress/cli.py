@@ -168,6 +168,16 @@ def stress_command(
             f"Not reproduced across {result.completed_trials} trial(s) "
             f"({result.infra_errors} infra error(s)). No triggering config saved."
         )
+
+    if result.unattributed_reproductions:
+        click.echo(
+            f"WARNING: {result.unattributed_reproductions} attempt(s) reported the "
+            f"bug while injecting NO delay (the config enabled 0 points). This "
+            f"target fails on its own, so any reproduction here may be its natural "
+            f"rate rather than an effect of the injected delay. Establish the "
+            f"baseline before trusting a triggering config.",
+            err=True,
+        )
     # Exit 0 whenever the search itself ran; callers read the report/config to
     # learn whether the bug reproduced (a non-zero exit means the search failed).
     sys.exit(0)

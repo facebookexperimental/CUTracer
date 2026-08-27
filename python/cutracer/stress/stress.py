@@ -21,6 +21,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+from cutracer.reduce.config_mutator import DelayConfigMutator
 from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
 
 
@@ -78,12 +79,17 @@ class StressResult:
     # ``infra_errors`` so a caller can tell "the workload hangs" apart from a
     # generic launch/tooling failure.
     timed_out: int = 0
+    # Attempts where the oracle reported the bug but the delay config it ran
+    # under enabled NO injection point. The failure is real, but nothing this
+    # search did can have caused it -- see `_enabled_point_count`.
+    unattributed_reproductions: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "reproduced": self.reproduced,
             "completed_trials": self.completed_trials,
             "reproductions": self.reproductions,
+            "unattributed_reproductions": self.unattributed_reproductions,
             "infra_errors": self.infra_errors,
             "timed_out": self.timed_out,
             "reproduction_rate": self.reproduction_rate,
@@ -101,6 +107,26 @@ class _AttemptResult:
     triggering: Optional[TriggeringConfig]
     log: str
     timed_out: int = 0
+    unattributed: int = 0
+
+
+def _enabled_point_count(config_path: str) -> int:
+    """How many injection points the dumped delay config actually turned on.
+
+    A delay config records every candidate point with an ``on`` flag, and only
+    the enabled ones stall. With a low ``--enable-prob`` and a large candidate
+    set, a whole attempt can enable nothing: on a target that also fails on its
+    own, the oracle then reports the bug during a run that injected no delay at
+    all, and attributing that to the config would be wrong.
+
+    Reuses the reduce-side config model rather than re-parsing, with validation
+    off and every error swallowed: an unreadable config means "cannot attribute",
+    which is the same conservative answer as zero points.
+    """
+    try:
+        return len(DelayConfigMutator(config_path, validate=False).enabled_points)
+    except Exception:  # noqa: BLE001 - any parse failure means "cannot attribute"
+        return 0
 
 
 def _unlink(path: str) -> None:
@@ -189,6 +215,30 @@ def _run_attempt(
         stderr=proc.stderr or "",
     )
     if proc.returncode == 0 and os.path.isfile(config_path):
+        if _enabled_point_count(config_path) == 0:
+            # Real failure, but this attempt injected nothing, so it is evidence
+            # about the target -- not about any injection point. Keep it out of
+            # the reproduction count so it can never become a triggering config.
+            _unlink(config_path)
+            return _AttemptResult(
+                1,
+                0,
+                0,
+                None,
+                _attempt_log(
+                    delay_ns=delay_ns,
+                    warpgroup=warpgroup,
+                    attempt=attempt,
+                    stdout=proc.stdout or "",
+                    stderr=proc.stderr or "",
+                    error=(
+                        "oracle reported the bug but the delay config enabled 0 "
+                        "injection points: the target reproduces without injected "
+                        "delay, so this attempt is not attributable"
+                    ),
+                ),
+                unattributed=1,
+            )
         return _AttemptResult(
             1,
             1,
@@ -224,15 +274,18 @@ def run_stress(
 ) -> StressResult:
     """Sweep the delay ladder under random injection until the oracle reproduces.
 
-    A "reproduction" requires both an interesting oracle exit (0) AND a dumped
-    delay config (otherwise there is nothing to replay/reduce, so the attempt is
-    counted as an infra error rather than a reproduction).
+    A "reproduction" requires an interesting oracle exit (0), a dumped delay
+    config (otherwise there is nothing to replay/reduce, so the attempt is
+    counted as an infra error), AND at least one enabled injection point in that
+    config (otherwise the attempt injected nothing and cannot have caused the
+    failure -- counted as an unattributed reproduction).
     """
     os.makedirs(config.output_dir, exist_ok=True)
     completed = 0
     reproductions = 0
     infra_errors = 0
     timed_out = 0
+    unattributed = 0
     triggering: Optional[TriggeringConfig] = None
     log_parts: List[str] = []
     stop = False
@@ -255,6 +308,7 @@ def run_stress(
                 reproductions += outcome.reproductions
                 infra_errors += outcome.infra_errors
                 timed_out += outcome.timed_out
+                unattributed += outcome.unattributed
                 log_parts.append(outcome.log)
                 if outcome.triggering is not None:
                     if triggering is None:
@@ -287,6 +341,7 @@ def run_stress(
         triggering=triggering,
         log_path=log_path,
         timed_out=timed_out,
+        unattributed_reproductions=unattributed,
     )
 
 
