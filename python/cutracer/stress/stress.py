@@ -40,10 +40,30 @@ class StressConfig:
     # a clean "did not reproduce" (the standalone default; the service pins [1]).
     not_interesting_exit_codes: List[int] = field(default_factory=list)
     kernel_filters: Optional[str] = None
+    # Control runs performed BEFORE the search, with injection instrumented but
+    # every point disabled. Without them a reproduction cannot be attributed to
+    # the delay on any target that also fails on its own.
+    #
+    # Defaults to 0 (off) here but to 3 on the `cutracer stress` CLI: the CLI is
+    # where a human reads a verdict, while programmatic callers (the service)
+    # own their own budget and should opt in explicitly.
+    baseline_runs: int = 0
     output_dir: str = "."
     timeout: int = 1800
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
+
+    def __post_init__(self) -> None:
+        # The `cutracer stress` CLI rejects an empty ladder with a UsageError,
+        # but programmatic callers (the service, which builds this straight from
+        # a spec) reach the search loop directly. An empty ladder means the
+        # search would sweep nothing, which is a caller mistake, not a clean
+        # zero-trial answer. ValueError, not IndexError-from-somewhere-inside:
+        # the service classifies ValueError as an INFRA_ERROR.
+        if not self.delay_ladder_ns:
+            raise ValueError("delay_ladder_ns must contain at least one delay")
+        if self.baseline_runs < 0:
+            raise ValueError(f"baseline_runs must be >= 0, got {self.baseline_runs}")
 
 
 @dataclass
@@ -66,6 +86,23 @@ class TriggeringConfig:
         }
 
 
+# How a reproduction relates to the target's own failure rate.
+ATTRIBUTION_NOT_REPRODUCED = "not_reproduced"
+# No control runs were REQUESTED, so the natural rate is unknown and attribution
+# is unproven. This is the caller opting out, not a failure.
+ATTRIBUTION_NO_BASELINE = "no_baseline"
+# A control arm WAS requested but did not produce the samples asked for (runs
+# timed out or died with an unexpected exit code). Distinct from `no_baseline`
+# on purpose: "the control crashed" must never read as "the user declined a
+# control", and unlike `no_baseline` it corroborates nothing.
+ATTRIBUTION_BASELINE_INCOMPLETE = "baseline_incomplete"
+# The target reproduced with injection disabled: a stress hit may just be that.
+ATTRIBUTION_NATURAL = "natural"
+# The control never reproduced, so the injected delay is the distinguishing
+# variable. Still only as strong as `baseline_completed` samples.
+ATTRIBUTION_ATTRIBUTED = "attributed"
+
+
 @dataclass
 class StressResult:
     reproduced: bool
@@ -83,6 +120,35 @@ class StressResult:
     # under enabled NO injection point. The failure is real, but nothing this
     # search did can have caused it -- see `_enabled_point_count`.
     unattributed_reproductions: int = 0
+    # Control arm: runs with injection instrumented but every point disabled.
+    #
+    # `requested` and `completed` are tracked separately because they answer
+    # different questions. `requested` is what the caller asked for;
+    # `completed` is how many runs produced a usable sample. Collapsing them
+    # would let three control runs that all timed out report as
+    # `attribution=no_baseline`, i.e. "no control was asked for".
+    baseline_requested: int = 0
+    baseline_completed: int = 0
+    baseline_reproductions: int = 0
+    # Control runs that hung / failed to run, counted apart from each other for
+    # the same reason the search arm keeps `timed_out` and `infra_errors` apart.
+    baseline_timed_out: int = 0
+    baseline_infra_errors: int = 0
+    attribution: str = ATTRIBUTION_NO_BASELINE
+
+    @property
+    def baseline_rate(self) -> float:
+        """Reproductions per *usable* control sample.
+
+        Divides by `baseline_completed`, not `baseline_requested`: a run that
+        timed out measured nothing, and counting it as a clean control run
+        would understate the target's natural failure rate.
+        """
+        return (
+            (self.baseline_reproductions / self.baseline_completed)
+            if self.baseline_completed
+            else 0.0
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -93,6 +159,13 @@ class StressResult:
             "infra_errors": self.infra_errors,
             "timed_out": self.timed_out,
             "reproduction_rate": self.reproduction_rate,
+            "baseline_requested": self.baseline_requested,
+            "baseline_completed": self.baseline_completed,
+            "baseline_reproductions": self.baseline_reproductions,
+            "baseline_timed_out": self.baseline_timed_out,
+            "baseline_infra_errors": self.baseline_infra_errors,
+            "baseline_rate": self.baseline_rate,
+            "attribution": self.attribution,
             "triggering_config": (
                 None if self.triggering is None else self.triggering.to_dict()
             ),
@@ -266,6 +339,140 @@ def _run_attempt(
     return _AttemptResult(0, 0, 1, None, log)
 
 
+@dataclass(frozen=True)
+class _BaselineResult:
+    """Outcome of the control arm.
+
+    ``requested`` and ``completed`` differ whenever a control run timed out or
+    exited with an unexpected code; see ``StressResult`` for why that gap must
+    stay visible.
+    """
+
+    requested: int
+    completed: int
+    reproductions: int
+    timed_out: int
+    infra_errors: int
+    logs: List[str]
+
+
+def _run_baseline(
+    config: StressConfig,
+    *,
+    cutracer_so: Optional[str],
+    runner: Optional[RunTarget],
+) -> _BaselineResult:
+    """Run the control arm: instrumented, but with every delay point disabled.
+
+    A *matched* control on purpose. Running the oracle bare would also measure a
+    natural rate, but it would differ from the search arm in two variables at
+    once (instrumentation overhead and injected stalls), so it could not tell
+    them apart. `--delay-enable-prob 0` keeps the instrumentation and removes
+    only the stalls, which is the variable the search manipulates.
+
+    No dump path is passed: an all-disabled config is not worth keeping, and not
+    writing one keeps the baseline out of the search's config namespace.
+    """
+    completed = 0
+    reproduced = 0
+    timed_out = 0
+    infra_errors = 0
+    logs: List[str] = []
+    if config.baseline_runs <= 0:
+        # A caller that opted out of the control arm must not pay for anything
+        # here -- including reading `delay_ladder_ns[0]`.
+        return _BaselineResult(0, 0, 0, 0, 0, logs)
+    delay_ns = config.delay_ladder_ns[0]
+    for attempt in range(config.baseline_runs):
+        try:
+            proc = run_instrumented_target(
+                config.oracle_argv,
+                InstrumentationConfig(
+                    cutracer_so=cutracer_so,
+                    instrument="random_delay",
+                    analysis="random_delay",
+                    kernel_filters=config.kernel_filters,
+                    output_dir=config.output_dir,
+                    delay_ns=delay_ns,
+                    delay_enable_prob=0.0,
+                    delay_mode="random",
+                    cwd=config.cwd,
+                    timeout=config.timeout,
+                    base_env=config.base_env,
+                ),
+                runner=runner,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timed_out += 1
+            logs.append(
+                _attempt_log(
+                    delay_ns=delay_ns,
+                    warpgroup=None,
+                    attempt=attempt,
+                    error=f"baseline timed out: {exc}",
+                )
+            )
+            continue
+        logs.append(
+            _attempt_log(
+                delay_ns=delay_ns,
+                warpgroup=None,
+                attempt=attempt,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+                error="baseline (injection disabled)",
+            )
+        )
+        if proc.returncode == 0:
+            completed += 1
+            reproduced += 1
+        elif (
+            not config.not_interesting_exit_codes
+            or proc.returncode in config.not_interesting_exit_codes
+        ):
+            completed += 1
+        else:
+            # Same rule as the search arm: an exit code the oracle contract does
+            # not cover means the control run did not measure anything.
+            infra_errors += 1
+    return _BaselineResult(
+        requested=config.baseline_runs,
+        completed=completed,
+        reproductions=reproduced,
+        timed_out=timed_out,
+        infra_errors=infra_errors,
+        logs=logs,
+    )
+
+
+def _attribution(
+    *,
+    baseline_requested: int,
+    baseline_completed: int,
+    baseline_reproductions: int,
+    triggering: object,
+) -> str:
+    """Classify what a reproduction can be credited to."""
+    if baseline_requested == 0:
+        return ATTRIBUTION_NO_BASELINE
+    if baseline_reproductions > 0:
+        # The target fails with injection disabled, so a search hit is not
+        # distinguishable from that. Reported even when the search found a
+        # config, because the config may merely have coincided with a failure.
+        # Checked before the completeness gate on purpose: a control run that
+        # DID reproduce is positive evidence, and stays the stronger answer even
+        # if its siblings never finished.
+        return ATTRIBUTION_NATURAL
+    if baseline_completed < baseline_requested:
+        # A control arm was asked for and did not deliver. "0 of 3 control runs
+        # produced a sample" is not the same claim as "no control was wanted",
+        # and it must not be reported as one.
+        return ATTRIBUTION_BASELINE_INCOMPLETE
+    if triggering is None:
+        return ATTRIBUTION_NOT_REPRODUCED
+    return ATTRIBUTION_ATTRIBUTED
+
+
 def run_stress(
     config: StressConfig,
     *,
@@ -286,8 +493,9 @@ def run_stress(
     infra_errors = 0
     timed_out = 0
     unattributed = 0
+    baseline = _run_baseline(config, cutracer_so=cutracer_so, runner=runner)
     triggering: Optional[TriggeringConfig] = None
-    log_parts: List[str] = []
+    log_parts: List[str] = list(baseline.logs)
     stop = False
     warp_targets: List[Optional[int]] = (
         [int(x) for x in config.warpgroup_ids] if config.warpgroup_ids else [None]
@@ -342,6 +550,17 @@ def run_stress(
         log_path=log_path,
         timed_out=timed_out,
         unattributed_reproductions=unattributed,
+        baseline_requested=baseline.requested,
+        baseline_completed=baseline.completed,
+        baseline_reproductions=baseline.reproductions,
+        baseline_timed_out=baseline.timed_out,
+        baseline_infra_errors=baseline.infra_errors,
+        attribution=_attribution(
+            baseline_requested=baseline.requested,
+            baseline_completed=baseline.completed,
+            baseline_reproductions=baseline.reproductions,
+            triggering=triggering,
+        ),
     )
 
 

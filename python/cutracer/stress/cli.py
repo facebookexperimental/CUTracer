@@ -15,7 +15,14 @@ import sys
 
 import click
 from cutracer.runner import resolve_cutracer_so
-from cutracer.stress.stress import run_stress, save_report, StressConfig
+from cutracer.stress.stress import (
+    ATTRIBUTION_BASELINE_INCOMPLETE,
+    ATTRIBUTION_NATURAL,
+    ATTRIBUTION_NO_BASELINE,
+    run_stress,
+    save_report,
+    StressConfig,
+)
 
 
 def _parse_int_list(text: str) -> list[int]:
@@ -36,6 +43,16 @@ def _parse_int_list(text: str) -> list[int]:
     help="Comma-separated warpgroup ids to target (default: all warpgroups).",
 )
 @click.option("--attempts-per-delay", type=int, default=3, show_default=True)
+@click.option(
+    "--baseline-runs",
+    type=int,
+    default=3,
+    show_default=True,
+    help="Control runs before the search, with injection instrumented but every "
+    "delay point disabled. If the target reproduces here it fails without any "
+    "injected delay, so a search hit cannot be credited to the delay and the "
+    "report says so. 0 skips the control and leaves attribution unproven.",
+)
 @click.option(
     "--stop-on-first/--no-stop-on-first",
     default=True,
@@ -94,6 +111,7 @@ def stress_command(
     attempts_per_delay: int,
     stop_on_first: bool,
     not_interesting_exit_codes: str,
+    baseline_runs: int,
     kernel_filters: str | None,
     output_dir: str,
     dump_path: str | None,
@@ -132,12 +150,14 @@ def stress_command(
         attempts_per_delay=attempts_per_delay,
         stop_on_first=stop_on_first,
         not_interesting_exit_codes=_parse_int_list(not_interesting_exit_codes),
+        baseline_runs=baseline_runs,
         kernel_filters=kernel_filters,
         output_dir=output_dir,
         timeout=timeout,
     )
     click.echo(
-        f"Running stress: {len(config.delay_ladder_ns)} delays x "
+        f"Running stress: {config.baseline_runs} baseline + "
+        f"{len(config.delay_ladder_ns)} delays x "
         f"{len(config.warpgroup_ids) or 1} warpgroup(s) x "
         f"{config.attempts_per_delay} attempts -- {' '.join(config.oracle_argv)}",
         err=True,
@@ -167,6 +187,35 @@ def stress_command(
         click.echo(
             f"Not reproduced across {result.completed_trials} trial(s) "
             f"({result.infra_errors} infra error(s)). No triggering config saved."
+        )
+
+    if result.attribution == ATTRIBUTION_NATURAL:
+        click.echo(
+            f"WARNING: the control arm reproduced {result.baseline_reproductions}/"
+            f"{result.baseline_completed} times with injection DISABLED. This "
+            f"target fails on its own, so nothing found here can be credited to "
+            f"the injected delay. Any triggering config is a coincidence until "
+            f"shown otherwise -- reduce it, or compare its failure magnitude "
+            f"against the baseline.",
+            err=True,
+        )
+    elif result.attribution == ATTRIBUTION_BASELINE_INCOMPLETE:
+        click.echo(
+            f"WARNING: only {result.baseline_completed} of "
+            f"{result.baseline_requested} requested control run(s) produced a "
+            f"usable sample ({result.baseline_timed_out} timed out, "
+            f"{result.baseline_infra_errors} infra error(s)). The control arm was "
+            f"asked for and did not deliver, so the target's natural failure rate "
+            f"is still unmeasured and nothing found here is corroborated. Fix the "
+            f"control runs (--timeout, --not-interesting-exit-codes) and re-run.",
+            err=True,
+        )
+    elif result.attribution == ATTRIBUTION_NO_BASELINE:
+        click.echo(
+            "NOTE: no control runs were requested (--baseline-runs 0), so a "
+            "reproduction here cannot be distinguished from the target's own "
+            "failure rate.",
+            err=True,
         )
 
     if result.unattributed_reproductions:
