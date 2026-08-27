@@ -6,12 +6,15 @@ Warp execution status summary for GPU hang analysis.
 This module provides utilities for analyzing warp execution status
 from trace records grouped by warp ID. It identifies:
 - Completed warps: executed EXIT instruction (normal termination)
-- In-progress warps: did not execute EXIT (may be hung or interrupted)
+- In-progress warps: never executed EXIT (may be hung or interrupted)
 - Missing warps: never appeared in trace (scheduling issues)
+
+"Executed EXIT" is a property of the whole record sequence, not of its last
+element: see :func:`warp_completed`.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from cutracer.types import TraceRecord
 
@@ -28,9 +31,9 @@ class WarpSummary:
     missing_warp_ids: list[int] = field(default_factory=list)
 
 
-def is_exit_instruction(record: TraceRecord) -> bool:
+def is_exit_sass(sass: Optional[str]) -> bool:
     """
-    Check if a record's SASS instruction is an EXIT instruction.
+    Check if a SASS instruction string is an EXIT instruction.
 
     EXIT instructions can be:
     - "EXIT;"
@@ -38,15 +41,56 @@ def is_exit_instruction(record: TraceRecord) -> bool:
     - "EXIT.KEEPREFCOUNT;"  (with modifier)
 
     Args:
+        sass: SASS instruction text, or None
+
+    Returns:
+        True if the instruction is EXIT
+    """
+    if not sass:
+        return False
+    return "EXIT" in sass.upper() and sass.strip().endswith(";")
+
+
+def is_exit_instruction(record: TraceRecord) -> bool:
+    """
+    Check if a record's SASS instruction is an EXIT instruction.
+
+    Args:
         record: A trace record dictionary
 
     Returns:
         True if the instruction is EXIT
     """
-    sass = record.get("sass", "")
-    if not sass:
-        return False
-    return "EXIT" in sass.upper() and sass.strip().endswith(";")
+    return is_exit_sass(record.get("sass", ""))
+
+
+def warp_completed(records: Iterable[TraceRecord]) -> bool:
+    """
+    Check whether a warp ran to completion: did ANY of its records execute EXIT?
+
+    The quantifier is "any", not "the last one". A cubin is free to keep
+    emitting records after its EXIT, so the last file-order record for a warp
+    that finished normally is frequently not the EXIT. Measured on the case-24
+    capture ``kernel_caf5167c275460d4_iter0_buggy_matmul_kernel_tma_ws_blackwell``
+    (32 warps, 69699 instruction records): 24 warps execute ``EXIT ;`` and then
+    emit exactly one more record, ``NOP;``. Testing only the last record scores
+    those 24 warps in-progress and reports 0/32 completed, which also erases the
+    signal that matters on that trace, namely that the OTHER 8 warps are the
+    ones genuinely stuck (4 on ``@!P1 BRA``, 3 on ``BAR.SYNC.DEFER_BLOCKING
+    0x1``, 1 on ``SYNCS.PHASECHK...TRYWAIT``).
+
+    This is the shared warp-completion predicate. Analysis-layer detectors that
+    need the same notion over a columnar (polars) trace express it as "the warp
+    has at least one row whose opcode resolves to an EXIT"; that is this
+    function, evaluated set-wise instead of row-wise.
+
+    Args:
+        records: The records belonging to one warp, in any order
+
+    Returns:
+        True if the warp executed an EXIT instruction
+    """
+    return any(is_exit_instruction(record) for record in records)
 
 
 def merge_to_ranges(ids: list[int]) -> list[tuple[int, int]]:
@@ -111,6 +155,16 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
     """
     Compute warp summary statistics from grouped records.
 
+    A warp counts as completed iff any of its records is an EXIT instruction
+    (see :func:`warp_completed`), not iff its last record is.
+
+    Grouping is by warp id alone, and that is correct: warp ids in a CUTracer
+    trace are grid-global, not per-CTA. Measured on a 2-CTA capture, CTA (0,0,0)
+    holds warps 0-15 and CTA (0,1,0) holds warps 16-31, with an empty
+    intersection, so no two CTAs can collide in this dict. One trace file also
+    holds exactly one launch (one file per launch, single ``grid_launch_id``
+    throughout), so ``grid_launch_id`` cannot collide either.
+
     Args:
         groups: Dict mapping warp ID to list of records
 
@@ -136,8 +190,7 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
             continue
         warp_ids.append(warp_int)
         if records:
-            last_record = records[-1]
-            if is_exit_instruction(last_record):
+            if warp_completed(records):
                 completed_ids.append(warp_int)
             else:
                 inprogress_ids.append(warp_int)

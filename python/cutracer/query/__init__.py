@@ -34,7 +34,9 @@ from .warp_summary import (
     format_ranges,
     format_warp_summary_text,
     is_exit_instruction,
+    is_exit_sass,
     merge_to_ranges,
+    warp_completed,
     warp_summary_to_dict,
     WarpSummary,
 )
@@ -55,7 +57,9 @@ __all__ = [
     "format_records_csv",
     # Warp Summary
     "WarpSummary",
+    "is_exit_sass",
     "is_exit_instruction",
+    "warp_completed",
     "merge_to_ranges",
     "format_ranges",
     "compute_warp_summary",

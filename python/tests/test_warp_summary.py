@@ -11,7 +11,9 @@ from cutracer.query.warp_summary import (
     format_ranges,
     format_warp_summary_text,
     is_exit_instruction,
+    is_exit_sass,
     merge_to_ranges,
+    warp_completed,
     warp_summary_to_dict,
     WarpSummary,
 )
@@ -59,6 +61,73 @@ class TestIsExitInstruction(unittest.TestCase):
         """Test EXIT without semicolon should return False."""
         record = {"sass": "EXIT"}
         self.assertFalse(is_exit_instruction(record))
+
+
+class IsExitSassTest(unittest.TestCase):
+    """Tests for the sass-level is_exit_sass predicate.
+
+    is_exit_instruction is a thin wrapper over this, so the two must agree.
+    """
+
+    def test_exit_forms(self):
+        """All the EXIT spellings a cubin emits."""
+        for sass in ("EXIT;", "EXIT ;", "@P0 EXIT ;", "EXIT.KEEPREFCOUNT;", "exit;"):
+            with self.subTest(sass=sass):
+                self.assertTrue(is_exit_sass(sass))
+
+    def test_non_exit(self):
+        """Ordinary instructions, including the trailing NOP, are not EXIT."""
+        for sass in ("MOV R1, R0;", "NOP;", "BAR.SYNC.DEFER_BLOCKING 0x1 ;"):
+            with self.subTest(sass=sass):
+                self.assertFalse(is_exit_sass(sass))
+
+    def test_empty_and_none(self):
+        """Missing sass is not an EXIT (and must not raise)."""
+        self.assertFalse(is_exit_sass(""))
+        self.assertFalse(is_exit_sass(None))
+
+    def test_agrees_with_record_wrapper(self):
+        """is_exit_instruction delegates to is_exit_sass."""
+        for sass in ("EXIT ;", "NOP;", "", "EXIT"):
+            with self.subTest(sass=sass):
+                self.assertEqual(
+                    is_exit_sass(sass), is_exit_instruction({"sass": sass})
+                )
+
+
+class WarpCompletedTest(unittest.TestCase):
+    """Tests for the shared warp-completion predicate."""
+
+    def test_no_records(self):
+        """A warp with no records did not complete."""
+        self.assertFalse(warp_completed([]))
+
+    def test_exit_is_last_record(self):
+        """The ordinary shape: EXIT terminates the record sequence."""
+        records = [{"sass": "MOV R1, R0;"}, {"sass": "EXIT ;"}]
+        self.assertTrue(warp_completed(records))
+
+    def test_epilogue_after_exit(self):
+        """Records emitted past EXIT do not un-complete the warp.
+
+        This is the case-24 shape: 24 of 32 warps execute "EXIT ;" and then
+        emit one more record, "NOP;".
+        """
+        records = [{"sass": "MOV R1, R0;"}, {"sass": "EXIT ;"}, {"sass": "NOP;"}]
+        self.assertTrue(warp_completed(records))
+
+    def test_never_exits(self):
+        """A warp stuck on a barrier never completes."""
+        records = [
+            {"sass": "MOV R1, R0;"},
+            {"sass": "BAR.SYNC.DEFER_BLOCKING 0x1 ;"},
+        ]
+        self.assertFalse(warp_completed(records))
+
+    def test_accepts_an_iterator(self):
+        """The argument is consumed once, so a bare generator works."""
+        records = iter([{"sass": "NOP;"}, {"sass": "EXIT ;"}])
+        self.assertTrue(warp_completed(records))
 
 
 class TestMergeToRanges(unittest.TestCase):
@@ -189,6 +258,41 @@ class TestComputeWarpSummary(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.completed_warp_ids, [0, 2])
         self.assertEqual(result.inprogress_warp_ids, [1])
+
+    def test_epilogue_past_exit_counts_as_completed(self):
+        """Regression: a warp whose records run "... EXIT ; NOP ;" is completed.
+
+        Testing only the last file-order record scored these warps in-progress.
+        Measured on the case-24 capture
+        kernel_caf5167c275460d4_iter0_buggy_matmul_kernel_tma_ws_blackwell
+        (32 warps, 69699 instruction records), 24 warps emit exactly one "NOP;"
+        after "EXIT ;", so the last-record test reported 0/32 completed on a
+        trace where 24 warps had provably finished.
+        """
+        groups = {
+            0: [{"sass": "MOV R1, R0;"}, {"sass": "EXIT ;"}, {"sass": "NOP;"}],
+            1: [{"sass": "MOV R1, R0;"}, {"sass": "EXIT ;"}, {"sass": "NOP;"}],
+            2: [{"sass": "MOV R1, R0;"}, {"sass": "BAR.SYNC.DEFER_BLOCKING 0x1 ;"}],
+        }
+        result = compute_warp_summary(groups)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.completed_warp_ids, [0, 1])
+        self.assertEqual(result.inprogress_warp_ids, [2])
+
+    def test_exit_anywhere_in_the_sequence_completes(self):
+        """The EXIT need not be the last or the second-to-last record."""
+        groups = {
+            0: [
+                {"sass": "EXIT ;"},
+                {"sass": "NOP;"},
+                {"sass": "NOP;"},
+                {"sass": "NOP;"},
+            ],
+        }
+        result = compute_warp_summary(groups)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.completed_warp_ids, [0])
+        self.assertEqual(result.inprogress_warp_ids, [])
 
     def test_missing_warps(self):
         """Test missing warps detection."""
