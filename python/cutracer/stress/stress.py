@@ -245,6 +245,10 @@ def _run_attempt(
         f"delay-{delay_ns}-wg-{warpgroup}-attempt-{attempt}.json",
     )
     try:
+        os.unlink(config_path)
+    except FileNotFoundError:
+        pass
+    try:
         proc = run_instrumented_target(
             config.oracle_argv,
             InstrumentationConfig(

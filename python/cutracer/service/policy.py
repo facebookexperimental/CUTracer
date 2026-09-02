@@ -15,6 +15,7 @@ from cutracer.service.contracts import (
     ExperimentRequest,
     ExperimentSpec,
     ReduceOptions,
+    ResultCompleteness,
     StressOptions,
     StressOutcome,
     StressTestResult,
@@ -119,6 +120,8 @@ class InitialCampaignPolicy:
                         kernel=unit.kernel,
                     ),
                     error="work unit has no pre-approved correctness oracle",
+                    planned_trials=0,
+                    completeness=ResultCompleteness.SKIPPED,
                 ),
             )
         return CampaignPlan(experiments=tuple(specs), skipped_results=skipped)

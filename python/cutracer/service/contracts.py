@@ -381,6 +381,7 @@ class ExperimentPhase(str, Enum):
 
 class StressOutcome(str, Enum):
     REPRODUCED = "reproduced"
+    UNATTRIBUTED_REPRODUCTION = "unattributed_reproduction"
     NOT_REPRODUCED = "not_reproduced"
     INCOMPLETE = "incomplete"
     SKIPPED = "skipped"
@@ -666,6 +667,23 @@ class StressOptions:
     warpgroup_ids: List[int] = dataclasses.field(default_factory=list)
     stop_on_first_reproduction: bool = True
 
+    def __post_init__(self) -> None:
+        # Invalid schedules have no meaningful planned scope. Reject them on
+        # construction, including deserialization, instead of fabricating a
+        # completeness value from an unexecutable legacy payload.
+        if not self.delay_ladder_ns:
+            raise ValueError("stress delay ladder must not be empty")
+        if self.attempts_per_delay <= 0:
+            raise ValueError("stress attempts_per_delay must be positive")
+
+    @property
+    def planned_trials(self) -> int:
+        return (
+            len(self.delay_ladder_ns)
+            * (len(self.warpgroup_ids) or 1)
+            * self.attempts_per_delay
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "delay_ladder_ns": list(self.delay_ladder_ns),
@@ -901,10 +919,42 @@ class StressTestResult:
     log: Optional[ArtifactRef] = None
     duration_s: float = 0.0
     error: Optional[str] = None
+    planned_trials: int = 0
+    timed_out_trials: int = 0
+    completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
+    unattributed_reproductions: int = 0
 
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.RANDOM_DELAY_STRESS, init=False
     )
+
+    @property
+    def has_positive_signal(self) -> bool:
+        return (
+            self.outcome
+            in (
+                StressOutcome.REPRODUCED,
+                StressOutcome.UNATTRIBUTED_REPRODUCTION,
+            )
+            or self.reproductions > 0
+            or self.unattributed_reproductions > 0
+            or self.triggering_config is not None
+        )
+
+    @property
+    def has_trustworthy_non_reproduction(self) -> bool:
+        return (
+            self.execution_status == ExecutionStatus.SUCCEEDED
+            and self.outcome == StressOutcome.NOT_REPRODUCED
+            and self.completeness == ResultCompleteness.COMPLETE
+            and self.planned_trials > 0
+            and self.completed_trials == self.planned_trials
+            and self.reproductions == 0
+            and self.infra_errors == 0
+            and self.timed_out_trials == 0
+            and self.unattributed_reproductions == 0
+            and self.triggering_config is None
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -924,6 +974,10 @@ class StressTestResult:
             "log": None if self.log is None else self.log.to_dict(),
             "duration_s": self.duration_s,
             "error": self.error,
+            "planned_trials": self.planned_trials,
+            "timed_out_trials": self.timed_out_trials,
+            "completeness": self.completeness.value,
+            "unattributed_reproductions": self.unattributed_reproductions,
         }
 
     @classmethod
@@ -944,6 +998,12 @@ class StressTestResult:
             log=None if log is None else ArtifactRef.from_dict(log),
             duration_s=float(d.get("duration_s", 0.0)),
             error=d.get("error"),
+            planned_trials=int(d.get("planned_trials", 0)),
+            timed_out_trials=int(d.get("timed_out_trials", 0)),
+            completeness=ResultCompleteness(
+                d.get("completeness", ResultCompleteness.UNKNOWN.value)
+            ),
+            unattributed_reproductions=int(d.get("unattributed_reproductions", 0)),
         )
 
 

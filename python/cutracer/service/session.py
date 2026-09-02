@@ -74,7 +74,7 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
 
 
 def _inconclusive_report(session: AnalysisSession, reason: str) -> ExplainReport:
-    reproduced = any(result.reproductions > 0 for result in session.evidence.stress)
+    reproduced = any(result.has_positive_signal for result in session.evidence.stress)
     return ExplainReport(
         root_cause="",
         race_class="unknown",

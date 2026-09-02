@@ -15,11 +15,93 @@ from cutracer.service.contracts import (
     ExecutionStatus,
     ExperimentKind,
     ExperimentSpec,
+    ResultCompleteness,
     StressOutcome,
     StressTestResult,
     TriggeringDelayConfig,
 )
-from cutracer.stress.stress import run_stress, StressConfig
+from cutracer.stress.stress import run_stress, StressConfig, StressResult
+
+
+def _campaign_completed(result: StressResult, planned_trials: int) -> bool:
+    return (
+        result.completed_trials == planned_trials
+        and result.infra_errors == 0
+        and result.timed_out == 0
+    )
+
+
+def _classify_result(
+    result: StressResult,
+    *,
+    planned_trials: int,
+    stop_on_first: bool,
+    triggering_config: Optional[TriggeringDelayConfig],
+) -> tuple[
+    StressOutcome,
+    ExecutionStatus,
+    Optional[str],
+    ResultCompleteness,
+]:
+    if triggering_config is not None:
+        attempted_trials = (
+            result.completed_trials + result.infra_errors + result.timed_out
+        )
+        if _campaign_completed(result, planned_trials):
+            completeness = ResultCompleteness.COMPLETE
+        elif (
+            stop_on_first
+            and attempted_trials < planned_trials
+            and result.infra_errors == 0
+            and result.timed_out == 0
+        ):
+            completeness = ResultCompleteness.COMPLETE_EARLY
+        else:
+            completeness = ResultCompleteness.PARTIAL
+        return (
+            StressOutcome.REPRODUCED,
+            ExecutionStatus.SUCCEEDED,
+            None,
+            completeness,
+        )
+    if result.unattributed_reproductions > 0:
+        return (
+            StressOutcome.UNATTRIBUTED_REPRODUCTION,
+            ExecutionStatus.SUCCEEDED,
+            None,
+            (
+                ResultCompleteness.COMPLETE
+                if _campaign_completed(result, planned_trials)
+                else ResultCompleteness.PARTIAL
+            ),
+        )
+    if _campaign_completed(result, planned_trials) and result.reproductions == 0:
+        return (
+            StressOutcome.NOT_REPRODUCED,
+            ExecutionStatus.SUCCEEDED,
+            None,
+            ResultCompleteness.COMPLETE,
+        )
+    if result.infra_errors > 0:
+        return (
+            StressOutcome.INCOMPLETE,
+            ExecutionStatus.INFRA_ERROR,
+            "stress campaign had one or more infrastructure failures",
+            ResultCompleteness.PARTIAL,
+        )
+    if result.timed_out > 0:
+        return (
+            StressOutcome.INCOMPLETE,
+            ExecutionStatus.TIMED_OUT,
+            "stress campaign timed out before completing its planned trials",
+            ResultCompleteness.PARTIAL,
+        )
+    return (
+        StressOutcome.INCOMPLETE,
+        ExecutionStatus.INFRA_ERROR,
+        "stress campaign did not complete enough valid oracle trials",
+        ResultCompleteness.PARTIAL,
+    )
 
 
 def run_stress_experiment(
@@ -40,6 +122,7 @@ def run_stress_experiment(
 
     os.makedirs(out_dir, exist_ok=True)
     started = time.monotonic()
+    planned_trials = spec.stress.planned_trials
 
     def _provenance() -> ExecutionProvenance:
         return ExecutionProvenance(
@@ -61,6 +144,8 @@ def run_stress_experiment(
             provenance=_provenance(),
             duration_s=time.monotonic() - started,
             error=error,
+            planned_trials=planned_trials,
+            completeness=ResultCompleteness.PARTIAL,
         )
 
     base_env = os.environ.copy()
@@ -107,6 +192,31 @@ def run_stress_experiment(
         stable_config_path = os.path.join(out_dir, "triggering_config.json")
         try:
             shutil.copyfile(result.triggering.config_path, stable_config_path)
+            artifact = local_artifact(
+                stable_config_path,
+                media_type="application/json",
+                include_sha256=True,
+            )
+            if artifact.sha256 is None or artifact.size_bytes is None:
+                raise OSError("triggering config disappeared before it was hashed")
+            triggering_config = TriggeringDelayConfig(
+                artifact=artifact,
+                work_unit_id=spec.unit.unit_id,
+                target_argv=list(spec.unit.argv),
+                oracle=spec.unit.oracle,
+                source_revision=spec.unit.source_revision,
+                arch=spec.unit.arch,
+                kernel=spec.unit.kernel,
+                delay_ns=result.triggering.delay_ns,
+                enable_prob=result.triggering.enable_prob,
+                warpgroup_id=result.triggering.warpgroup_id,
+                attempt_index=result.triggering.attempt_index,
+                completed_trials=result.completed_trials,
+                reproductions=result.reproductions,
+                reproduction_rate=result.reproduction_rate,
+                cutracer_version=cutracer_version,
+                toolchain_version=toolchain_version,
+            )
         except OSError as exc:
             # The campaign already ran to completion (a reproduction was even
             # found); only persisting its config failed. Preserve the real
@@ -115,52 +225,17 @@ def run_stress_experiment(
             terminal.completed_trials = result.completed_trials
             terminal.reproductions = result.reproductions
             terminal.infra_errors = result.infra_errors + 1
+            terminal.timed_out_trials = result.timed_out
+            terminal.unattributed_reproductions = result.unattributed_reproductions
             terminal.log = log
             return terminal
-        triggering_config = TriggeringDelayConfig(
-            artifact=local_artifact(
-                stable_config_path,
-                media_type="application/json",
-                include_sha256=True,
-            ),
-            work_unit_id=spec.unit.unit_id,
-            target_argv=list(spec.unit.argv),
-            oracle=spec.unit.oracle,
-            source_revision=spec.unit.source_revision,
-            arch=spec.unit.arch,
-            kernel=spec.unit.kernel,
-            delay_ns=result.triggering.delay_ns,
-            enable_prob=result.triggering.enable_prob,
-            warpgroup_id=result.triggering.warpgroup_id,
-            attempt_index=result.triggering.attempt_index,
-            completed_trials=result.completed_trials,
-            reproductions=result.reproductions,
-            reproduction_rate=result.reproduction_rate,
-            cutracer_version=cutracer_version,
-            toolchain_version=toolchain_version,
-        )
 
-    if triggering_config is not None:
-        outcome = StressOutcome.REPRODUCED
-        status = ExecutionStatus.SUCCEEDED
-        error = None
-    elif result.completed_trials > 0:
-        # At least one oracle trial ran to a clean verdict and none reproduced.
-        # Infra errors / timeouts on other attempts are surfaced as metadata
-        # (infra_errors) rather than downgrading a genuine non-reproduction.
-        outcome = StressOutcome.NOT_REPRODUCED
-        status = ExecutionStatus.SUCCEEDED
-        error = None
-    elif result.timed_out > 0 and result.timed_out >= result.infra_errors:
-        # No attempt produced a verdict and the dominant failure was the repro
-        # command hanging: report a timeout, distinct from a generic infra error.
-        outcome = StressOutcome.INCOMPLETE
-        status = ExecutionStatus.TIMED_OUT
-        error = "stress campaign timed out before completing any valid oracle trial"
-    else:
-        outcome = StressOutcome.INCOMPLETE
-        status = ExecutionStatus.INFRA_ERROR
-        error = "stress campaign did not complete enough valid oracle trials"
+    outcome, status, error, completeness = _classify_result(
+        result,
+        planned_trials=planned_trials,
+        stop_on_first=spec.stress.stop_on_first_reproduction,
+        triggering_config=triggering_config,
+    )
 
     return StressTestResult(
         experiment_id=spec.experiment_id,
@@ -174,4 +249,8 @@ def run_stress_experiment(
         log=log,
         duration_s=time.monotonic() - started,
         error=error,
+        planned_trials=planned_trials,
+        timed_out_trials=result.timed_out,
+        completeness=completeness,
+        unattributed_reproductions=result.unattributed_reproductions,
     )

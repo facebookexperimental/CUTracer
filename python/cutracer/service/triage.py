@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List
 
-from cutracer.service.contracts import EvidenceBundle, FindingRecord, StressOutcome
+from cutracer.service.contracts import EvidenceBundle, FindingRecord
 
 
 @dataclasses.dataclass
@@ -41,9 +41,7 @@ def correlate_evidence(unit_id: str, evidence: EvidenceBundle) -> TriageResult:
     sanitizer_signals = [
         result for result in evidence.sanitizer if result.has_positive_signal
     ]
-    stress_reproduced = any(
-        result.outcome == StressOutcome.REPRODUCED for result in evidence.stress
-    )
+    stress_reproduced = any(result.has_positive_signal for result in evidence.stress)
     if not sanitizer_signals and not stress_reproduced:
         return TriageResult(correlated_findings=[], should_analyze=False)
 

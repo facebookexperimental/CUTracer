@@ -15,11 +15,9 @@ from cutracer.service.contracts import (
     CrossValidation,
     DecisionKind,
     EvidenceSufficiency,
-    ExecutionStatus,
     ExperimentKind,
     ExperimentRequest,
     ExplainReport,
-    StressOutcome,
 )
 from cutracer.service.triage import correlate_evidence
 
@@ -264,9 +262,7 @@ def _prompt(session: AnalysisSession, artifact_context: str) -> str:
 
 
 def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
-    reproduced = any(
-        result.outcome == StressOutcome.REPRODUCED for result in session.evidence.stress
-    )
+    reproduced = any(result.has_positive_signal for result in session.evidence.stress)
     refs: List[str] = []
     for result in session.evidence.sanitizer:
         if result.log is not None:
@@ -296,9 +292,7 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
 def _has_correctness_signal(session: AnalysisSession) -> bool:
     return any(
         result.has_positive_signal for result in session.evidence.sanitizer
-    ) or any(
-        result.outcome == StressOutcome.REPRODUCED for result in session.evidence.stress
-    )
+    ) or any(result.has_positive_signal for result in session.evidence.stress)
 
 
 def _sanitizer_is_trustworthy_clean(session: AnalysisSession) -> bool:
@@ -307,14 +301,23 @@ def _sanitizer_is_trustworthy_clean(session: AnalysisSession) -> bool:
     )
 
 
+def _stress_is_trustworthy_non_reproduction(session: AnalysisSession) -> bool:
+    return bool(session.evidence.stress) and all(
+        result.has_trustworthy_non_reproduction for result in session.evidence.stress
+    )
+
+
+def _both_initial_sources_are_trustworthy_clean(session: AnalysisSession) -> bool:
+    """Require both peer detectors; an absent source is incomplete, not neutral."""
+    return _sanitizer_is_trustworthy_clean(
+        session
+    ) and _stress_is_trustworthy_non_reproduction(session)
+
+
 def fallback_decision(session: AnalysisSession, reason: str) -> AnalysisDecision:
     has_signal = _has_correctness_signal(session)
     sanitizer_is_clean = _sanitizer_is_trustworthy_clean(session)
-    stress_is_clean = bool(session.evidence.stress) and all(
-        result.execution_status == ExecutionStatus.SUCCEEDED
-        and result.outcome == StressOutcome.NOT_REPRODUCED
-        for result in session.evidence.stress
-    )
+    stress_is_clean = _stress_is_trustworthy_non_reproduction(session)
     if not has_signal and sanitizer_is_clean and stress_is_clean:
         report = _fallback_report(session, reason)
         report.race_class = "none"
@@ -368,13 +371,13 @@ class ClaudeReasoner:
 
     def analyze(self, session: AnalysisSession) -> AnalysisDecision:
         if (
-            session.evidence.sanitizer
+            (session.evidence.sanitizer or session.evidence.stress)
             and not _has_correctness_signal(session)
-            and not _sanitizer_is_trustworthy_clean(session)
+            and not _both_initial_sources_are_trustworthy_clean(session)
         ):
             # Completeness is a deterministic service invariant. Do not let a
-            # model promote legacy or truncated sanitizer evidence to clean.
-            return fallback_decision(session, "sanitizer evidence is incomplete")
+            # model promote legacy or partial initial evidence to clean.
+            return fallback_decision(session, "initial evidence is incomplete")
         available = (
             shutil.which(self._claude_bin) is not None
             if self._available is None
