@@ -1269,6 +1269,12 @@ class SessionBudget:
     max_rounds: int = 2
     max_experiments: int = 8
 
+    def __post_init__(self) -> None:
+        if self.max_rounds < 0:
+            raise ValueError("max_rounds must be non-negative")
+        if self.max_experiments < 0:
+            raise ValueError("max_experiments must be non-negative")
+
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 

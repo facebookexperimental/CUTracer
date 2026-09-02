@@ -10,11 +10,12 @@ from cutracer.service.contracts import (
     AnalysisSession,
     ExperimentResult,
     ExperimentSpec,
+    SessionBudget,
     SessionReport,
     SessionStatus,
     WorkUnit,
 )
-from cutracer.service.policy import ExperimentGuardPolicy
+from cutracer.service.policy import ExperimentGuardPolicy, InitialCampaignPolicy
 from cutracer.service.session import (
     build_session_report,
     create_session,
@@ -120,8 +121,20 @@ class DistributedCoordinator:
             f"session update contention exceeded retry limit: {session_id}"
         )
 
-    def start(self, session_id: str, unit: WorkUnit) -> AnalysisSession:
-        transition = create_session(session_id, unit)
+    def start(
+        self,
+        session_id: str,
+        unit: WorkUnit,
+        *,
+        budget: SessionBudget | None = None,
+        campaign_policy: InitialCampaignPolicy | None = None,
+    ) -> AnalysisSession:
+        transition = create_session(
+            session_id,
+            unit,
+            budget=budget,
+            campaign_policy=campaign_policy,
+        )
         transition.session.state_revision = 1
         if not self._store.create(transition.session):
             return self.resume(session_id)
