@@ -76,6 +76,16 @@ class SanitizerOutcome(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ResultCompleteness(str, Enum):
+    """How completely an experiment covered its declared verdict scope."""
+
+    COMPLETE = "complete"
+    COMPLETE_EARLY = "complete_early"
+    PARTIAL = "partial"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -612,6 +622,41 @@ class FindingRecord:
 
 
 @dataclasses.dataclass
+class SanitizerSummary:
+    """Run-level aggregate copied from a canonical sanitizer summary."""
+
+    total_hazards: int
+    errors: int
+    warnings: int
+    raw: str = ""
+
+    @property
+    def is_positive(self) -> bool:
+        return self.total_hazards > 0 or self.errors > 0 or self.warnings > 0
+
+    @property
+    def is_zero(self) -> bool:
+        return self.total_hazards == 0 and self.errors == 0 and self.warnings == 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_hazards": self.total_hazards,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "raw": self.raw,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SanitizerSummary":
+        return cls(
+            total_hazards=int(d["total_hazards"]),
+            errors=int(d["errors"]),
+            warnings=int(d["warnings"]),
+            raw=d.get("raw", ""),
+        )
+
+
+@dataclasses.dataclass
 class StressOptions:
     delay_ladder_ns: List[int] = dataclasses.field(
         default_factory=lambda: [1000, 5000, 10000, 50000, 100000]
@@ -775,10 +820,34 @@ class SanitizerSweepResult:
     log: Optional[ArtifactRef] = None
     duration_s: float = 0.0
     error: Optional[str] = None
+    summary: Optional[SanitizerSummary] = None
+    completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
+    summary_issues: List[str] = dataclasses.field(default_factory=list)
 
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.COMPUTE_SANITIZER, init=False
     )
+
+    @property
+    def has_positive_signal(self) -> bool:
+        return (
+            self.outcome == SanitizerOutcome.FINDING
+            or bool(self.findings)
+            or (self.summary is not None and self.summary.is_positive)
+        )
+
+    @property
+    def has_trustworthy_clean(self) -> bool:
+        return (
+            self.execution_status == ExecutionStatus.SUCCEEDED
+            and self.tool == "racecheck"
+            and self.outcome == SanitizerOutcome.CLEAN
+            and self.completeness == ResultCompleteness.COMPLETE
+            and self.summary is not None
+            and self.summary.is_zero
+            and not self.summary_issues
+            and not self.findings
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -792,11 +861,15 @@ class SanitizerSweepResult:
             "log": None if self.log is None else self.log.to_dict(),
             "duration_s": self.duration_s,
             "error": self.error,
+            "summary": None if self.summary is None else self.summary.to_dict(),
+            "completeness": self.completeness.value,
+            "summary_issues": list(self.summary_issues),
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SanitizerSweepResult":
         log = d.get("log")
+        summary = d.get("summary")
         return cls(
             experiment_id=d["experiment_id"],
             execution_status=ExecutionStatus(d["execution_status"]),
@@ -807,6 +880,11 @@ class SanitizerSweepResult:
             log=None if log is None else ArtifactRef.from_dict(log),
             duration_s=float(d.get("duration_s", 0.0)),
             error=d.get("error"),
+            summary=(None if summary is None else SanitizerSummary.from_dict(summary)),
+            completeness=ResultCompleteness(
+                d.get("completeness", ResultCompleteness.UNKNOWN.value)
+            ),
+            summary_issues=list(d.get("summary_issues", [])),
         )
 
 

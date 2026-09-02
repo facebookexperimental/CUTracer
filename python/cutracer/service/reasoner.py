@@ -19,7 +19,6 @@ from cutracer.service.contracts import (
     ExperimentKind,
     ExperimentRequest,
     ExplainReport,
-    SanitizerOutcome,
     StressOutcome,
 )
 from cutracer.service.triage import correlate_evidence
@@ -294,18 +293,23 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
     )
 
 
-def fallback_decision(session: AnalysisSession, reason: str) -> AnalysisDecision:
-    has_signal = any(
-        result.outcome == SanitizerOutcome.FINDING
-        for result in session.evidence.sanitizer
+def _has_correctness_signal(session: AnalysisSession) -> bool:
+    return any(
+        result.has_positive_signal for result in session.evidence.sanitizer
     ) or any(
         result.outcome == StressOutcome.REPRODUCED for result in session.evidence.stress
     )
-    sanitizer_is_clean = bool(session.evidence.sanitizer) and all(
-        result.execution_status == ExecutionStatus.SUCCEEDED
-        and result.outcome == SanitizerOutcome.CLEAN
-        for result in session.evidence.sanitizer
+
+
+def _sanitizer_is_trustworthy_clean(session: AnalysisSession) -> bool:
+    return bool(session.evidence.sanitizer) and all(
+        result.has_trustworthy_clean for result in session.evidence.sanitizer
     )
+
+
+def fallback_decision(session: AnalysisSession, reason: str) -> AnalysisDecision:
+    has_signal = _has_correctness_signal(session)
+    sanitizer_is_clean = _sanitizer_is_trustworthy_clean(session)
     stress_is_clean = bool(session.evidence.stress) and all(
         result.execution_status == ExecutionStatus.SUCCEEDED
         and result.outcome == StressOutcome.NOT_REPRODUCED
@@ -363,6 +367,14 @@ class ClaudeReasoner:
         self._max_artifact_bytes = max_artifact_bytes
 
     def analyze(self, session: AnalysisSession) -> AnalysisDecision:
+        if (
+            session.evidence.sanitizer
+            and not _has_correctness_signal(session)
+            and not _sanitizer_is_trustworthy_clean(session)
+        ):
+            # Completeness is a deterministic service invariant. Do not let a
+            # model promote legacy or truncated sanitizer evidence to clean.
+            return fallback_decision(session, "sanitizer evidence is incomplete")
         available = (
             shutil.which(self._claude_bin) is not None
             if self._available is None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from click import ClickException
@@ -24,12 +25,22 @@ from cutracer.service.contracts import (
     ExperimentKind,
     ExperimentSpec,
     FindingRecord,
+    ResultCompleteness,
     SanitizerOutcome,
+    SanitizerSummary,
     SanitizerSweepResult,
     SourceLoc,
 )
 
 Reader = Callable[[str], str]
+
+
+@dataclass(frozen=True)
+class _RacecheckEvidence:
+    findings: List[FindingRecord]
+    summary: Optional[SanitizerSummary]
+    completeness: ResultCompleteness
+    issues: List[str]
 
 
 def _default_reader(path: str) -> str:
@@ -39,10 +50,11 @@ def _default_reader(path: str) -> str:
         return fh.read()
 
 
-def parse_racecheck_log(text: str) -> List[FindingRecord]:
-    """Convert the canonical CUTracer parser output to service wire records."""
+def _parse_racecheck_evidence(text: str) -> _RacecheckEvidence:
+    """Convert one canonical parser result without discarding run-level facts."""
+    parsed = parse_canonical_racecheck_log(text)
     records: List[FindingRecord] = []
-    for finding in parse_canonical_racecheck_log(text).findings:
+    for finding in parsed.findings:
         primary = finding.accesses[0]
         count = finding.max_hazards
         records.append(
@@ -55,7 +67,31 @@ def parse_racecheck_log(text: str) -> List[FindingRecord]:
                 raw=finding.raw_block,
             )
         )
-    return records
+    summary = (
+        None
+        if parsed.summary is None
+        else SanitizerSummary(
+            total_hazards=parsed.summary.total_hazards,
+            errors=parsed.summary.errors,
+            warnings=parsed.summary.warnings,
+            raw=parsed.summary.raw,
+        )
+    )
+    return _RacecheckEvidence(
+        findings=records,
+        summary=summary,
+        completeness=(
+            ResultCompleteness.COMPLETE
+            if parsed.is_complete
+            else ResultCompleteness.PARTIAL
+        ),
+        issues=[diagnostic.value for diagnostic in parsed.diagnostics],
+    )
+
+
+def parse_racecheck_log(text: str) -> List[FindingRecord]:
+    """Compatibility wrapper returning only converted finding blocks."""
+    return _parse_racecheck_evidence(text).findings
 
 
 def run_sanitizer_experiment(
@@ -124,13 +160,25 @@ def run_sanitizer_experiment(
             status = ExecutionStatus.INFRA_ERROR
             error = f"could not read sanitizer log {log_path}: {exc}"
 
-    findings = parse_racecheck_log(text) if tool == "racecheck" else []
-    if findings:
-        outcome = SanitizerOutcome.FINDING
-    elif status != ExecutionStatus.SUCCEEDED or log is None or tool != "racecheck":
+    racecheck = _parse_racecheck_evidence(text) if tool == "racecheck" else None
+    findings = [] if racecheck is None else racecheck.findings
+    summary = None if racecheck is None else racecheck.summary
+    completeness = (
+        ResultCompleteness.UNKNOWN if racecheck is None else racecheck.completeness
+    )
+    summary_issues = [] if racecheck is None else racecheck.issues
+
+    if racecheck is None or racecheck.completeness != ResultCompleteness.COMPLETE:
         outcome = SanitizerOutcome.UNKNOWN
-    else:
+    elif summary is not None and summary.is_positive:
+        # A complete positive summary is useful evidence even if the target
+        # process itself returned non-zero. Execution and semantic outcome are
+        # intentionally kept separate.
+        outcome = SanitizerOutcome.FINDING
+    elif status == ExecutionStatus.SUCCEEDED and log is not None:
         outcome = SanitizerOutcome.CLEAN
+    else:
+        outcome = SanitizerOutcome.UNKNOWN
 
     return SanitizerSweepResult(
         experiment_id=spec.experiment_id,
@@ -146,4 +194,7 @@ def run_sanitizer_experiment(
         log=log,
         duration_s=time.monotonic() - started,
         error=error,
+        summary=summary,
+        completeness=completeness,
+        summary_issues=summary_issues,
     )

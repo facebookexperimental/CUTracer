@@ -38,13 +38,19 @@ class TriageResult:
 
 def correlate_evidence(unit_id: str, evidence: EvidenceBundle) -> TriageResult:
     findings = [finding for result in evidence.sanitizer for finding in result.findings]
+    sanitizer_signals = [
+        result for result in evidence.sanitizer if result.has_positive_signal
+    ]
     stress_reproduced = any(
         result.outcome == StressOutcome.REPRODUCED for result in evidence.stress
     )
-    if not findings and not stress_reproduced:
+    if not sanitizer_signals and not stress_reproduced:
         return TriageResult(correlated_findings=[], should_analyze=False)
 
     source_tools = {finding.source_tool for finding in findings}
+    source_tools.update(
+        f"compute_sanitizer/{result.tool}" for result in sanitizer_signals
+    )
     if stress_reproduced:
         source_tools.add("cutracer/random_delay")
     sources = sorted(source_tools)

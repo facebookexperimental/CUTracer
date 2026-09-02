@@ -118,6 +118,10 @@ def run_compute_sanitizer(
     if config.output_dir is not None:
         os.makedirs(config.output_dir, exist_ok=True)
         log_path = os.path.join(config.output_dir, f"{config.tool}.log")
+        try:
+            os.unlink(log_path)
+        except FileNotFoundError:
+            pass
 
     env = dict(os.environ if config.base_env is None else config.base_env)
     if config.env is not None:
