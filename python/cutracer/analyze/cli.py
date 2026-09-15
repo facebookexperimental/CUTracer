@@ -143,12 +143,21 @@ if is_fbcode():
     from cutracer.analyze.fb.ai.cli import all_command, deadlock_command
     from cutracer.analyze.fb.data_race.cli import data_race_command
     from cutracer.analyze.fb.dataflow.cli import mma_command, tma_command
+    from cutracer.analyze.fb.numeric.cli import numeric_command
 
     analyze_command.add_command(data_race_command)
     analyze_command.add_command(tma_command)
     analyze_command.add_command(mma_command)
     analyze_command.add_command(deadlock_command)
     analyze_command.add_command(all_command)
+
+    # Numeric sanitizer. One subcommand per bug family, with --check
+    # selecting a single member, mirroring ``analyze data-race --detector``.
+    # Registered as an explicit subcommand only: it is a different bug class
+    # from the schedule-sensitive concurrency detectors above, is not
+    # schedule-sensitive, and requires reg_trace. Adding it to the default
+    # bundle would change what a bare ``analyze <trace>`` means.
+    analyze_command.add_command(numeric_command)
 
     # Unified entry point: a bare ``cutracer analyze <trace>`` (no subcommand)
     # runs the full schedule-sensitive concurrency-defect bundle (deadlock +
