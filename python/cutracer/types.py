@@ -96,6 +96,8 @@ class TraceRecord(TypedDict, total=False):
     tma_transfer_info: dict[str, Any]  # NVBit 1.8 TMA transfer info (src/dst)
 
     # kernel_metadata specific
+    instrument_modes: list[str]
+    instrument_ipoints: dict[str, str]  # Actual mode positions: BEFORE or AFTER
     mangled_name: str
     unmangled_name: str
     kernel_checksum: str

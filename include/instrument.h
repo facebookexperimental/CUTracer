@@ -10,18 +10,7 @@
 #include <vector>
 
 #include "analysis.h"
-
-/**
- * @brief Instrumentation types for different data collection modes
- */
-enum class InstrumentType {
-  OPCODE_ONLY,      // Lightweight: only collect opcode information
-  REG_TRACE,        // Medium: collect register values
-  MEM_ADDR_TRACE,   // Heavy: collect memory access information (address only)
-  MEM_VALUE_TRACE,  // Heavy: collect memory access with values
-  TMA_TRACE,        // TMA descriptor tracing for Tensor Memory Accelerator instructions
-  RANDOM_DELAY,     // Inject random delays on synchronization instructions
-};
+#include "instrument_types.h"
 
 /**
  * @brief Structure to hold operand information for instrumentation

@@ -155,6 +155,17 @@
       },
       "description": "Effective enabled instrumentation modes after init_analysis() if/else precedence (e.g. proton_instr_histogram auto-adds opcode_only, deadlock_detection auto-adds reg_trace). Reflects what the trace actually contains, not what the user typed. Optional for backward compat with pre-Diff-2 traces; absence is treated as 'unknown' by contract_check (INFO exit + rerun guidance)."
     },
+    "instrument_ipoints": {
+      "type": "object",
+      "properties": {
+        "reg_trace": {
+          "type": "string",
+          "enum": ["BEFORE", "AFTER"]
+        }
+      },
+      "additionalProperties": false,
+      "description": "Effective register-capture position resolved by the instrumentation configuration. reg_trace is present only when enabled. Optional for legacy traces; absence does not establish BEFORE."
+    },
     "instr_categories": {
       "type": ["array", "null"],
       "items": {

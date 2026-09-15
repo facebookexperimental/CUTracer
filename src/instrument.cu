@@ -37,25 +37,8 @@ static ipoint_t to_ipoint(IPointType type) {
  * @return The IPOINT to use for instrumentation
  */
 static ipoint_t get_ipoint_from_config(InstrumentType type, ipoint_t default_ipoint) {
-  // Check per-instrument override (indexed by position in enabled_instrument_types_ordered)
-  auto it = instrument_type_to_index.find(type);
-  if (it != instrument_type_to_index.end()) {
-    int index = it->second;
-    if (static_cast<size_t>(index) < ipoint_overrides.size()) {
-      IPointType override_val = ipoint_overrides[index];
-      if (override_val != IPointType::DEFAULT) {
-        return to_ipoint(override_val);
-      }
-    }
-  }
-
-  // Then, check uniform IPOINT
-  if (uniform_ipoint != IPointType::DEFAULT) {
-    return to_ipoint(uniform_ipoint);
-  }
-
-  // Finally, use default
-  return default_ipoint;
+  return to_ipoint(
+      resolve_instrument_ipoint(type, default_ipoint == IPOINT_BEFORE ? IPointType::BEFORE : IPointType::AFTER));
 }
 
 /**

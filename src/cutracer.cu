@@ -43,6 +43,7 @@
 
 /* instrumentation functionality */
 #include "instrument.h"
+#include "instrument_metadata.h"
 
 /* env config */
 #include "env_config.h"
@@ -1097,6 +1098,7 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
     modes.push_back(instrument_type_to_name(t));
   }
   md["instrument_modes"] = modes;
+  md["instrument_ipoints"] = instrument_ipoints_to_json();
 
   // Effective instruction-category filter (post init_instr_categories()).
   // null when CUTRACER_INSTR_CATEGORIES is unset -> no filter (all

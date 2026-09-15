@@ -193,6 +193,24 @@ class KernelMetadataSchemaTest(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(invalid_record, KERNEL_METADATA_SCHEMA)
 
+    def test_instrument_ipoints_accepts_only_resolved_positions(self):
+        schema = KERNEL_METADATA_SCHEMA["properties"]["instrument_ipoints"]
+        for value in ({}, {"reg_trace": "BEFORE"}, {"reg_trace": "AFTER"}):
+            with self.subTest(value=value):
+                jsonschema.validate(value, schema)
+        for value in (
+            {"reg_trace": "DEFAULT"},
+            {"reg_trace": "before"},
+            {"reg_trace": None},
+            {"reg_trace": 0},
+            {"other": "BEFORE"},
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(jsonschema.ValidationError),
+            ):
+                jsonschema.validate(value, schema)
+
 
 class DelayConfigSchemaTest(unittest.TestCase):
     """Tests for delay injection configuration schema."""

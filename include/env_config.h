@@ -282,5 +282,18 @@ extern IPointType uniform_ipoint;
 // Indexed by position in enabled_instrument_types_ordered
 extern std::vector<IPointType> ipoint_overrides;
 
+// Shared by instrumentation and metadata: describe the effective position,
+// including defaults and analysis-added modes, rather than the raw request.
+inline IPointType resolve_instrument_ipoint(InstrumentType type, IPointType default_ipoint) {
+  const auto it = instrument_type_to_index.find(type);
+  if (it != instrument_type_to_index.end() && static_cast<size_t>(it->second) < ipoint_overrides.size()) {
+    const IPointType override_val = ipoint_overrides[it->second];
+    if (override_val != IPointType::DEFAULT) {
+      return override_val;
+    }
+  }
+  return uniform_ipoint == IPointType::DEFAULT ? default_ipoint : uniform_ipoint;
+}
+
 // Initialize IPOINT configuration from environment variables
 void init_instrument_ipoint();
