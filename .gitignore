@@ -128,6 +128,13 @@ tests/unit/test_instr_category
 !python/tests/example_inputs/*.log
 !python/tests/example_inputs/*.zst
 
+# Exception for real-capture test fixtures. These are checked-in traces, not
+# build output. Without this every one of them has to be force-added, and
+# forgetting to is invisible locally: Buck's resource glob reads the working
+# tree, so an ignored fixture still resolves and the test passes, while CI
+# builds from the commit and finds an empty directory.
+!python/tests/fb/data/**/*.ndjson
+
 # Exception for example trace files
 !examples/proton_trace/*.csv
 !examples/proton_trace/*.log
