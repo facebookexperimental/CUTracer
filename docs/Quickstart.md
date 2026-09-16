@@ -13,7 +13,7 @@ Minimal steps to build CUTracer, attach it to an app, and collect traces.
 > export LD_LIBRARY_PATH=~/opt/cuda/lib64:$LD_LIBRARY_PATH
 > ```
 > This installs CUDA 13.0 (plus cuDNN, NCCL, cuSparseLt, nvSHMEM) under `~/opt/cuda`.
-> Supported versions: 12.6, 12.8, 12.9, 13.0, 13.2. Requires ~15 GB disk space.
+> Supported versions: 12.6, 12.8, 12.9, 13.0, 13.2, 13.4. Requires ~15 GB disk space.
 >
 > **aarch64/GB200 support:** The script auto-detects architecture via `uname -m`. For cross-compilation or container builds targeting ARM64 (e.g., NVIDIA GB200, Grace Hopper), set `TARGETARCH=aarch64`:
 > ```bash

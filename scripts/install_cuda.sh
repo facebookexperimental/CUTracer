@@ -33,7 +33,7 @@ echo "🚀 ===== CUDA Installation Script Started ====="
 CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX:-$HOME/opt}
 CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX%/}
 CUDA_VERSION=${CUDA_VERSION:-12.8}
-NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.4.5}
+NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.7.2}
 CUDA_CUPTI_VERSION=${CUDA_CUPTI_VERSION:-13.3.75}
 INSTALL_NCCL=${INSTALL_NCCL:-1}
 NCCL_VERSION=${NCCL_VERSION:-v2.30.7-1}
@@ -51,24 +51,29 @@ declare -A CUDA_FULL_VERSION=(
   ["12.6"]="12.6.3"
   ["12.8"]="12.8.1"
   ["12.9"]="12.9.1"
-  ["13.0"]="13.0.2"
+  ["13.0"]="13.0.3"
   ["13.2"]="13.2.1"
+  ["13.4"]="13.4.1"
 )
 
 declare -A CUDA_RUNFILE=(
   ["12.6"]="cuda_12.6.3_560.35.05_linux"
   ["12.8"]="cuda_12.8.1_570.124.06_linux"
   ["12.9"]="cuda_12.9.1_575.57.08_linux"
-  ["13.0"]="cuda_13.0.2_580.95.05_linux"
+  ["13.0"]="cuda_13.0.3_580.126.20_linux"
   ["13.2"]="cuda_13.2.1_595.58.03_linux"
+  # 13.4.1 runfile carries no driver suffix; NVIDIA published it after
+  # upstream wired 13.4 to the preview network repo (runfile URL verified).
+  ["13.4"]="cuda_13.4.1_linux"
 )
 
 declare -A CUDNN_VERSIONS=(
   ["12.6"]="9.10.2.21"
-  ["12.8"]="9.25.1.1"
-  ["12.9"]="9.25.1.1"
-  ["13.0"]="9.25.1.1"
-  ["13.2"]="9.25.1.1"
+  ["12.8"]="9.26.0.51"
+  ["12.9"]="9.26.0.51"
+  ["13.0"]="9.26.0.51"
+  ["13.2"]="9.26.0.51"
+  ["13.4"]="9.26.0.51"
 )
 
 declare -A CUDA_MAJOR=(
@@ -77,6 +82,7 @@ declare -A CUDA_MAJOR=(
   ["12.9"]="12"
   ["13.0"]="13"
   ["13.2"]="13"
+  ["13.4"]="13"
 )
 
 # Create temporary directory
