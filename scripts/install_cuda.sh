@@ -52,7 +52,7 @@ declare -A CUDA_FULL_VERSION=(
   ["12.8"]="12.8.1"
   ["12.9"]="12.9.1"
   ["13.0"]="13.0.3"
-  ["13.2"]="13.2.1"
+  ["13.2"]="13.2.2"
   ["13.4"]="13.4.1"
 )
 
@@ -61,7 +61,7 @@ declare -A CUDA_RUNFILE=(
   ["12.8"]="cuda_12.8.1_570.124.06_linux"
   ["12.9"]="cuda_12.9.1_575.57.08_linux"
   ["13.0"]="cuda_13.0.3_580.126.20_linux"
-  ["13.2"]="cuda_13.2.1_595.58.03_linux"
+  ["13.2"]="cuda_13.2.2_595.71.05_linux"
   # 13.4.1 runfile carries no driver suffix; NVIDIA published it after
   # upstream wired 13.4 to the preview network repo (runfile URL verified).
   ["13.4"]="cuda_13.4.1_linux"
