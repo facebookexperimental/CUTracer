@@ -20,6 +20,10 @@ NVBIT_VERSION="${NVBIT_VERSION:-1.8}"
 JSON_VERSION="${JSON_VERSION:-3.12.0}"
 RAPIDJSON_VERSION="${RAPIDJSON_VERSION:-1.1.0}"
 
+# Match fbsource//third-party/picosha2/METADATA.bzl and its checked-in header.
+PICOSHA2_VERSION="1.0.1"
+PICOSHA2_SHA256="b13c180161ffac8d0adc81e033e493c409457c4d1258ab9781ac80579ba3bdd8"
+
 # ============================================================
 # Install NVBit
 # ============================================================
@@ -188,6 +192,30 @@ rm -f "$TEMP_FILE"
 rm -rf "$TEMP_DIR"
 
 echo "rapidjson ${RAPIDJSON_VERSION} has been successfully installed."
+
+# ============================================================
+# Install PicoSHA2 (header-only, including its MIT license)
+# ============================================================
+echo ""
+echo "Downloading PicoSHA2 ${PICOSHA2_VERSION}..."
+PICOSHA2_URL="https://raw.githubusercontent.com/okdshin/PicoSHA2/v${PICOSHA2_VERSION}/picosha2.h"
+mkdir -p third_party/picosha2 || exit 1
+PICOSHA2_TEMP=$(mktemp third_party/picosha2/.picosha2.h.XXXXXX) || exit 1
+if ! curl -fsSL --retry 3 -o "$PICOSHA2_TEMP" "$PICOSHA2_URL"; then
+    echo "Error: Failed to download PicoSHA2." >&2
+    rm -f "$PICOSHA2_TEMP"
+    exit 1
+fi
+if ! printf '%s  %s\n' "$PICOSHA2_SHA256" "$PICOSHA2_TEMP" | sha256sum --check --status; then
+    echo "Error: PicoSHA2 header checksum does not match the pinned version." >&2
+    rm -f "$PICOSHA2_TEMP"
+    exit 1
+fi
+if ! chmod 644 "$PICOSHA2_TEMP" || ! mv "$PICOSHA2_TEMP" third_party/picosha2/picosha2.h; then
+    rm -f "$PICOSHA2_TEMP"
+    exit 1
+fi
+echo "PicoSHA2 ${PICOSHA2_VERSION} has been successfully installed."
 
 echo ""
 echo "All third-party dependencies have been successfully installed."

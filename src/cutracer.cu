@@ -34,6 +34,7 @@
 
 /* contains definition of the reg_info_t and mem_access_t structure */
 #include "common.h"
+#include "cubin_identity.h"
 
 /* analysis functionality */
 #include "analysis.h"
@@ -622,6 +623,40 @@ static KernelFuncMetadata& get_or_create_kernel_func_metadata(CUfunction func, C
   return it->second;
 }
 
+static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata& meta) {
+  const std::string prefix = output_dir.empty() ? "" : output_dir + (output_dir.back() == '/' ? "" : "/");
+  const std::string name = meta.mangled_name.substr(0, 150);
+  std::string temporary_dir = prefix + ".cutracer-cubin-XXXXXX";
+  if (mkdtemp(temporary_dir.data()) == nullptr) {
+    loprintf("ERROR: could not create cubin snapshot for %s\n", meta.mangled_name.c_str());
+    return;
+  }
+  // Reserve a private directory, then let NVBit create the file with the
+  // caller's umask. mkstemp would leave the published cubin at mode 0600.
+  const std::string temporary = temporary_dir + "/snapshot.cubin";
+  // NVBit 1.8 can return false after writing a valid cubin. Inspect the fresh
+  // file instead; a failed dump cannot reuse bytes from an earlier capture.
+  nvbit_dump_cubin(ctx, func, temporary.c_str());
+  const std::string digest = cubin_file_sha256(temporary);
+  if (digest.empty()) {
+    loprintf("ERROR: could not hash dumped cubin %s\n", temporary.c_str());
+    unlink(temporary.c_str());
+    rmdir(temporary_dir.c_str());
+    return;
+  }
+  // The SASS checksum can stay identical when embedded PTX contracts differ.
+  const std::string path = prefix + "kernel_" + meta.kernel_checksum + "_" + digest + "_" + name + ".cubin";
+  if (rename(temporary.c_str(), path.c_str()) != 0) {
+    loprintf("ERROR: could not preserve cubin snapshot %s\n", path.c_str());
+    unlink(temporary.c_str());
+    rmdir(temporary_dir.c_str());
+    return;
+  }
+  rmdir(temporary_dir.c_str());
+  meta.cubin_path = path;
+  meta.cubin_sha256 = digest;
+}
+
 /**
  * @brief Conditionally instruments a CUDA function by delegating to specialized
  * instrumentation functions.
@@ -695,17 +730,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     loprintf_v("Kernel checksum for %s: %s\n", meta.mangled_name.c_str(), meta.kernel_checksum.c_str());
 
     if (dump_cubin) {
-      // Use the same "kernel_{checksum}_{name}" prefix as trace files
-      // so Python analyze can derive cubin path from trace filename
-      // (trace: kernel_{checksum}_iter{N}_{name}.ndjson → cubin: kernel_{checksum}_{name}.cubin)
-      std::string truncated_name = std::string(mangled_name).substr(0, 150);
-      std::string cubin_filename = "kernel_" + meta.kernel_checksum + "_" + truncated_name + ".cubin";
-      if (!output_dir.empty()) {
-        meta.cubin_path = output_dir + (output_dir.back() != '/' ? "/" : "") + cubin_filename;
-      } else {
-        meta.cubin_path = cubin_filename;
-      }
-      nvbit_dump_cubin(ctx, f, meta.cubin_path.c_str());
+      dump_kernel_cubin(ctx, f, meta);
     }
 
     // Create kernel delay config if dump path is set (for exporting to JSON)

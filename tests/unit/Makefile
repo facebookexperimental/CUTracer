@@ -4,8 +4,13 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -I../../include
 
+# GoogleTest source tests require libgtest-dev on Debian/Ubuntu.
+GTEST_CPPFLAGS ?=
+GTEST_LIBS ?= -lgtest_main -lgtest -pthread
+THIRD_PARTY := ../../third_party
+
 # Test executables
-TESTS = test_instr_category test_kernel_types
+TESTS = test_instr_category test_kernel_types test_cubin_identity
 
 .PHONY: all clean test
 
@@ -16,6 +21,12 @@ test_instr_category: test_instr_category.cpp ../../include/instr_category.h
 
 test_kernel_types: test_kernel_types.cpp ../../include/kernel_types.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
+
+test_cubin_identity: ../../src/test/CubinIdentityTest.cpp ../../src/cubin_identity.cpp \
+                    ../../src/test/TemporaryDirectoryTest.h ../../include/cubin_identity.h \
+                    $(THIRD_PARTY)/picosha2/picosha2.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) -I$(THIRD_PARTY)/picosha2 \
+		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -o $@
 
 test: $(TESTS)
 	@echo "Running unit tests..."

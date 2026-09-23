@@ -40,14 +40,14 @@ echo "uv:          $(command -v uv) ($(uv --version))"
 echo "python:      $(command -v python) ($(python -V 2>&1))"
 
 # ─────────────────────────────────────────────────────────────────────
-# 1. apt: zstd CLI + libzstd-dev
+# 1. apt: zstd CLI + libzstd-dev + GoogleTest
 #    run_tests.sh's trace verification uses `zstd -d` to inspect
 #    compressed traces, and CUTracer compression code links libzstd.
 #    libzstd.so.1 is preinstalled but no -dev headers and no CLI.
 # ─────────────────────────────────────────────────────────────────────
-echo "::group::apt: zstd"
+echo "::group::apt: compression and unit-test dependencies"
 sudo apt-get update -y
-sudo apt-get install -y --no-install-recommends zstd libzstd-dev
+sudo apt-get install -y --no-install-recommends zstd libzstd-dev libgtest-dev
 echo "::endgroup::"
 
 # ─────────────────────────────────────────────────────────────────────
