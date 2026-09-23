@@ -7,6 +7,8 @@ This module provides the TraceReader class for reading and iterating
 over trace records from NDJSON files (plain or Zstd-compressed).
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import islice
@@ -179,6 +181,30 @@ def select_records(
     return list(islice(records, head))
 
 
+def _resolve_record_references(
+    record: TraceRecord,
+    sass_table: dict[str, str],
+    callstack_table: dict[str, list[str]],
+) -> None:
+    """Resolve SASS and caller references without replacing inline values."""
+    if "sass" not in record and "opcode_id" in record and sass_table:
+        opcode_key = str(record["opcode_id"])
+        if opcode_key in sass_table:
+            record["sass"] = sass_table[opcode_key]
+
+    # The innermost frame is the direct call site. It may still be framework
+    # code (e.g., torch dispatch), depending on how the callstack was captured.
+    if (
+        record.get("type") == "kernel_launch"
+        and "callstack_id" in record
+        and callstack_table
+        and "caller" not in record
+    ):
+        frames = callstack_table.get(record["callstack_id"])
+        if frames:
+            record["caller"] = frames[-1]
+
+
 class TraceReaderBase(ABC):
     """
     Reader for CUTracer trace files.
@@ -228,6 +254,8 @@ class TraceReader(TraceReaderBase):
             raise FileNotFoundError(f"File not found: {self.file_path}")
 
         self.compression = detect_compression(self.file_path)
+        self.capture_completion: TraceRecord | None = None
+        self.capture_completion_count = 0
 
     def iter_records(
         self, filter_exprs: Optional[tuple[str, ...]] = None
@@ -240,6 +268,10 @@ class TraceReader(TraceReaderBase):
         opcode_id lookup, so downstream consumers always see a "sass" field
         regardless of whether it was stored inline (legacy) or in the
         instruction table (new format).
+
+        Completion records are retained in `capture_completion` and counted
+        separately, without yielding them as instructions. This property is
+        raw metadata; consuming it does not verify capture completeness.
 
         Yields:
             dict: Each trace record as a dictionary
@@ -256,6 +288,8 @@ class TraceReader(TraceReaderBase):
         sass_table: dict[str, str] = {}
         # Maps callstack_id -> frames list, populated from callstack_def
         callstack_table: dict[str, list[str]] = {}
+        self.capture_completion = None
+        self.capture_completion_count = 0
 
         with open_trace_file(self.file_path) as f:
             for line in f:
@@ -265,6 +299,11 @@ class TraceReader(TraceReaderBase):
                 record = loads(line)
 
                 record_type = record.get("type")
+
+                if record_type == "capture_completion":
+                    self.capture_completion = record
+                    self.capture_completion_count += 1
+                    continue
 
                 # Cache instruction table from kernel_metadata
                 if record_type == "kernel_metadata":
@@ -281,25 +320,5 @@ class TraceReader(TraceReaderBase):
                         callstack_table[cid] = frames
                     continue
 
-                # Inject sass from instruction table if not already present
-                if "sass" not in record and "opcode_id" in record and sass_table:
-                    opcode_key = str(record["opcode_id"])
-                    if opcode_key in sass_table:
-                        record["sass"] = sass_table[opcode_key]
-
-                # Inject caller from callstack table for kernel_launch records.
-                # `caller` = innermost (deepest) frame, which is the direct call
-                # site. Note: this may still be framework code (e.g., torch
-                # dispatch) rather than user code, depending on how the
-                # callstack was captured.
-                if (
-                    record_type == "kernel_launch"
-                    and "callstack_id" in record
-                    and callstack_table
-                    and "caller" not in record
-                ):
-                    frames = callstack_table.get(record["callstack_id"])
-                    if frames:
-                        record["caller"] = frames[-1]
-
+                _resolve_record_references(record, sass_table, callstack_table)
                 yield record

@@ -52,7 +52,7 @@ class TraceRecord(TypedDict, total=False):
     warp: int  # Warp ID
     opcode_id: int
     pc: str  # Hex string "0x..."
-    ipoint: str  # "B" (before) or "A" (after), on memory trace records
+    ipoint: str  # reg_trace: "before"/"after"; memory traces: "B"/"A"
 
     # cuda-gdb opcode_only specific fields. These are emitted by the debugger
     # sampler, not by NVBit reg_trace/mem_trace/tma_trace records.
@@ -116,6 +116,15 @@ class TraceRecord(TypedDict, total=False):
     instructions: dict[
         str, dict[str, Any]
     ]  # opcode_id (str) -> {sass, binary, regs, uregs, ...}
+
+    # capture_completion specific
+    version: int
+    status: str
+    kernel_completed: bool
+    channel_drained: bool
+    trace_records_written: int
+    dropped_records: int
+    errors: list[str]
 
     # kernel_launch specific (kernel events file)
     kernel_launch_id: int

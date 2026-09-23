@@ -99,6 +99,10 @@ def _extract_json_stats(
                     if isinstance(info, dict) and "sass" in info:
                         sass_table[opcode_id] = info["sass"]
                 continue
+            if msg_type == "capture_completion":
+                # Completion describes the capture, not an executed instruction.
+                # compare_trace_formats() validates its schema before comparison.
+                continue
 
             type_counts[msg_type] = type_counts.get(msg_type, 0) + 1
             if "cta" in record:

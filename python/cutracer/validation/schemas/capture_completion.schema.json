@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/capture_completion.schema.json",
+  "title": "CUTracer Capture Completion",
+  "description": "Receiver-written completion status after the launch's final channel chunk has been parsed.",
+  "type": "object",
+  "required": [
+    "type",
+    "version",
+    "grid_launch_id",
+    "status",
+    "kernel_completed",
+    "channel_drained",
+    "trace_records_written",
+    "dropped_records",
+    "errors"
+  ],
+  "properties": {
+    "type": {
+      "const": "capture_completion"
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "grid_launch_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete"
+      ]
+    },
+    "kernel_completed": {
+      "type": "boolean"
+    },
+    "channel_drained": {
+      "type": "boolean"
+    },
+    "trace_records_written": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dropped_records": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "complete"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kernel_completed": {
+            "const": true
+          },
+          "channel_drained": {
+            "const": true
+          },
+          "dropped_records": {
+            "const": 0
+          },
+          "errors": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

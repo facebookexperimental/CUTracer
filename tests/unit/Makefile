@@ -8,9 +8,10 @@ CXXFLAGS = -std=c++17 -Wall -Wextra -I../../include
 GTEST_CPPFLAGS ?=
 GTEST_LIBS ?= -lgtest_main -lgtest -pthread
 THIRD_PARTY := ../../third_party
+CUDA_HOME ?= /usr/local/cuda
 
 # Test executables
-TESTS = test_instr_category test_kernel_types test_cubin_identity
+TESTS = test_instr_category test_kernel_types test_cubin_identity test_capture_completion
 
 .PHONY: all clean test
 
@@ -27,6 +28,13 @@ test_cubin_identity: ../../src/test/CubinIdentityTest.cpp ../../src/cubin_identi
                     $(THIRD_PARTY)/picosha2/picosha2.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) -I$(THIRD_PARTY)/picosha2 \
 		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -o $@
+
+test_capture_completion: ../../src/test/CaptureCompletionTest.cpp ../../src/trace_writer.cpp \
+                         ../../src/trace_rapidjson.cpp ../../src/test/TemporaryDirectoryTest.h \
+                         $(wildcard ../../include/*.h)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) -I$(THIRD_PARTY) \
+		-isystem $(THIRD_PARTY)/nvbit/core -isystem $(CUDA_HOME)/include \
+		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -lzstd -o $@
 
 test: $(TESTS)
 	@echo "Running unit tests..."

@@ -8,11 +8,15 @@ CUTracer for syntax correctness and schema compliance. Supports both
 uncompressed (.ndjson) and Zstd-compressed (.ndjson.zst) files.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Union
 
 import jsonschema
 from tritonparse._json_compat import JSONDecodeError, loads
+from zstandard import ZstdError
 
 from .compression import detect_compression, open_trace_file
 from .schema_loader import SCHEMAS_BY_TYPE
@@ -24,9 +28,33 @@ class JsonValidationError(Exception):
     pass
 
 
+@dataclass
+class _JsonSyntaxSummary:
+    valid_count: int = 0
+    metadata_count: int = 0
+    message_type: str | None = None
+    errors: list[str] = field(default_factory=list)
+    type_error: str | None = None
+
+    def observe(self, record: Any) -> None:
+        self.valid_count += 1
+        if not isinstance(record, dict):
+            self.type_error = self.type_error or "JSON trace record must be an object"
+            return
+        message_type = record.get("type")
+        if message_type in ("kernel_metadata", "capture_completion"):
+            self.metadata_count += 1
+        elif not isinstance(message_type, str) or message_type not in SCHEMAS_BY_TYPE:
+            self.type_error = (
+                self.type_error or f"Unknown message type in file: {message_type}"
+            )
+        elif self.message_type is None:
+            self.message_type = message_type
+
+
 def validate_json_syntax(
-    filepath: Union[str, Path],
-) -> Tuple[int, List[str]]:
+    filepath: str | Path,
+) -> tuple[int, list[str]]:
     """
     Validate JSON syntax line-by-line for NDJSON file.
 
@@ -43,12 +71,15 @@ def validate_json_syntax(
     Raises:
         FileNotFoundError: If file does not exist
     """
-    filepath = Path(filepath)
+    summary = _scan_json_syntax(Path(filepath))
+    return summary.valid_count, summary.errors
+
+
+def _scan_json_syntax(filepath: Path) -> _JsonSyntaxSummary:
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
 
-    valid_count = 0
-    errors: List[str] = []
+    summary = _JsonSyntaxSummary()
 
     try:
         with open_trace_file(filepath, encoding_errors="replace") as f:
@@ -58,15 +89,16 @@ def validate_json_syntax(
                     continue
 
                 try:
-                    loads(line)
-                    valid_count += 1
+                    summary.observe(loads(line))
                 except JSONDecodeError as e:
-                    errors.append(f"Line {line_num}: JSON decode error - {e.msg}")
+                    summary.errors.append(
+                        f"Line {line_num}: JSON decode error - {e.msg}"
+                    )
 
-    except Exception as e:
-        errors.append(f"File reading error: {str(e)}")
+    except (OSError, ValueError, EOFError, ZstdError) as e:
+        summary.errors.append(f"File reading error: {str(e)}")
 
-    return valid_count, errors
+    return summary
 
 
 def validate_json_schema(
@@ -222,14 +254,14 @@ def validate_json_trace(filepath: Union[str, Path]) -> Dict[str, Any]:
 
     # Step 1: Validate syntax
     try:
-        valid_count, syntax_errors = validate_json_syntax(filepath)
-        result["record_count"] = valid_count
+        syntax = _scan_json_syntax(filepath)
+        result["record_count"] = syntax.valid_count
 
-        if syntax_errors:
-            result["errors"].extend(syntax_errors)
+        if syntax.errors:
+            result["errors"].extend(syntax.errors)
             return result
 
-        if valid_count == 0:
+        if syntax.valid_count == 0:
             result["errors"].append("No valid JSON records found in file")
             return result
 
@@ -237,38 +269,18 @@ def validate_json_trace(filepath: Union[str, Path]) -> Dict[str, Any]:
         result["errors"].append(f"Syntax validation error: {str(e)}")
         return result
 
-    # Step 2: Auto-detect message type from first non-metadata record
-    # kernel_metadata lines are header records (not trace data), so we skip
-    # them when detecting the dominant message type and exclude them from
-    # record_count to keep parity with text mode (which has no metadata line).
-    try:
-        metadata_count = 0
-        with open_trace_file(filepath, encoding_errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = loads(line)
-                message_type = record.get("type")
-                if message_type == "kernel_metadata":
-                    metadata_count += 1
-                    continue
-                if message_type not in SCHEMAS_BY_TYPE:
-                    result["errors"].append(
-                        f"Unknown message type in file: {message_type}"
-                    )
-                    return result
-                result["message_type"] = message_type
-                break
-        result["record_count"] -= metadata_count
-    except Exception as e:
-        result["errors"].append(f"Failed to detect message type: {str(e)}")
+    if syntax.type_error:
+        result["errors"].append(syntax.type_error)
         return result
+    result["message_type"] = syntax.message_type
+    result["record_count"] -= syntax.metadata_count
 
-    # Step 3: Validate schema (allow mixed types since trace files often contain multiple record types)
+    # Metadata-only captures still have a schema, even with no instruction type.
     try:
         validate_json_schema(
-            filepath, message_type=result["message_type"], allow_mixed_types=True
+            filepath,
+            message_type=syntax.message_type or "kernel_metadata",
+            allow_mixed_types=True,
         )
         result["valid"] = True
     except JsonValidationError as e:

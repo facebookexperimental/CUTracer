@@ -18,6 +18,8 @@ Schema files are located in the 'schemas/' subdirectory:
 - cuda_gdb_opcode_only.schema.json: Schema for cuda-gdb opcode_only records
 """
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,7 @@ OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("opcode_only")
 DEBUGGER_OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("cuda_gdb_opcode_only")
 DELAY_CONFIG_SCHEMA: dict[str, Any] = _load_schema("delay_config")
 KERNEL_METADATA_SCHEMA: dict[str, Any] = _load_schema("kernel_metadata")
+CAPTURE_COMPLETION_SCHEMA: dict[str, Any] = _load_schema("capture_completion")
 
 # Mapping from type field to schema (for trace records with "type" field).
 # Keys are the exact `type` strings emitted by the C++ writer
@@ -89,4 +92,5 @@ SCHEMAS_BY_TYPE: dict[str, dict[str, Any]] = {
     "tma_trace": TMA_TRACE_SCHEMA,
     "opcode_only": OPCODE_ONLY_SCHEMA,
     "kernel_metadata": KERNEL_METADATA_SCHEMA,
+    "capture_completion": CAPTURE_COMPLETION_SCHEMA,
 }

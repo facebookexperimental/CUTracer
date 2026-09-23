@@ -138,7 +138,7 @@ TraceWriter::~TraceWriter() {
 
 void TraceWriter::write_metadata(const nlohmann::json& metadata) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (!enabled_.load(std::memory_order_relaxed)) {
+  if (!is_enabled() || finished_) {
     return;
   }
   // Text mode (mode 0) does not use json_buffer_; skip.
@@ -151,22 +151,37 @@ void TraceWriter::write_metadata(const nlohmann::json& metadata) {
 
 bool TraceWriter::write_trace(const TraceRecord& record) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (!enabled_.load(std::memory_order_relaxed)) {
+  if (finished_) {
     return false;
   }
-
-  // Dispatch based on trace mode
-  if (trace_mode_ == TraceMode::TEXT) {
-    write_text_format(record);
-  } else {
-    write_json_format(record);
+  if (!is_enabled()) {
+    ++dropped_records_;
+    return false;
+  }
+  if (record.sass_instruction.empty()) {
+    capture_errors_.insert("missing_instruction_identity");
   }
 
-  return true;
+  if (trace_mode_ != TraceMode::TEXT) {
+    return write_json_format(record);
+  }
+  write_text_format(record);
+  const bool success = file_handle_ != nullptr && !ferror(file_handle_);
+  if (success) {
+    ++trace_records_written_;
+  } else {
+    ++dropped_records_;
+    capture_errors_.insert("record_write_failed");
+  }
+  return success;
 }
 
 void TraceWriter::flush() {
   std::lock_guard<std::mutex> lk(mu_);
+  flush_locked();
+}
+
+void TraceWriter::flush_locked() {
   // Dispatch based on trace mode
   if (trace_mode_ == TraceMode::COMPRESSED_NDJSON) {
     write_compressed();
@@ -178,13 +193,61 @@ void TraceWriter::flush() {
 
 void TraceWriter::disable() {
   std::lock_guard<std::mutex> lk(mu_);
-  // Inlined flush() body — we already hold the lock, can't recursively re-take it.
-  if (trace_mode_ == TraceMode::COMPRESSED_NDJSON) {
-    write_compressed();
-  } else if (trace_mode_ == TraceMode::UNCOMPRESSED_NDJSON || trace_mode_ == TraceMode::CLP) {
-    write_uncompressed();
+  capture_errors_.insert("trace_disabled");
+  flush_locked();
+  accepting_records_.store(false, std::memory_order_release);
+}
+
+void TraceWriter::mark_capture_error(const std::string& reason, bool dropped_record) {
+  std::lock_guard<std::mutex> lock(mu_);
+  capture_errors_.insert(reason);
+  if (dropped_record) {
+    ++dropped_records_;
   }
-  enabled_.store(false, std::memory_order_release);
+}
+
+void TraceWriter::finish(uint64_t launch_id, bool kernel_completed, bool channel_drained) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (finished_) {
+    return;
+  }
+  flush_locked();
+  if (fd_ >= 0 && fsync(fd_) != 0) {
+    const int sync_errno = errno;
+    fprintf(stderr, "TraceWriter: failed to sync trace data (errno=%d)\n", sync_errno);
+    capture_errors_.insert("data_sync_failed");
+    enabled_ = false;
+  }
+  if (!kernel_completed) {
+    capture_errors_.insert("kernel_completion_unverified");
+  }
+  if (!channel_drained) {
+    capture_errors_.insert("channel_drain_unverified");
+  }
+  finished_ = true;
+  accepting_records_ = false;
+  if (!enabled_) {
+    fprintf(stderr,
+            "TraceWriter: capture completion unavailable for launch_id %lu: "
+            "trace_records_written=%lu dropped_records=%lu\n",
+            launch_id, trace_records_written_, dropped_records_);
+    return;
+  }
+  if (trace_mode_ == TraceMode::TEXT) {
+    return;
+  }
+  const nlohmann::json completion = {
+      {"type", "capture_completion"},
+      {"version", 1},
+      {"grid_launch_id", launch_id},
+      {"kernel_completed", kernel_completed},
+      {"channel_drained", channel_drained},
+      {"trace_records_written", trace_records_written_},
+      {"dropped_records", dropped_records_},
+      {"errors", capture_errors_},
+      {"status", capture_errors_.empty() && dropped_records_ == 0 ? "complete" : "incomplete"}};
+  json_buffer_ += completion.dump() + "\n";
+  flush_locked();
 }
 
 size_t TraceWriter::get_file_size_bytes() const {
@@ -254,7 +317,20 @@ void TraceWriter::write_uncompressed() {
   if (json_buffer_.empty() || !enabled_.load(std::memory_order_relaxed)) {
     return;
   }
-  write_data(json_buffer_.data(), json_buffer_.size(), "bytes");
+  finish_buffer_write(write_data(json_buffer_.data(), json_buffer_.size(), "bytes"));
+}
+
+void TraceWriter::finish_buffer_write(bool success) {
+  if (success) {
+    trace_records_written_ += buffered_trace_records_;
+  } else {
+    // A partial batch is unverified, even if some bytes reached the file.
+    // Do not count any of its records as written or emit a completion footer.
+    dropped_records_ += buffered_trace_records_;
+    capture_errors_.insert("record_write_failed");
+    enabled_ = false;
+  }
+  buffered_trace_records_ = 0;
   json_buffer_.clear();
 }
 
@@ -290,15 +366,14 @@ void TraceWriter::write_compressed() {
   size_t compressed_size = ZSTD_compressCCtx(zstd_ctx_, compressed_buffer_.data(), compressed_buffer_.size(),
                                              json_buffer_.data(), json_buffer_.size(), compression_level_);
 
-  // Always clear the source buffer, success or fail (see comment above).
-  json_buffer_.clear();
-
   if (ZSTD_isError(compressed_size)) {
     fprintf(stderr, "TraceWriter: Zstd compression error: %s\n", ZSTD_getErrorName(compressed_size));
+    capture_errors_.insert("compression_failed");
+    finish_buffer_write(false);
     return;
   }
 
-  write_data(compressed_buffer_.data(), compressed_size, "compressed bytes");
+  finish_buffer_write(write_data(compressed_buffer_.data(), compressed_size, "compressed bytes"));
 }
 
 // ============================================================================
@@ -382,7 +457,7 @@ void TraceWriter::write_text_format(const TraceRecord& record) {
   fflush(file_handle_);
 }
 
-void TraceWriter::write_json_format(const TraceRecord& record) {
+bool TraceWriter::write_json_format(const TraceRecord& record) {
   // Serialize one NDJSON line via the rapidjson streaming writer into a reused
   // per-thread buffer, then append it directly (no per-record std::string).
   thread_local rapidjson::StringBuffer sb;
@@ -390,11 +465,15 @@ void TraceWriter::write_json_format(const TraceRecord& record) {
     // rj_serialize_to_buffer only fails for an unknown type or null data (it
     // returns Writer::IsComplete() otherwise); skip rather than emit garbage.
     fprintf(stderr, "TraceWriter: skipping unserializable record (type %d)\n", static_cast<int>(record.type));
-    return;
+    capture_errors_.insert("serialization_failed");
+    capture_errors_.insert("record_write_failed");
+    ++dropped_records_;
+    return false;
   }
 
   json_buffer_.append(sb.GetString(), sb.GetSize());
   json_buffer_ += '\n';
+  ++buffered_trace_records_;
   if (json_buffer_.size() >= buffer_threshold_) {
     if (trace_mode_ == TraceMode::COMPRESSED_NDJSON) {
       write_compressed();
@@ -402,4 +481,5 @@ void TraceWriter::write_json_format(const TraceRecord& record) {
       write_uncompressed();
     }
   }
+  return enabled_.load(std::memory_order_relaxed);
 }
