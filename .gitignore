@@ -123,6 +123,9 @@ reduce_report.json
 python/minimal_config.json
 python/reduce_report.json
 tests/unit/test_instr_category
+tests/unit/test_cubin_identity
+tests/unit/test_capture_completion
+tests/unit/test_cuda_callback_guard
 
 # Exception for Python test example inputs
 !python/tests/example_inputs/*.ndjson

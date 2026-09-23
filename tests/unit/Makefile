@@ -11,7 +11,8 @@ THIRD_PARTY := ../../third_party
 CUDA_HOME ?= /usr/local/cuda
 
 # Test executables
-TESTS = test_instr_category test_kernel_types test_cubin_identity test_capture_completion
+TESTS = test_instr_category test_kernel_types test_cubin_identity test_capture_completion \
+        test_cuda_callback_guard
 
 .PHONY: all clean test
 
@@ -35,6 +36,9 @@ test_capture_completion: ../../src/test/CaptureCompletionTest.cpp ../../src/trac
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) -I$(THIRD_PARTY) \
 		-isystem $(THIRD_PARTY)/nvbit/core -isystem $(CUDA_HOME)/include \
 		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -lzstd -o $@
+
+test_cuda_callback_guard: ../../src/test/CudaCallbackGuardTest.cpp ../../include/cuda_callback_guard.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) $< $(LDFLAGS) $(GTEST_LIBS) -o $@
 
 test: $(TESTS)
 	@echo "Running unit tests..."

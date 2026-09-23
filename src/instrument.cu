@@ -84,15 +84,19 @@ void instrument_opcode_only(Instr* instr, int opcode_id, CTXstate* ctx_state) {
  *  - **Refactoring**: Encapsulated the logic into this dedicated function,
  *    separating it from the main instruction iteration loop in `cutracer.cu`.
  */
-void instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, const OperandLists& operands) {
+ipoint_t reg_trace_ipoint() {
+  return get_ipoint_from_config(InstrumentType::REG_TRACE, IPOINT_BEFORE);
+}
+
+bool instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, const OperandLists& operands) {
   if (operands.reg_nums.size() > MAX_REG_OPERANDS || operands.ureg_nums.size() > MAX_UREG_OPERANDS) {
     loprintf("ERROR: skipping reg_trace for opcode_id=%d: %zu R operands and %zu UR operands exceed limits %d/%d\n",
              opcode_id, operands.reg_nums.size(), operands.ureg_nums.size(), MAX_REG_OPERANDS, MAX_UREG_OPERANDS);
-    return;
+    return false;
   }
 
   /* insert call to the instrumentation function with its arguments */
-  nvbit_insert_call(instr, "instrument_reg_val", get_ipoint_from_config(InstrumentType::REG_TRACE, IPOINT_BEFORE));
+  nvbit_insert_call(instr, "instrument_reg_val", reg_trace_ipoint());
   /* guard predicate value */
   nvbit_add_call_arg_guard_pred_val(instr);
   /* opcode id */
@@ -118,6 +122,7 @@ void instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state,
   for (int num : operands.ureg_nums) {
     nvbit_add_call_arg_ureg_val(instr, num, true);
   }
+  return true;
 }
 
 /**

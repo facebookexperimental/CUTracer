@@ -25,6 +25,7 @@
 #include "common.h"
 #include "cuda.h"
 #include "env_config.h"
+#include "instrument.h"
 #include "log.h"
 #include "trace_writer.h"
 #include "utils/channel.hpp"
@@ -796,34 +797,57 @@ static void check_trace_size_limit(CTXstate* ctx_state) {
   }
 }
 
-/**
- * @brief The main thread function for receiving and processing data from the
- * GPU.
- *
- * This function is based on the `recv_thread_fun` from NVIDIA's `mem_trace`
- * example. It runs in a separate CPU thread for each CUDA context, continuously
- * receiving data packets from the GPU channel and processing them.
- *
- * Meta's enhancements transform this from a simple single-purpose function to a
- * versatile multi-analysis pipeline:
- *  - **Generic Message-Passing System**: The original function only handled one
- *    data type (`mem_addr_access_t`). This version uses a `message_header_t` to
- *    identify different packet types (`reg_info_t`, `opcode_only_t`, etc.) and
- *    dispatch them to the appropriate analysis logic.
- *  - **Instruction Histogram Analysis**: It contains the complete host-side logic
- *    for the `PROTON_INSTR_HISTOGRAM` feature, including state management for
- *    each warp (`warp_states`) and tracking completed regions.
- *  - **Kernel Boundary Detection**: It introduces robust state management across
- *    kernel launches by tracking `kernel_launch_id`. This allows it to detect
- *    when a kernel has finished, ensuring that all pending data for that kernel
- *    is finalized and dumped before processing the next one.
- *  - **SASS String Enrichment**: For richer logging, it looks up the SASS string
- *    for a given `opcode_id` to provide more context in the trace output.
- *
- * @param args A void pointer to the `CUcontext` for which this thread is
- * launched.
- * @return void* Always returns NULL.
- */
+static void mark_channel_failure(CTXstate* state, const std::string& reason) {
+  state->channel_failed = true;
+  std::shared_lock<std::shared_mutex> lock(state->writers_mutex);
+  for (const auto& [launch_id, writer] : state->trace_writers) {
+    if (writer) {
+      writer->mark_capture_error(reason);
+    }
+  }
+}
+
+static void mark_dropped_record(CTXstate* state, uint64_t launch_id, const std::string& reason) {
+  std::shared_lock<std::shared_mutex> lock(state->writers_mutex);
+  const auto writer = state->trace_writers.find(launch_id);
+  if (writer != state->trace_writers.end() && writer->second) {
+    writer->second->mark_capture_error(reason, true);
+  }
+}
+
+static void finish_requested_captures(CTXstate* state) {
+  for (const auto& request : state->capture_completions.take_at_chunk_boundary()) {
+    std::unique_lock<std::shared_mutex> lock(state->writers_mutex);
+    const auto writer = state->trace_writers.find(request.launch_id);
+    if (writer == state->trace_writers.end() || !writer->second) {
+      continue;
+    }
+    if (state->channel_failed) {
+      writer->second->mark_capture_error("channel_failure");
+    }
+    if (!request.error.empty()) {
+      writer->second->mark_capture_error(request.error);
+    }
+    if (!request.channel_drained) {
+      writer->second->mark_capture_error("channel_drain_unverified");
+    }
+    writer->second->finish(request.launch_id, request.kernel_completed, request.channel_drained);
+    delete writer->second;
+    state->trace_writers.erase(writer);
+    state->trace_index_by_kernel.erase(request.launch_id);
+    state->kernel_warp_tracking.erase(request.launch_id);
+    if (state->trace_writers.empty()) {
+      clear_deadlock_state(state);
+    }
+  }
+}
+
+static bool has_capture_writer(CTXstate* state, uint64_t launch_id) {
+  std::shared_lock<std::shared_mutex> lock(state->writers_mutex);
+  const auto writer = state->trace_writers.find(launch_id);
+  return writer != state->trace_writers.end() && writer->second && state->trace_index_by_kernel.count(launch_id);
+}
+
 void* recv_thread_fun(void* args) {
   CUcontext ctx = (CUcontext)args;
 
@@ -850,6 +874,9 @@ void* recv_thread_fun(void* args) {
   // Throttle counter for trace size limit checks (every SIZE_CHECK_INTERVAL iterations)
   uint64_t size_check_counter = 0;
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
+    // NVBit flush waits for recv() to copy and acknowledge its final chunk.
+    // Consume requests here, after fully parsing the preceding copied chunk.
+    finish_requested_captures(ctx_state);
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, channel_buffer_size);
 
     if (num_recv_bytes > 0) {
@@ -863,6 +890,7 @@ void* recv_thread_fun(void* args) {
         const uint32_t remaining = num_recv_bytes - num_processed_bytes;
         if (remaining < sizeof(message_header_t)) {
           loprintf("ERROR: truncated channel header: remaining=%u expected=%zu\n", remaining, sizeof(message_header_t));
+          mark_channel_failure(ctx_state, "truncated_channel_header");
           break;
         }
 
@@ -873,6 +901,7 @@ void* recv_thread_fun(void* args) {
         if (raw_type < MSG_TYPE_REG_INFO || raw_type > MSG_TYPE_TMA_ACCESS) {
           loprintf("ERROR: unknown channel message type %d at offset %u/%u\n", raw_type, num_processed_bytes,
                    num_recv_bytes);
+          mark_channel_failure(ctx_state, "unknown_channel_message");
           break;
         }
         const message_type_t message_type = static_cast<message_type_t>(raw_type);
@@ -880,17 +909,28 @@ void* recv_thread_fun(void* args) {
         if (message_size == 0) {
           loprintf("ERROR: unsupported channel message type %d at offset %u/%u\n", raw_type, num_processed_bytes,
                    num_recv_bytes);
+          mark_channel_failure(ctx_state, "unsupported_channel_message");
           break;
         }
         if (remaining < message_size) {
           loprintf("ERROR: truncated channel message type %d: remaining=%u expected=%zu\n", raw_type, remaining,
                    message_size);
+          mark_channel_failure(ctx_state, "truncated_channel_message");
           break;
         }
 
         uint64_t current_launch_id = get_kernel_launch_id(header);
+        if (!has_capture_writer(ctx_state, current_launch_id)) {
+          if (!ctx_state->channel_failed) {
+            loprintf("ERROR: channel record has no capture writer: launch_id=%lu type=%d\n", current_launch_id,
+                     raw_type);
+          }
+          mark_channel_failure(ctx_state, "record_without_capture_writer");
+          num_processed_bytes += message_size;
+          continue;
+        }
         bool is_new_kernel = false;
-        if (current_launch_id != 0 && current_launch_id != last_seen_kernel_launch_id) {
+        if (current_launch_id != last_seen_kernel_launch_id) {
           is_new_kernel = true;
           if (last_seen_kernel_launch_id != UINT64_MAX) {
             // Cleanup for the previous kernel
@@ -907,21 +947,6 @@ void* recv_thread_fun(void* args) {
             }
             if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
               clear_deadlock_state(ctx_state, last_seen_kernel_launch_id);
-            }
-
-            // Close the previous kernel's TraceWriter (per-launch file)
-            // Since kernels are serialized and channel is FIFO, all data for
-            // last_seen_kernel_launch_id has been processed when we see a new launch_id
-            {
-              std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
-              auto it = ctx_state->trace_writers.find(last_seen_kernel_launch_id);
-              if (it != ctx_state->trace_writers.end() && it->second) {
-                it->second->flush();
-                delete it->second;
-                ctx_state->trace_writers.erase(it);
-                ctx_state->trace_index_by_kernel.erase(last_seen_kernel_launch_id);
-                loprintf_v("Closed TraceWriter for launch_id %lu\n", last_seen_kernel_launch_id);
-              }
             }
           }
           last_seen_kernel_launch_id = current_launch_id;
@@ -952,6 +977,7 @@ void* recv_thread_fun(void* args) {
                 "ERROR: invalid reg_info_t counts: launch_id=%lu opcode_id=%d num_regs=%d num_uregs=%d "
                 "active_mask=0x%x\n",
                 ri->kernel_launch_id, ri->opcode_id, ri->num_regs, ri->num_uregs, ri->active_mask);
+            mark_dropped_record(ctx_state, current_launch_id, "invalid_register_counts");
             num_processed_bytes += sizeof(reg_info_t);
             continue;
           }
@@ -1023,6 +1049,7 @@ void* recv_thread_fun(void* args) {
 
               // Create TraceRecord and write (mode 0/1/2 handled by TraceWriter)
               auto record = TraceRecord::create_reg_trace(ctx, sass_str_cpp, trace_idx, timestamp, ri, reg_indices_ptr);
+              record.reg_ipoint = reg_trace_ipoint() == IPOINT_BEFORE ? "before" : "after";
               it->second->write_trace(record);
             }
           }
@@ -1130,6 +1157,7 @@ void* recv_thread_fun(void* args) {
           if (tma->tma_param_size > TMA_PARAM_HANDLE_MAX_BYTES) {
             loprintf("ERROR: invalid tma_access_t size: launch_id=%lu opcode_id=%d size=%u max=%d\n",
                      tma->kernel_launch_id, tma->opcode_id, tma->tma_param_size, TMA_PARAM_HANDLE_MAX_BYTES);
+            mark_dropped_record(ctx_state, current_launch_id, "invalid_tma_size");
             num_processed_bytes += sizeof(tma_access_t);
             continue;
           }
@@ -1207,6 +1235,7 @@ void* recv_thread_fun(void* args) {
           // terminating in case a new type is added without a parser here.
           loprintf("ERROR: unhandled channel message type %d at offset %u/%u\n", header->type, num_processed_bytes,
                    num_recv_bytes);
+          mark_channel_failure(ctx_state, "unhandled_channel_message");
           break;
         }
       }
@@ -1256,6 +1285,8 @@ void* recv_thread_fun(void* args) {
     }
   }
 
+  finish_requested_captures(ctx_state);
+
   // Dump data for the very last kernel if it exists.
   if (last_seen_kernel_launch_id != UINT64_MAX) {
     // Dump any remaining histograms for warps that were still collecting.
@@ -1267,21 +1298,19 @@ void* recv_thread_fun(void* args) {
     if (!local_completed_histograms.empty()) {
       dump_previous_kernel_data(last_seen_kernel_launch_id, local_completed_histograms);
     }
-
-    // Close the last kernel's TraceWriter
-    {
-      std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
-      auto it = ctx_state->trace_writers.find(last_seen_kernel_launch_id);
-      if (it != ctx_state->trace_writers.end() && it->second) {
-        it->second->flush();
-        delete it->second;
-        ctx_state->trace_writers.erase(it);
-        ctx_state->trace_index_by_kernel.erase(last_seen_kernel_launch_id);
-        loprintf_v("Closed final TraceWriter for launch_id %lu\n", last_seen_kernel_launch_id);
-      }
-    }
   }
 
+  {
+    std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+    for (const auto& [launch_id, writer] : ctx_state->trace_writers) {
+      if (writer) {
+        writer->finish(launch_id, false, false);
+        delete writer;
+      }
+    }
+    ctx_state->trace_writers.clear();
+    ctx_state->trace_index_by_kernel.clear();
+  }
   free(recv_buffer);
   ctx_state->recv_thread_done = RecvThreadState::FINISHED;
   return NULL;
