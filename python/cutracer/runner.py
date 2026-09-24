@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 import click
+from cutracer.file_utils import file_sha256
 
 RunTarget = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -93,14 +94,6 @@ def _persist_extracted_so(src: Path) -> Path:
     return dst
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _host_arch() -> str:
     machine = platform.machine().lower()
     return {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
@@ -116,7 +109,7 @@ def _persist_extracted_cuda_tools(
     host tools must outlive that context. The host architecture and content
     digest keep x86_64/aarch64 packages and CUTracer releases isolated.
     """
-    tool_digests = {name: _file_sha256(path) for name, path in extracted.items()}
+    tool_digests = {name: file_sha256(path) for name, path in extracted.items()}
     bundle_digest = hashlib.sha256()
     for name in sorted(tool_digests):
         bundle_digest.update(name.encode())
@@ -135,7 +128,7 @@ def _persist_extracted_cuda_tools(
 
     for name, source in extracted.items():
         destination = cache_root / name
-        if destination.is_file() and _file_sha256(destination) == tool_digests[name]:
+        if destination.is_file() and file_sha256(destination) == tool_digests[name]:
             continue
 
         fd, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=str(cache_root))
