@@ -137,6 +137,7 @@ struct KernelFuncMetadata {
   std::string unmangled_name;
   std::string kernel_checksum;  // FNV-1a hash hex string
   std::string cubin_path;       // Only set when dump_cubin is enabled
+  std::string cubin_sha256;
   uint64_t func_addr = 0;       // nvbit_get_func_addr()
   int nregs = 0;                // CU_FUNC_ATTRIBUTE_NUM_REGS
   int shmem_static_nbytes = 0;  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
@@ -156,6 +157,9 @@ struct KernelFuncMetadata {
     j["sm_family"] = sm_family;
     if (!cubin_path.empty()) {
       j["cubin_path"] = cubin_path;
+    }
+    if (!cubin_sha256.empty()) {
+      j["cubin_sha256"] = cubin_sha256;
     }
     return j;
   }

@@ -44,7 +44,8 @@ INCLUDE_DIR := include
 
 # NVBIT settings
 NVBIT_PATH=./third_party/nvbit/core
-INCLUDES=-I$(NVBIT_PATH) -I./$(INCLUDE_DIR) -I./third_party
+PICOSHA2_PATH=./third_party/picosha2
+INCLUDES=-I$(NVBIT_PATH) -I./$(INCLUDE_DIR) -I./third_party -I$(PICOSHA2_PATH)
 
 # Libraries
 # zstd linking strategy:
@@ -166,6 +167,8 @@ $(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC)
 	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # Compilation rule for C++ files
+$(OBJ_DIR)/cubin_identity.o: $(PICOSHA2_PATH)/picosha2.h
+
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) -std=c++17 $(INCLUDES) -Wall $(DEBUG_FLAGS) -fPIC -c $< -o $@
 

@@ -24,9 +24,9 @@ else
     exit 1
 fi
 
-# Install zstd library for compression support
-echo "📦 Installing zstd library..."
-sudo apt-get update && sudo apt-get install -y libzstd-dev
-echo "✅ zstd installed"
+# Install compression and C++ unit-test dependencies
+echo "📦 Installing zstd and GoogleTest..."
+sudo apt-get update && sudo apt-get install -y libzstd-dev libgtest-dev
+echo "✅ zstd and GoogleTest installed"
 
 echo "Setup completed successfully!"

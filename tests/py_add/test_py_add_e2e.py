@@ -94,6 +94,7 @@ TEST_KEEP_OUTPUT=1
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -205,6 +206,7 @@ class TestPyAddE2E(unittest.TestCase):
         dump_cubin=False,
         extra_env=None,
         run_label: str = "",
+        umask: int = -1,
     ):
         """Run test_add.py as a subprocess with CUTracer instrumentation.
 
@@ -221,6 +223,7 @@ class TestPyAddE2E(unittest.TestCase):
                 _build_cutracer_env, so can override any CUTracer var).
             run_label: Optional label appended to the allocated run-dir name.
                 Defaults to "fmt<N>" when trace_format is given.
+            umask: File creation mask for the child process, or -1 to inherit.
 
         Returns:
             (CompletedProcess, output_dir) tuple. The freshly-allocated run
@@ -244,6 +247,8 @@ class TestPyAddE2E(unittest.TestCase):
             delay_ns=None,
             dump_cubin=dump_cubin,
         )
+        # Make Buck's bundled packages visible to the raw Python subprocess.
+        env["PYTHONPATH"] = os.pathsep.join(sys.path)
         if extra_env:
             env.update(extra_env)
         # Pin Triton/Inductor cache so all subprocesses share the same
@@ -257,6 +262,7 @@ class TestPyAddE2E(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=300,
+            umask=umask,
         )
         return result, run_dir
 
@@ -447,6 +453,31 @@ class TestPyAddE2E(unittest.TestCase):
                 0,
                 f"Cubin file is empty: {f.name}",
             )
+
+    def test_cubin_dump_respects_umask(self):
+        """Published cubins preserve the caller's file creation mask."""
+        for mask in (0o022, 0o002, 0o077):
+            with self.subTest(umask=f"{mask:03o}"):
+                result, run_dir = self._run_py_add(
+                    trace_format=2,
+                    dump_cubin=True,
+                    run_label=f"umask_{mask:03o}",
+                    umask=mask,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"Run failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+                )
+                cubins = sorted(run_dir.glob("kernel_*.cubin"))
+                self.assertTrue(cubins, f"No cubins generated in {run_dir}")
+                for path in cubins:
+                    self.assertEqual(
+                        stat.S_IMODE(path.stat().st_mode),
+                        0o666 & ~mask,
+                        f"Unexpected permissions for {path.name}",
+                    )
+                self.assertFalse(list(run_dir.glob(".cutracer-cubin-*")))
 
     # ------------------------------------------------------------------
     # Test: Cubin dump — explicit disable

@@ -52,6 +52,11 @@
       "minimum": 0,
       "description": "Static shared memory size in bytes (CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)"
     },
+    "cubin_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA256 of the actual dumped cubin bytes, including embedded PTX/debug information."
+    },
     "cubin_path": {
       "type": "string",
       "description": "Path to dumped cubin file (only present when dump_cubin is enabled)"

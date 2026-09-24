@@ -56,6 +56,8 @@ sudo dnf install libzstd-static
 This will download:
 - NVBit (NVIDIA Binary Instrumentation Tool)
 - nlohmann/json (JSON library for C++)
+- RapidJSON (JSON serialization headers)
+- PicoSHA2 1.0.1 (SHA-256 headers, checksum-verified and shared with the internal build)
 
 4. Build the tool:
 
