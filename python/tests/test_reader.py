@@ -4,6 +4,8 @@
 Unit tests for TraceReader class and related functions.
 """
 
+from __future__ import annotations
+
 import json
 import types
 import unittest
@@ -276,6 +278,51 @@ class TestTraceReaderIterRecords(BaseValidationTest):
 
 class TestTraceReaderEdgeCases(BaseValidationTest):
     """Edge case tests for TraceReader."""
+
+    def test_instruction_table_resolution_preserves_inline_sass(self):
+        metadata = {
+            "type": "kernel_metadata",
+            "instructions": {
+                "1": {"sass": "EXIT ;"},
+                "2": {},
+                "3": "not an instruction entry",
+            },
+        }
+        events = [
+            {"type": "reg_trace", "opcode_id": 1},
+            {"type": "reg_trace", "opcode_id": "1"},
+            {"type": "reg_trace", "opcode_id": 1, "sass": "inline instruction"},
+            {"type": "reg_trace", "opcode_id": 2},
+            {"type": "reg_trace", "opcode_id": 3},
+            {"type": "reg_trace", "opcode_id": 99},
+            {"type": "reg_trace"},
+        ]
+        path = self.create_temp_file(
+            "instruction_table.ndjson",
+            "\n".join(json.dumps(row) for row in [metadata, *events]) + "\n",
+        )
+        reader = TraceReader(path)
+        expected = [
+            metadata,
+            {**events[0], "sass": "EXIT ;"},
+            {**events[1], "sass": "EXIT ;"},
+            *events[2:],
+        ]
+        for _ in range(2):
+            self.assertEqual(list(reader.iter_records()), expected)
+
+    def test_completion_is_retained_as_metadata_and_iteration_resets_count(self):
+        event = {"type": "reg_trace", "warp": 0, "sass": "EXIT;"}
+        footer = {"type": "capture_completion", "status": "incomplete"}
+        path = self.create_temp_file(
+            "completion.ndjson",
+            "\n".join(json.dumps(row) for row in (event, footer)) + "\n",
+        )
+        reader = TraceReader(path)
+        for _ in range(2):
+            self.assertEqual(list(reader.iter_records()), [event])
+            self.assertEqual(reader.capture_completion, footer)
+            self.assertEqual(reader.capture_completion_count, 1)
 
     def test_empty_file(self):
         """Test reading an empty file."""

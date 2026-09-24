@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,7 @@ struct TraceRecord {
    * Lifetime: Caller ensures pointed-to TMATransferInfo_t outlives write_trace() call.
    */
   const TMATransferInfo_t* tma_info = nullptr;
+  const char* reg_ipoint = nullptr;
 
   // ========== Constructors for convenience ==========
 
@@ -217,6 +219,12 @@ class TraceWriter {
   size_t buffer_threshold_;
   TraceMode trace_mode_;
   std::atomic<bool> enabled_;
+  std::atomic<bool> accepting_records_{true};
+  bool finished_ = false;
+  uint64_t buffered_trace_records_ = 0;
+  uint64_t trace_records_written_ = 0;
+  uint64_t dropped_records_ = 0;
+  std::set<std::string> capture_errors_;
 
   // Serializes every public mutator (write_trace, write_metadata, flush,
   // disable). TraceWriter is reachable concurrently from multiple threads:
@@ -258,7 +266,8 @@ class TraceWriter {
    * Mode 1/2: Serializes to JSON and writes to .ndjson[.zst] file
    *
    * @param record Complete trace record with all information
-   * @return true if successful, false on error
+   * @return true if accepted into the output buffer, false on error. A later
+   * flush can still fail; only a completion record confirms the capture.
    */
   bool write_trace(const TraceRecord& record);
 
@@ -280,6 +289,9 @@ class TraceWriter {
    */
   void flush();
 
+  void mark_capture_error(const std::string& reason, bool dropped_record = false);
+  void finish(uint64_t launch_id, bool kernel_completed, bool channel_drained);
+
   /**
    * @brief Check if writer is functional.
    *
@@ -287,7 +299,7 @@ class TraceWriter {
    * if another thread invokes disable(). Callers should treat it as advisory.
    */
   bool is_enabled() const {
-    return enabled_.load(std::memory_order_acquire);
+    return enabled_.load(std::memory_order_acquire) && accepting_records_.load(std::memory_order_acquire);
   }
 
   /**
@@ -322,7 +334,10 @@ class TraceWriter {
   /**
    * @brief Write record in JSON format (mode 1/2).
    */
-  void write_json_format(const TraceRecord& record);
+  bool write_json_format(const TraceRecord& record);
+
+  void flush_locked();
+  void finish_buffer_write(bool success);
 
   /**
    * @brief Write CLP archive (mode 3).

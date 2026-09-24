@@ -51,6 +51,10 @@ void rj_cta(JW& w, int x, int y, int z) {
 
 void rj_reg(JW& w, const TraceRecord& rec, const reg_info_t* r, const RegIndices* idx) {
   w.StartObject();
+  if (rec.reg_ipoint != nullptr) {
+    w.Key("ipoint");
+    w.String(rec.reg_ipoint);
+  }
   rj_key_hex(w, "active_mask", r->active_mask);
   rj_cta(w, r->cta_id_x, r->cta_id_y, r->cta_id_z);
   rj_key_hex(w, "ctx", reinterpret_cast<uintptr_t>(rec.context));
