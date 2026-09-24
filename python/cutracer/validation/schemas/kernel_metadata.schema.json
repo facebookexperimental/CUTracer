@@ -57,6 +57,75 @@
       "pattern": "^[0-9a-f]{64}$",
       "description": "SHA256 of the actual dumped cubin bytes, including embedded PTX/debug information."
     },
+    "capture_config": {
+      "type": "object",
+      "required": [
+        "version",
+        "grid_launch_id",
+        "launch_kind",
+        "instr_begin",
+        "instr_end",
+        "reg_trace_ipoint",
+        "root_function",
+        "pc_namespace",
+        "root_instruction_count",
+        "reg_trace_instruction_count",
+        "instrumentation_errors"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "grid_launch_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "launch_kind": {
+          "enum": [
+            "direct",
+            "graph",
+            "unknown"
+          ]
+        },
+        "instr_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "instr_end": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "reg_trace_ipoint": {
+          "enum": [
+            "before",
+            "after"
+          ]
+        },
+        "root_function": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pc_namespace": {
+          "const": "root_function_without_executed_calls"
+        },
+        "root_instruction_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reg_trace_instruction_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "instrumentation_errors": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "cubin_path": {
       "type": "string",
       "description": "Path to dumped cubin file (only present when dump_cubin is enabled)"

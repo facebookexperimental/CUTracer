@@ -48,7 +48,9 @@ void instrument_opcode_only(Instr* instr, int opcode_id, CTXstate* ctx_state);
  * @param ctx_state The context state containing channel information
  * @param operands Structure containing all operand information (reg, ureg, etc.)
  */
-void instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, const OperandLists& operands);
+bool instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, const OperandLists& operands);
+
+ipoint_t reg_trace_ipoint();
 
 /**
  * @brief Insert memory access tracing instrumentation

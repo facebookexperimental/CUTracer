@@ -7,6 +7,7 @@
 
 #ifndef ANALYSIS_H
 #define ANALYSIS_H
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <deque>
@@ -21,6 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "capture_completion.h"
 #include "common.h"
 #include "instr_category.h"
 #include "kernel_types.h"
@@ -138,6 +140,9 @@ struct KernelFuncMetadata {
   std::string kernel_checksum;  // FNV-1a hash hex string
   std::string cubin_path;       // Only set when dump_cubin is enabled
   std::string cubin_sha256;
+  size_t instruction_count = 0;
+  size_t reg_trace_instruction_count = 0;
+  size_t instrumentation_errors = 0;
   uint64_t func_addr = 0;       // nvbit_get_func_addr()
   int nregs = 0;                // CU_FUNC_ATTRIBUTE_NUM_REGS
   int shmem_static_nbytes = 0;  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
@@ -187,7 +192,9 @@ struct CTXstate {
   // parent thread sets it to STOP to make recv thread stop working.
   // recv thread sets it to FINISHED when it cleans up.
   // parent thread should wait until the state becomes FINISHED to clean up.
-  volatile RecvThreadState recv_thread_done = RecvThreadState::INIT;
+  std::atomic<RecvThreadState> recv_thread_done{RecvThreadState::INIT};
+  CaptureCompletionQueue capture_completions;
+  std::atomic<bool> channel_failed{false};
 
   // Whether the context and the channel need a synchronization at termination.
   // Set to true when a kernel is actually launched (not during stream capture
@@ -220,8 +227,8 @@ struct CTXstate {
   std::unordered_map<WarpKey, bool, WarpKey::Hash> last_is_defer_blocking_by_warp;
 
   // Deadlock handling
-  time_t kernel_start_time = 0;
-  time_t last_data_received_time = 0;
+  std::atomic<time_t> kernel_start_time{0};
+  std::atomic<time_t> last_data_received_time{0};
   int deadlock_consecutive_hits = 0;
   bool deadlock_termination_initiated = false;
 

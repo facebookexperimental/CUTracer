@@ -111,6 +111,7 @@ class TraceRecord(TypedDict, total=False):
     cluster_dim_source: str
     cubin_path: str
     cubin_sha256: str
+    capture_config: dict[str, Any]
     func_addr: str
     sm_family: int  # SM architecture family (e.g. 90 = Hopper, 100 = Blackwell)
     instructions: dict[

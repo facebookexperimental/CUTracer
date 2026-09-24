@@ -7,11 +7,15 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "TemporaryDirectoryTest.h"
+#include "capture_completion.h"
 #include "trace_writer.h"
 
 // TraceWriter references the extern configuration variable from env_config.h.
@@ -202,6 +206,103 @@ TEST_F(CaptureCompletionTest, SyncFailureReportsWhyCompletionIsUnavailable) {
   const auto diagnostic = testing::internal::GetCapturedStderr();
   EXPECT_FALSE(writer.is_enabled());
   EXPECT_NE(diagnostic.find("TraceWriter: failed to sync trace data"), std::string::npos);
+}
+
+TEST_F(CaptureCompletionTest, CopiedChunkMustBeParsedBeforeCompletion) {
+  TraceWriter writer(path("zero"), 2);
+  writer.write_metadata({{"type", "kernel_metadata"}});
+  CaptureCompletionQueue queue;
+  std::thread callback([&] { queue.request({0, true, true, ""}); });
+  callback.join();
+  writer.flush();
+  ASSERT_EQ(records("zero").size(), 1);
+
+  ASSERT_TRUE(record(writer, 0, 0));
+  ASSERT_TRUE(record(writer, 0, 1));
+  const auto ready = queue.take_at_chunk_boundary();
+  ASSERT_EQ(ready.size(), 1);
+  writer.finish(ready[0].launch_id, ready[0].kernel_completed, ready[0].channel_drained);
+
+  const auto rows = records("zero");
+  ASSERT_EQ(rows.size(), 4);
+  EXPECT_EQ(rows[1]["ipoint"], "before");
+  const nlohmann::json expected = {{"type", "capture_completion"}, {"version", 1},
+                                   {"grid_launch_id", 0},          {"kernel_completed", true},
+                                   {"channel_drained", true},      {"trace_records_written", 2},
+                                   {"dropped_records", 0},         {"errors", nlohmann::json::array()},
+                                   {"status", "complete"}};
+  EXPECT_EQ(rows.back(), expected);
+  EXPECT_TRUE(queue.take_at_chunk_boundary().empty());
+}
+
+TEST_F(CaptureCompletionTest, InterleavedLaunchesKeepTheirOwnWriters) {
+  std::map<uint64_t, std::unique_ptr<TraceWriter>> writers;
+  for (uint64_t id : {3, 9}) {
+    writers[id] = std::make_unique<TraceWriter>(path(std::to_string(id)), 2);
+  }
+  ASSERT_TRUE(record(*writers[3], 3, 0));
+  ASSERT_TRUE(record(*writers[9], 9, 0));
+  CaptureCompletionQueue queue;
+  queue.request({9, true, true, ""});
+  queue.request({3, true, true, ""});
+  ASSERT_TRUE(record(*writers[3], 3, 1));
+  for (const auto& ready : queue.take_at_chunk_boundary()) {
+    writers.at(ready.launch_id)->finish(ready.launch_id, ready.kernel_completed, ready.channel_drained);
+  }
+  EXPECT_EQ(records("3").back()["trace_records_written"], 2);
+  EXPECT_EQ(records("9").back()["trace_records_written"], 1);
+  EXPECT_EQ(records("3").back()["grid_launch_id"], 3);
+  EXPECT_EQ(records("9").back()["grid_launch_id"], 9);
+}
+
+TEST_F(CaptureCompletionTest, GraphDrainIncludesEmptyLaunchAndRetiresTheBatch) {
+  TraceWriter active(path("graph_active"), 2);
+  TraceWriter empty(path("graph_empty"), 2);
+  active.mark_capture_error("graph_launch_completion_unverified");
+  empty.mark_capture_error("graph_launch_completion_unverified");
+  CaptureCompletionQueue queue;
+  queue.register_graph_launch(3);
+  queue.register_graph_launch(9);
+  ASSERT_TRUE(record(active, 3, 0));
+  queue.request_graph_completion(true, true, "");
+  ASSERT_TRUE(record(active, 3, 1));
+  const auto ready = queue.take_at_chunk_boundary();
+  ASSERT_EQ(ready.size(), 2);
+  active.finish(ready[0].launch_id, ready[0].kernel_completed, ready[0].channel_drained);
+  empty.finish(ready[1].launch_id, ready[1].kernel_completed, ready[1].channel_drained);
+  const auto empty_rows = records("graph_empty");
+  ASSERT_EQ(empty_rows.size(), 1);
+  const nlohmann::json expected = {
+      {"type", "capture_completion"}, {"version", 1},
+      {"grid_launch_id", 9},          {"kernel_completed", true},
+      {"channel_drained", true},      {"trace_records_written", 0},
+      {"dropped_records", 0},         {"errors", nlohmann::json::array({"graph_launch_completion_unverified"})},
+      {"status", "incomplete"}};
+  EXPECT_EQ(empty_rows.back(), expected);
+  const auto active_rows = records("graph_active");
+  ASSERT_EQ(active_rows.size(), 3);
+  EXPECT_EQ(active_rows.back()["trace_records_written"], 2);
+  EXPECT_EQ(active_rows.back()["status"], "incomplete");
+
+  queue.register_graph_launch(17);
+  queue.request_graph_completion(true, true, "");
+  const auto next = queue.take_at_chunk_boundary();
+  ASSERT_EQ(next.size(), 1);
+  EXPECT_EQ(next[0].launch_id, 17);
+  queue.request_graph_completion(true, true, "");
+  EXPECT_TRUE(queue.take_at_chunk_boundary().empty());
+}
+
+TEST_F(CaptureCompletionTest, GraphRequestPreservesLaunchFailureAfterSuccessfulDrain) {
+  CaptureCompletionQueue queue;
+  queue.register_graph_launch(4);
+  queue.request_graph_completion(false, true, "cuda_graph_launch_or_flush_failed");
+  const auto ready = queue.take_at_chunk_boundary();
+  ASSERT_EQ(ready.size(), 1);
+  EXPECT_EQ(ready[0].launch_id, 4);
+  EXPECT_FALSE(ready[0].kernel_completed);
+  EXPECT_TRUE(ready[0].channel_drained);
+  EXPECT_EQ(ready[0].error, "cuda_graph_launch_or_flush_failed");
 }
 
 }  // namespace
