@@ -273,6 +273,8 @@ This repository contains code under the MIT license (Meta) and the BSD-3-Clause 
 
 ## 📚 Documentation
 
+For trace capture, validation, and queries, see the [Python CLI guide](python/README.md#cli). Run `cutracer analyze --help` to see the analysis workflows available in your installed build.
+
 The full project documentation lives in [`docs/`](docs/) and is automatically
 synced to the [GitHub Wiki](https://github.com/facebookexperimental/CUTracer/wiki)
 on every push to `main` via
