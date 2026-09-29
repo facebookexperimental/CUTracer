@@ -13,6 +13,8 @@
 #   NVBIT_VERSION=latest ./install_third_party.sh   # Use latest NVBit
 #   NVBIT_VERSION=1.7.5 JSON_VERSION=3.10.0 ./install_third_party.sh
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 1
+
 # ============================================================
 # Configuration: Set default values if not provided
 # ============================================================
@@ -119,6 +121,13 @@ fi
 EXTRACTED_DIR=$(find "$TEMP_DIR" -maxdepth 1 -name "nvbit*" -type d | head -1)
 if [ -z "$EXTRACTED_DIR" ]; then
   echo "Error: Unable to find extracted NVBit directory."
+  rm -f "$TEMP_FILE"
+  rm -rf "$TEMP_DIR"
+  exit 1
+fi
+
+# Apply CUTracer's required channel fix before installing the downloaded tree.
+if ! bash "$SCRIPT_DIR/scripts/apply_nvbit_patches.sh" "$EXTRACTED_DIR"; then
   rm -f "$TEMP_FILE"
   rm -rf "$TEMP_DIR"
   exit 1

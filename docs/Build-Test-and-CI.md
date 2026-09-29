@@ -4,6 +4,8 @@
 - For a faster, targeted build, you can specify an architecture, e.g., `make ARCH=sm_90`.
 - `inject_funcs.cu` is compiled with special flags; `ptxas` version gates may alter `-maxrregcount`.
 
+The standalone build requires the `patch` utility. `install_third_party.sh` applies the producer publication fence missing from NVBit 1.8: each producer must publish its packet writes before advancing the channel tail. A fence in the flushing warp does not order writes from other warps. `make` also applies the patch to existing downloads and rebuilds the objects and embedded fatbins that use the channel. Already patched dependencies are accepted; an incompatible upstream channel stops the build for review. The patch is maintained in `scripts/patches/nvbit-channel-producer-fence.patch`.
+
 ### Build knobs (Makefile)
 
 These are the variables the top-level `Makefile` recognizes. They can be set

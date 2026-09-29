@@ -44,6 +44,9 @@ INCLUDE_DIR := include
 
 # NVBIT settings
 NVBIT_PATH=./third_party/nvbit/core
+NVBIT_CHANNEL=$(NVBIT_PATH)/utils/channel.hpp
+NVBIT_PATCH=scripts/patches/nvbit-channel-producer-fence.patch
+NVBIT_PATCH_STAMP=$(NVBIT_PATH)/.cutracer-channel-producer-fence
 PICOSHA2_PATH=./third_party/picosha2
 INCLUDES=-I$(NVBIT_PATH) -I./$(INCLUDE_DIR) -I./third_party -I$(PICOSHA2_PATH)
 
@@ -145,8 +148,16 @@ $(OBJ_DIR):
 $(LIB_DIR):
 	mkdir -p $@
 
+# Cover existing downloads as well as dependencies installed by the script.
+# Keep the stamp inside NVBit so reinstalling it also invalidates old objects.
+nvbit-patch: $(NVBIT_PATCH_STAMP)
+
+$(NVBIT_PATCH_STAMP): $(NVBIT_CHANNEL) scripts/apply_nvbit_patches.sh $(NVBIT_PATCH)
+	bash scripts/apply_nvbit_patches.sh "$(NVBIT_PATH)/.."
+	touch "$@"
+
 # Linking rule
-$(NVBIT_TOOL): $(OBJS) $(NVBIT_PATH)/libnvbit.a
+$(NVBIT_TOOL): $(OBJS) $(NVBIT_PATH)/libnvbit.a | $(LIB_DIR)
 	$(NVCC) -arch=$(ARCH) $(DEBUG_FLAGS) $(OBJS) $(LIBS) $(NVCC_PATH) -Wno-deprecated-gpu-targets -lcuda -lcudart_static -shared -Xcompiler -rdynamic -o $@
 
 # Compile tool_func/*.cu → *.fatbin
@@ -180,7 +191,12 @@ $(OBJ_DIR)/fb_%.o: $(FB_SRC_DIR)/%.cu
 $(OBJ_DIR)/fb_inject_funcs_fb.o: $(FB_INJECT_FUNCS_SRC)
 	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
+# The channel is inlined into injected functions and the embedded flush kernel.
+# A normal prerequisite both orders parallel builds and forces recompilation.
+$(OBJS) $(TOOL_FUNC_FATBINS): $(NVBIT_PATCH_STAMP)
+$(OBJS): | $(OBJ_DIR)
+
 clean:
 	rm -rf $(OBJ_DIR) $(LIB_DIR) $(TOOL_FUNC_DIR)/*.fatbin $(TOOL_FUNC_DIR)/*.c
 
-.PHONY: all clean dirs
+.PHONY: all clean dirs nvbit-patch
