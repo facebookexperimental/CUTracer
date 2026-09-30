@@ -17,7 +17,7 @@
 # Configuration: Set default values if not provided
 # ============================================================
 NVBIT_MIN_VERSION="1.8.1"
-NVBIT_VERSION="${NVBIT_VERSION:-$NVBIT_MIN_VERSION}"
+NVBIT_VERSION="${NVBIT_VERSION:-1.8.1$NVBIT_MIN_VERSION}"
 JSON_VERSION="${JSON_VERSION:-3.12.0}"
 RAPIDJSON_VERSION="${RAPIDJSON_VERSION:-1.1.0}"
 
