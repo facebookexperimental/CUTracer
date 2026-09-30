@@ -1,0 +1,67 @@
+name: Probe H100 CUDA availability
+
+# The branch-only push trigger lets us inspect the runner without merging a
+# diagnostic workflow into main. No CUDA packages are installed by this probe.
+on:
+  push:
+    branches: [probe/h100-cuda-13-3-20260929]
+    paths:
+      - .github/workflows/probe-h100-cuda.yml
+      - .ci/probe-h100-cuda.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: CUDA inventory (${{ matrix.lane }})
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: [linux-gcp-h100]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: meta-triton
+            conda_env: meta-triton
+          - lane: triton-nightly
+            conda_env: triton-main
+    env:
+      CONDA_ENV: ${{ matrix.conda_env }}
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Prepare probe output directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-probe/tmp" "$RUNNER_TEMP/cuda-probe/cache"
+          {
+            echo "PROBE_DIR=$RUNNER_TEMP/cuda-probe"
+            echo "TMPDIR=$RUNNER_TEMP/cuda-probe/tmp"
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/cuda-probe/cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Inspect base image before environment activation
+        run: |
+          python3 .ci/probe-h100-cuda.py --phase base-image --output "$PROBE_DIR/base-image.json" | tee "$PROBE_DIR/base-image.log"
+
+      - name: Inspect the runner-provided CI environment
+        # Use the same activation as test-h100.yml, before setup-h100.sh would
+        # install CUDA 13.0. This preserves evidence of the image's own tools.
+        run: |
+          # shellcheck disable=SC1090
+          . "$SETUP_SCRIPT"
+          python .ci/probe-h100-cuda.py --phase activated-venv --output "$PROBE_DIR/activated-venv.json" | tee "$PROBE_DIR/activated-venv.log"
+
+      - name: Upload CUDA inventory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: h100-cuda-probe-${{ matrix.lane }}
+          path: ${{ runner.temp }}/cuda-probe
+          if-no-files-found: error
+          retention-days: 30
