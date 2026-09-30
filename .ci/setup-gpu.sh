@@ -27,7 +27,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CUDA_VERSION="${CUDA_VERSION:-13.0}"
 INSTALL_CUDA_COMPAT="${INSTALL_CUDA_COMPAT:-0}"
 case "$CUDA_VERSION" in
-    13.0|13.3|13.4) ;;
+    13.0|13.4) ;;
     *) echo "::error::Unsupported CUDA_VERSION: $CUDA_VERSION"; exit 1 ;;
 esac
 case "$INSTALL_CUDA_COMPAT" in

@@ -2,7 +2,7 @@ name: CI Build and Test (B200)
 
 on:
   push:
-    branches: [main, develop, ci/b200-cuda-13-4-20260930]
+    branches: [main, develop]
     paths-ignore:
       - "*.md"
       - ".gitignore"
@@ -15,14 +15,6 @@ on:
       - "docs/**"
   workflow_dispatch:
     inputs:
-      cuda-version:
-        description: "CUDA toolkit and compatibility libraries"
-        required: true
-        default: "13.4"
-        type: choice
-        options:
-          - "13.4"
-          - "13.3"
       test-type:
         description: "Type of tests to run"
         required: true
@@ -43,7 +35,7 @@ permissions:
 
 jobs:
   build-and-test-b200:
-    name: build-and-test-b200 (${{ matrix.lane }}, CUDA ${{ inputs.cuda-version || '13.4' }})
+    name: build-and-test-b200 (${{ matrix.lane }}, CUDA 13.4)
     if: github.repository_owner == 'facebookexperimental'
     # Same runner label as facebookexperimental/triton's b200.yml.
     runs-on: [nvidia-dgx-b200]
@@ -57,6 +49,7 @@ jobs:
         include:
           - lane: meta-triton
             conda_env: meta-triton
+            # Match H100's Proton policy for the FB Triton environment.
             skip_proton: "1"
             expect_fb_fork: "1"
           - lane: triton-nightly
@@ -66,7 +59,7 @@ jobs:
     env:
       CONDA_ENV: ${{ matrix.conda_env }}
       SETUP_SCRIPT: /workspace/setup_instance.sh
-      CUDA_VERSION: ${{ inputs.cuda-version || '13.4' }}
+      CUDA_VERSION: "13.4"
       # The B200 host currently has an R580 driver. Matching compat libraries
       # provide PTX JIT support for the newer toolkit inside this CI pod.
       INSTALL_CUDA_COMPAT: "1"
