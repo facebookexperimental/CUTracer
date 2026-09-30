@@ -4,21 +4,20 @@
 # Script to download and install third-party dependencies for CUTracer
 #
 # Environment Variables:
-#   NVBIT_VERSION       - NVBit version (or "latest" for latest release)
+#   NVBIT_VERSION       - NVBit version >= 1.8.1 (or "latest" for latest release)
 #   JSON_VERSION        - nlohmann/json version
 #   RAPIDJSON_VERSION   - rapidjson release tag (header-only)
 #
 # Usage:
 #   ./install_third_party.sh                        # Use defaults
 #   NVBIT_VERSION=latest ./install_third_party.sh   # Use latest NVBit
-#   NVBIT_VERSION=1.7.5 JSON_VERSION=3.10.0 ./install_third_party.sh
-
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 1
+#   NVBIT_VERSION=1.8.1 JSON_VERSION=3.12.0 ./install_third_party.sh
 
 # ============================================================
 # Configuration: Set default values if not provided
 # ============================================================
-NVBIT_VERSION="${NVBIT_VERSION:-1.8}"
+NVBIT_MIN_VERSION="1.8.1"
+NVBIT_VERSION="${NVBIT_VERSION:-$NVBIT_MIN_VERSION}"
 JSON_VERSION="${JSON_VERSION:-3.12.0}"
 RAPIDJSON_VERSION="${RAPIDJSON_VERSION:-1.1.0}"
 
@@ -76,6 +75,14 @@ if [ -z "$TAG_CHECK" ]; then
   exit 1
 fi
 
+# Check the resolved tag before downloading or replacing the installed NVBit.
+NVBIT_VERSION="${TAG_CHECK#v}"
+if [[ ! "$NVBIT_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+  ! printf '%s\n' "$NVBIT_MIN_VERSION" "$NVBIT_VERSION" | LC_ALL=C sort -V -C; then
+  echo "Error: CUTracer requires a stable NVBit release >= $NVBIT_MIN_VERSION (resolved: $TAG_CHECK)." >&2
+  exit 1
+fi
+
 # Find the download link for the detected architecture
 DOWNLOAD_URL=$(echo "$RELEASE_INFO" | grep -o '"browser_download_url": "[^"]*'"$NVBIT_ARCH"'[^"]*\.tar\.bz2"' | cut -d'"' -f4)
 
@@ -121,13 +128,6 @@ fi
 EXTRACTED_DIR=$(find "$TEMP_DIR" -maxdepth 1 -name "nvbit*" -type d | head -1)
 if [ -z "$EXTRACTED_DIR" ]; then
   echo "Error: Unable to find extracted NVBit directory."
-  rm -f "$TEMP_FILE"
-  rm -rf "$TEMP_DIR"
-  exit 1
-fi
-
-# Apply CUTracer's required channel fix before installing the downloaded tree.
-if ! bash "$SCRIPT_DIR/scripts/apply_nvbit_patches.sh" "$EXTRACTED_DIR"; then
   rm -f "$TEMP_FILE"
   rm -rf "$TEMP_DIR"
   exit 1

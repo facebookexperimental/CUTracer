@@ -45,8 +45,8 @@ INCLUDE_DIR := include
 # NVBIT settings
 NVBIT_PATH=./third_party/nvbit/core
 NVBIT_CHANNEL=$(NVBIT_PATH)/utils/channel.hpp
-NVBIT_PATCH=scripts/patches/nvbit-channel-producer-fence.patch
-NVBIT_PATCH_STAMP=$(NVBIT_PATH)/.cutracer-channel-producer-fence
+NVBIT_HEADERS=$(wildcard $(NVBIT_PATH)/*.h $(NVBIT_PATH)/utils/*.h $(NVBIT_PATH)/utils/*.hpp)
+NVBIT_DEPENDENCY_STAMP=$(NVBIT_PATH)/.cutracer-build-deps
 PICOSHA2_PATH=./third_party/picosha2
 INCLUDES=-I$(NVBIT_PATH) -I./$(INCLUDE_DIR) -I./third_party -I$(PICOSHA2_PATH)
 
@@ -148,12 +148,9 @@ $(OBJ_DIR):
 $(LIB_DIR):
 	mkdir -p $@
 
-# Cover existing downloads as well as dependencies installed by the script.
-# Keep the stamp inside NVBit so reinstalling it also invalidates old objects.
-nvbit-patch: $(NVBIT_PATCH_STAMP)
-
-$(NVBIT_PATCH_STAMP): $(NVBIT_CHANNEL) scripts/apply_nvbit_patches.sh $(NVBIT_PATCH)
-	bash scripts/apply_nvbit_patches.sh "$(NVBIT_PATH)/.."
+# Keep the stamp inside NVBit so reinstalling it invalidates old objects even
+# when the release archive preserves header and library timestamps.
+$(NVBIT_DEPENDENCY_STAMP): $(NVBIT_CHANNEL) $(NVBIT_HEADERS) $(NVBIT_PATH)/libnvbit.a
 	touch "$@"
 
 # Linking rule
@@ -162,7 +159,7 @@ $(NVBIT_TOOL): $(OBJS) $(NVBIT_PATH)/libnvbit.a | $(LIB_DIR)
 
 # Compile tool_func/*.cu → *.fatbin
 $(TOOL_FUNC_DIR)/%.fatbin: $(TOOL_FUNC_DIR)/%.cu
-	$(NVCC) -arch=$(ARCH) $(INCLUDES) $(DEBUG_FLAGS) -Wno-deprecated-gpu-targets -fatbin $< -o $@
+	$(NVCC) -std=c++17 -arch=$(ARCH) $(INCLUDES) $(DEBUG_FLAGS) -Wno-deprecated-gpu-targets -fatbin $< -o $@
 
 # Convert *.fatbin → *.c (embedded as C byte array via bin2c)
 $(TOOL_FUNC_DIR)/%.c: $(TOOL_FUNC_DIR)/%.fatbin
@@ -175,7 +172,7 @@ $(REGULAR_OBJS): $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu $(TOOL_FUNC_BIN2CS)
 
 # Special rule for inject_funcs.cu
 $(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC)
-	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
+	$(NVCC) -std=c++17 $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # Compilation rule for C++ files
 $(OBJ_DIR)/cubin_identity.o: $(PICOSHA2_PATH)/picosha2.h
@@ -189,14 +186,14 @@ $(OBJ_DIR)/fb_%.o: $(FB_SRC_DIR)/%.cu
 
 # Special rule for inject_funcs_fb.cu (same flags as inject_funcs.cu for NVBit device functions)
 $(OBJ_DIR)/fb_inject_funcs_fb.o: $(FB_INJECT_FUNCS_SRC)
-	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
+	$(NVCC) -std=c++17 $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # The channel is inlined into injected functions and the embedded flush kernel.
 # A normal prerequisite both orders parallel builds and forces recompilation.
-$(OBJS) $(TOOL_FUNC_FATBINS): $(NVBIT_PATCH_STAMP)
+$(OBJS) $(TOOL_FUNC_FATBINS): $(NVBIT_DEPENDENCY_STAMP)
 $(OBJS): | $(OBJ_DIR)
 
 clean:
 	rm -rf $(OBJ_DIR) $(LIB_DIR) $(TOOL_FUNC_DIR)/*.fatbin $(TOOL_FUNC_DIR)/*.c
 
-.PHONY: all clean dirs nvbit-patch
+.PHONY: all clean dirs

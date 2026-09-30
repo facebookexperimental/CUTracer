@@ -47,6 +47,7 @@
 /* instrumentation functionality */
 #include "instrument.h"
 #include "instrument_metadata.h"
+#include "tma_registers.h"
 
 /* env config */
 #include "env_config.h"
@@ -632,8 +633,8 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
   // Reserve a private directory, then let NVBit create the file with the
   // caller's umask. mkstemp would leave the published cubin at mode 0600.
   const std::string temporary = temporary_dir + "/snapshot.cubin";
-  // NVBit 1.8 can return false after writing a valid cubin. Inspect the fresh
-  // file instead; a failed dump cannot reuse bytes from an earlier capture.
+  // Hash the fresh snapshot before publishing it; a failed dump cannot reuse
+  // bytes from an earlier capture.
   nvbit_dump_cubin(ctx, func, temporary.c_str());
   const std::string digest = cubin_file_sha256(temporary);
   if (digest.empty()) {
@@ -863,13 +864,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
           loprintf_v("  TMA_PARAM_HANDLE operand[%d]: ureg_nums=[%d,%d,%d,%d]\n", i, op->u.tma_param_handle.ureg_num[0],
                      op->u.tma_param_handle.ureg_num[1], op->u.tma_param_handle.ureg_num[2],
                      op->u.tma_param_handle.ureg_num[3]);
-          for (int t = 0; t < InstrType::MAX_TMA_REGS; t++) {
-            int ur = op->u.tma_param_handle.ureg_num[t];
-            if (ur < 0 || ur == InstrType::URZ) {
-              continue;
-            }
-            operands.ureg_nums.push_back(ur);
-          }
+          collect_tma_uniform_registers(*op, meta.sm_family, operands.ureg_nums);
         } else {
           loprintf_v("  Unhandled operand[%d] type=%s\n", i, InstrType::OperandTypeStr[(int)op->type]);
         }
@@ -1038,7 +1033,7 @@ void init_context_state(CUcontext ctx) {
   cudaMallocManaged(&ctx_state->channel_dev, sizeof(ChannelDev));
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, channel_buffer_size, ctx_state->channel_dev,
                                recv_thread_fun, ctx);
-  nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
+  nvbit_set_tool_thread(ctx_state->channel_host.get_thread_id());
 }
 
 /**
@@ -1630,6 +1625,8 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   kernel_launch_to_iter_map.clear();
 
   if (ctx_state->channel_dev != nullptr) {
+    // Unregister before destroy() joins the receiver and resets its thread ID.
+    nvbit_unset_tool_thread(ctx_state->channel_host.get_thread_id());
     ctx_state->channel_host.destroy(false);
     cudaFree(ctx_state->channel_dev);
   }
