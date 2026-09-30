@@ -170,9 +170,12 @@ $(TOOL_FUNC_DIR)/%.c: $(TOOL_FUNC_DIR)/%.fatbin
 $(REGULAR_OBJS): $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu $(TOOL_FUNC_BIN2CS)
 	$(NVCC) -dc -c -std=c++17 $(INCLUDES) -Xptxas -cloning=no -Wno-deprecated-gpu-targets -Xcompiler -Wall -arch=$(ARCH) $(DEBUG_FLAGS) -Xcompiler -fPIC $< -o $@
 
-# Special rule for inject_funcs.cu
-$(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC)
-	$(NVCC) -std=c++17 $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
+# CUDA 13.0 atomic helpers retain __assertfail under --keep-device-functions,
+# which NVBit cannot resolve in injected code. Keep NDEBUG local to injection
+# units so assertions in regular tool code remain enabled. Depend on Makefile
+# so changes to injection flags also invalidate existing objects.
+$(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC) Makefile
+	$(NVCC) -std=c++17 -DNDEBUG $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # Compilation rule for C++ files
 $(OBJ_DIR)/cubin_identity.o: $(PICOSHA2_PATH)/picosha2.h
@@ -185,8 +188,8 @@ $(OBJ_DIR)/fb_%.o: $(FB_SRC_DIR)/%.cu
 	$(NVCC) -dc -c -std=c++17 $(INCLUDES) -Xptxas -cloning=no -Wno-deprecated-gpu-targets -Xcompiler -Wall -arch=$(ARCH) $(DEBUG_FLAGS) -Xcompiler -fPIC $< -o $@
 
 # Special rule for inject_funcs_fb.cu (same flags as inject_funcs.cu for NVBit device functions)
-$(OBJ_DIR)/fb_inject_funcs_fb.o: $(FB_INJECT_FUNCS_SRC)
-	$(NVCC) -std=c++17 $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
+$(OBJ_DIR)/fb_inject_funcs_fb.o: $(FB_INJECT_FUNCS_SRC) Makefile
+	$(NVCC) -std=c++17 -DNDEBUG $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # The channel is inlined into injected functions and the embedded flush kernel.
 # A normal prerequisite both orders parallel builds and forces recompilation.

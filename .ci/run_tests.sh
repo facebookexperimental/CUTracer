@@ -178,6 +178,12 @@ build_cutracer() {
     return 1
   fi
 
+  local injected_objects=("$PROJECT_ROOT/obj/inject_funcs.o")
+  if [ -f "$PROJECT_ROOT/src/fb/inject_funcs_fb.cu" ]; then
+    injected_objects+=("$PROJECT_ROOT/obj/fb_inject_funcs_fb.o")
+  fi
+  bash "$PROJECT_ROOT/.ci/check_injected_device_symbols.sh" "${injected_objects[@]}" || return 1
+
   echo "✅ CUTracer library built successfully"
   ls -la "$PROJECT_ROOT/lib/"
   return 0
