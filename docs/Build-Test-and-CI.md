@@ -63,16 +63,17 @@ Key validations in tests:
 
 ## CI 🤖
 
-CI is defined in [`.github/workflows/test.yml`](../.github/workflows/test.yml)
-and runs on push to `main`/`develop` and on PRs to `main`. The `paths-ignore`
-list excludes `*.md`, `.gitignore`, and `docs/**`, so documentation-only
-changes do not trigger a full build/test cycle.
+The H100 and B200 CI workflows run on push to `main`/`develop` and on PRs to `main`. The `paths-ignore` list excludes `*.md`, `.gitignore`, and `docs/**`, so documentation-only changes do not trigger a full build/test cycle.
 
-| Job | Runner | What it does |
-|-----|--------|--------------|
-| `format-check` | `ubuntu-latest` | Installs `clang-format==21.1.2` and the Python dev extras, then runs `./format.sh check` |
-| `build-and-test (default)` / `build-and-test (nightly)` | `4-core-ubuntu-gpu-t4` | Matrix job over `triton: [default, nightly]`. Both legs build CUTracer via `bash .ci/setup.sh` (CUDA 12.8) and run the full suite via `bash .ci/run_tests.sh` (`TEST_TYPE=all`, `TIMEOUT=60`, `INSTALL_THIRD_PARTY=1`). The `nightly` leg first replaces PyTorch nightly's bundled `pytorch-triton` with the upstream `Triton-Nightly` wheel from OpenAI's Azure DevOps feed; it carries `continue-on-error: true` and is treated as a canary, since upstream Triton main can ABI-drift from the commit PyTorch nightly pins. Artifacts (per leg): vectoradd, py_add, proton_tests logs/traces |
-| `check-status` | `ubuntu-latest` | Aggregates the matrix `build-and-test` results. Fails the workflow if the required `default` leg failed; the `nightly` leg is non-blocking (canary) |
+| GPU workflow | Runner label | CUDA toolkit |
+|--------------|--------------|--------------|
+| [H100](../.github/workflows/test-h100.yml) | `linux-gcp-h100` | 13.0 |
+| [B200](../.github/workflows/test-b200.yml) | `nvidia-dgx-b200` | 13.4 |
 
-The `workflow_dispatch` trigger also exposes `test-type` (`all` /
-`build-only` / `vectoradd`) and `debug` (boolean) inputs for ad-hoc runs.
+The `workflow_dispatch` trigger also exposes `test-type` (`all` / `build-only` / `vectoradd`) and `debug` (boolean) inputs for ad-hoc runs.
+
+Both workflows use the runner-provided `meta-triton` and `triton-main` uv environments and run `.ci/run_tests.sh`. The `meta-triton` lane skips Proton; the `triton-nightly` lane uses `triton-main` and includes Proton. The B200 runner label is also used by [facebookexperimental/triton](https://github.com/facebookexperimental/triton/blob/main/.github/workflows/b200.yml).
+
+The shared [GPU setup script](../.ci/setup-gpu.sh) installs the selected CUDA toolkit and test dependencies. B200 sets `CUDA_VERSION=13.4` and `INSTALL_CUDA_COMPAT=1` to install `cuda-toolkit-13-4` and `cuda-compat-13-4`, with `/usr/local/cuda-13.4/compat` first in `LD_LIBRARY_PATH`. These [forward-compatibility libraries](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) provide CUDA 13.4 PTX JIT support with the runner's R580 host driver. The H100 entrypoint keeps its CUDA 13.0 default.
+
+Before building CUTracer, the B200 workflow verifies the toolkit version, CUDA initialization, B200 compute capability `(10, 0)`, and GPU arithmetic. It records the loaded CUDA driver library and Driver API version, plus the PyTorch and Triton versions. The runner-provided PyTorch currently uses a CUDA 13.0 build; its build version is recorded separately from the CUDA 13.4 toolkit used to compile CUTracer. Setup logs, environment details, test logs, and traces are uploaded as artifacts with a 30-day retention period.

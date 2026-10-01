@@ -1,0 +1,195 @@
+name: CI Build and Test (B200)
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-type:
+        description: "Type of tests to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "build-only"
+          - "vectoradd"
+      debug:
+        description: "Enable debug build"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test-b200:
+    name: build-and-test-b200 (${{ matrix.lane }}, CUDA 13.4)
+    if: github.repository_owner == 'facebookexperimental'
+    # Same runner label as facebookexperimental/triton's b200.yml.
+    runs-on: [nvidia-dgx-b200]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: meta-triton
+            conda_env: meta-triton
+            # Match H100's Proton policy for the FB Triton environment.
+            skip_proton: "1"
+            expect_fb_fork: "1"
+          - lane: triton-nightly
+            conda_env: triton-main
+            skip_proton: "0"
+            expect_fb_fork: "0"
+    env:
+      CONDA_ENV: ${{ matrix.conda_env }}
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      CUDA_VERSION: "13.4"
+      # The B200 host currently has an R580 driver. Matching compat libraries
+      # provide PTX JIT support for the newer toolkit inside this CI pod.
+      INSTALL_CUDA_COMPAT: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Prepare CI output directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/cutracer-b200-ci/"{logs,results,tmp,cache}
+          {
+            echo "CI_OUTPUT_DIR=$RUNNER_TEMP/cutracer-b200-ci"
+            echo "TMPDIR=$RUNNER_TEMP/cutracer-b200-ci/tmp"
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/cutracer-b200-ci/cache"
+            echo "UV_CACHE_DIR=$RUNNER_TEMP/cutracer-b200-ci/cache/uv"
+            echo "TRITON_CACHE_DIR=$RUNNER_TEMP/cutracer-b200-ci/cache/triton"
+            echo "CUDA_CACHE_PATH=$RUNNER_TEMP/cutracer-b200-ci/cache/cuda"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Inspect B200 host
+        run: nvidia-smi | tee "$CI_OUTPUT_DIR/logs/nvidia-smi.log"
+
+      - name: Activate runner-provided uv environment
+        run: |
+          # shellcheck disable=SC1090
+          . "$SETUP_SCRIPT"
+          {
+            echo "PATH=$PATH"
+            echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "TRITONBENCH_PYTORCH_REPO_PATH=${TRITONBENCH_PYTORCH_REPO_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify Triton lane
+        env:
+          EXPECT_FB_FORK: ${{ matrix.expect_fb_fork }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import torch
+          import triton
+
+          print(f"python: {sys.executable}")
+          print(f"torch: {torch.__version__} (build CUDA={torch.version.cuda})")
+          print(f"triton: {triton.__version__} ({triton.__file__})")
+          expect_fb = os.environ["EXPECT_FB_FORK"] == "1"
+          assert expect_fb == ("fb" in triton.__version__), "Triton lane mismatch"
+          PY
+
+      - name: Install CUDA toolkit, compatibility libraries, and test dependencies
+        run: bash .ci/setup-gpu.sh 2>&1 | tee "$CI_OUTPUT_DIR/logs/setup.log"
+
+      - name: Verify CUDA toolchain and B200 runtime
+        run: |
+          python - <<'PY'
+          import ctypes
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import torch
+          import triton
+
+          version = os.environ["CUDA_VERSION"]
+          nvcc = subprocess.check_output(["nvcc", "--version"], text=True)
+          assert re.search(rf"release {re.escape(version)},", nvcc), nvcc
+          cuda = ctypes.CDLL("libcuda.so.1")
+          status = cuda.cuInit(0)
+          assert status == 0, f"cuInit failed: {status}"
+          driver_api = ctypes.c_int()
+          assert cuda.cuDriverGetVersion(ctypes.byref(driver_api)) == 0
+          major, minor = map(int, version.split("."))
+          assert driver_api.value >= major * 1000 + minor * 10, driver_api.value
+          assert torch.cuda.is_available(), "CUDA is unavailable to PyTorch"
+          device = torch.cuda.get_device_name(0)
+          capability = torch.cuda.get_device_capability(0)
+          assert "B200" in device and capability == (10, 0), (device, capability)
+          values = torch.arange(1024, dtype=torch.float32, device="cuda")
+          torch.testing.assert_close((values + values).cpu(), torch.arange(1024, dtype=torch.float32) * 2)
+          report = {
+              "gpu": device,
+              "compute_capability": capability,
+              "cuda_toolkit": version,
+              "nvcc": nvcc.strip(),
+              "driver_api_version": driver_api.value,
+              "torch": torch.__version__,
+              "torch_build_cuda": torch.version.cuda,
+              "triton": triton.__version__,
+              "triton_path": triton.__file__,
+              "libcuda_paths": sorted({line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if "/libcuda.so" in line}),
+          }
+          print(json.dumps(report, indent=2))
+          (Path(os.environ["CI_OUTPUT_DIR"]) / "results/environment.json").write_text(json.dumps(report, indent=2) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"### B200 / {os.environ['CONDA_ENV']}\n\n")
+              summary.write(f"- GPU: {device}, compute capability {capability}\n")
+              summary.write(f"- CUDA toolkit: {version}; CUDA Driver API: {driver_api.value}\n")
+              summary.write(f"- PyTorch: {torch.__version__}, built with CUDA {torch.version.cuda}\n")
+              summary.write(f"- Triton: {triton.__version__}\n")
+              summary.write("- CUDA initialization and GPU arithmetic: passed\n")
+          PY
+
+      - name: Build CUTracer and run tests
+        env:
+          TEST_TYPE: ${{ inputs.test-type || 'all' }}
+          DEBUG: ${{ inputs.debug && '1' || '0' }}
+          TIMEOUT: 60
+          INSTALL_THIRD_PARTY: 1
+          SKIP_CONDA: 1
+          SKIP_PROTON: ${{ matrix.skip_proton }}
+        run: bash .ci/run_tests.sh 2>&1 | tee "$CI_OUTPUT_DIR/logs/tests.log"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-b200-cuda${{ env.CUDA_VERSION }}-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/cutracer-b200-ci/logs
+            ${{ runner.temp }}/cutracer-b200-ci/results
+            tests/**/*.log
+            tests/**/*.sass
+            tests/**/*.ndjson
+            tests/**/*.zst*
+            tests/**/*.csv
+          retention-days: 30
