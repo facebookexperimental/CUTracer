@@ -991,7 +991,7 @@ def launch_kernel(tritonparse_path):
             NUM_MMA_SLICES=NUM_MMA_SLICES,
             GROUP_SIZE_N=GROUP_SIZE_N,
             num_warps=4,
-            num_stages=0,
+            num_stages=1,
             num_ctas=1,
         )
         torch.cuda.synchronize()
