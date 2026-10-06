@@ -184,12 +184,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-artifacts-b200-cuda${{ env.CUDA_VERSION }}-${{ matrix.lane }}
+          # Keep diagnostic logs and summaries. kernel_*.log files are full traces.
           path: |
             ${{ runner.temp }}/cutracer-b200-ci/logs
             ${{ runner.temp }}/cutracer-b200-ci/results
             tests/**/*.log
-            tests/**/*.sass
-            tests/**/*.ndjson
-            tests/**/*.zst*
+            tests/**/*_warp_status_summary.ndjson
             tests/**/*.csv
+            !tests/**/kernel_*.log
           retention-days: 30
