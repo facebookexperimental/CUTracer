@@ -34,7 +34,7 @@ matters when reproducing or reporting it.
 | `ptxas` (CUDA toolkit) | release 13.0, V13.0.88 |
 | `cuobjdump` / `nvdisasm` | CUDA 13.0 |
 | PyTorch | 2.13.0.dev20260611+cu130 (nightly) |
-| Triton | 3.7.1 |
+| Triton | 3.7.1+git5d6048aa (bundled with the nightly; see [Setup](#setup)) |
 | Python | 3.14.4 |
 | `compute-sanitizer` | CUDA 13.0 |
 
@@ -64,11 +64,33 @@ out of bounds. Confirmed `ptxas`: `DISABLE_PTXAS_OPT=1` on the same PTX gives
 
 ## How to reproduce
 
+### Setup
+
+The bug only reproduces with the Triton build bundled with the PyTorch nightly
+above, `3.7.1+git5d6048aa`. The released Triton 3.7.1 differs only in its LLVM
+pin, but that changes the generated PTX enough that `ptxas` no longer
+miscompiles it. That nightly has been pruned, so the wheel is mirrored in this
+repo's
+[`deps/triton-3.7.1-git5d6048aa`](https://github.com/facebookexperimental/CUTracer/releases/tag/deps/triton-3.7.1-git5d6048aa)
+release:
+
+```bash
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install torch==2.13.0 numpy --index-url https://download.pytorch.org/whl/cu130
+pip uninstall -y triton
+pip install --no-deps https://github.com/facebookexperimental/CUTracer/releases/download/deps%2Ftriton-3.7.1-git5d6048aa/triton-3.7.1+git5d6048aa-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+```
+
+Triton's bundled `ptxas` (13.1) also miscompiles this PTX, so no CUDA 13.0
+toolkit is needed for the crash itself.
+
+### Run
+
 Plain run (no CUTracer) -- hard crash:
 
 ```bash
 python mini_repro_bwd_weight.py
-# RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
+# torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 ```
 
 Confirm it is a ptxas optimizer bug (same PTX, optimizer off -> clean):
