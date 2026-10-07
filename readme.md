@@ -67,11 +67,35 @@ make -j$(nproc)
 
 ## Quickstart
 
-### 1. Install the Python CLI
+### 1. Install the Python packages from PyPI
 
 ```bash
-cd ~/CUTracer/python
-pip install .
+python3 -m venv .venv && source .venv/bin/activate   # Python 3.10-3.13
+
+pip install torch==2.13.0 numpy --index-url https://download.pytorch.org/whl/cu130
+
+# fbtriton is Meta's Triton fork with TLX. It ships the same `triton` package
+# as the upstream Triton that torch pulls in, so swap one for the other.
+pip uninstall -y triton
+pip install --no-deps fbtriton
+
+# Nightly CLI: matches the trace format of a cutracer.so built from main.
+pip install --pre cutracer
+```
+
+The `cutracer` wheel contains the CLI only; `cutracer.so` still has to be
+built from this repo (see [Installation](#installation)). The latest stable
+release, `cutracer==0.3.0`, cannot validate traces from a `cutracer.so` built
+from main. To use it, build `cutracer.so` from the `v0.3.0` tag instead.
+
+To use the CLI from a source checkout instead: `cd ~/CUTracer/python && pip install .`
+
+Smoke test from the repo root:
+
+```bash
+cutracer trace -i mem_addr_trace -k triton_poi_fused -o /tmp/ct_quickstart \
+  -- python tests/py_add/test_add.py
+cutracer validate "$(ls /tmp/ct_quickstart/*.ndjson | head -1)"
 ```
 
 ### 2. Run your CUDA app with CUTracer
