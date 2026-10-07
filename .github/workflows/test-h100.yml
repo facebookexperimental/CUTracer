@@ -179,18 +179,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-artifacts-h100-cuda13.0-${{ matrix.lane }}
+          # Keep diagnostic logs and summaries. kernel_*.log files are full traces.
           path: |
-            tests/vectoradd/*.sass
-            tests/vectoradd/*.log
-            tests/vectoradd/*.ndjson
-            tests/vectoradd/*.ndjson.zstd
-            tests/py_add/*.log
-            tests/py_add/*.sass
-            tests/py_add/*.ndjson
-            tests/py_add/*.ndjson.zstd
-            tests/py_add/mode*_validation.log
-            tests/py_add/mode*_run.log
-            tests/py_add/mode1_decompressed.ndjson
-            tests/proton_tests/*.log
-            tests/proton_tests/*.sass
-            tests/proton_tests/*.csv
+            tests/**/*.log
+            tests/**/*_warp_status_summary.ndjson
+            tests/**/*.csv
+            !tests/**/kernel_*.log
