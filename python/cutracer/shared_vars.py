@@ -5,6 +5,6 @@
 import importlib.util
 
 
-def is_fbcode():
+def is_fbcode() -> bool:
     """Check if running in fbcode environment."""
     return importlib.util.find_spec("cutracer.analyze.fb") is not None
