@@ -7,12 +7,16 @@ on:
       - "*.md"
       - ".gitignore"
       - "docs/**"
+      - "agentic/**"
+      - "examples/**"
   pull_request:
     branches: [main]
     paths-ignore:
       - "*.md"
       - ".gitignore"
       - "docs/**"
+      - "agentic/**"
+      - "examples/**"
   workflow_dispatch:
     inputs:
       test-type:
