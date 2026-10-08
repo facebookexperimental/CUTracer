@@ -28,6 +28,7 @@ pip-wheel-metadata/
 *.ipynb
 .env/
 .venv/
+.venv-format/
 env/
 venv/
 # End of Python specific

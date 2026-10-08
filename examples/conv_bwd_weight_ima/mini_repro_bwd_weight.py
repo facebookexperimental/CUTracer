@@ -31,7 +31,7 @@ def triton_convolution2d_bwd_weight(arg_X, arg_dY, out_ptr0):
     STRIDE_W: tl.constexpr = 1
     DILATION_H: tl.constexpr = 2
     DILATION_W: tl.constexpr = 2
-    GROUPS: tl.constexpr = 1
+    GROUPS: tl.constexpr = 1  # noqa: F841
     ALLOW_TF32: tl.constexpr = False
     BLOCK_M: tl.constexpr = 256
     BLOCK_N: tl.constexpr = 16
