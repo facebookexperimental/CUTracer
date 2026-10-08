@@ -13,11 +13,16 @@ from cutracer.analyze.cli import analyze_command
 from cutracer.compute_sanitizer.cli import compute_sanitizer_command
 from cutracer.query.cli import query_command, sass_command
 from cutracer.reduce.cli import reduce_command
-from cutracer.runner import trace_command
 from cutracer.runtime_version import get_runtime_version
 from cutracer.service.cli import diagnose_command
+from cutracer.shared_vars import is_fbcode
 from cutracer.stress.cli import stress_command
 from cutracer.validation.cli import compare_command, validate_command
+
+if is_fbcode():
+    from cutracer.fb.runner import trace_command
+else:
+    from cutracer.runner import trace_command
 
 EXAMPLES = """
 Examples:

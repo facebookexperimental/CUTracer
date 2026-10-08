@@ -55,7 +55,7 @@ class InstrumentationConfig:
     cpu_callstack: Optional[str] = None
     channel_records: Optional[int] = None
     kernel_events: Optional[str] = None
-    dump_cubin: bool = False
+    dump_cubin: Optional[bool] = False
     trace_size_limit_mb: int = 0
     kernel_timeout_s: int = 0
     no_data_timeout_s: int = 15
@@ -407,7 +407,7 @@ def _resolve_and_build_env(
         cpu_callstack=config.cpu_callstack,
         channel_records=config.channel_records,
         kernel_events=config.kernel_events,
-        dump_cubin=config.dump_cubin,
+        dump_cubin=bool(config.dump_cubin),
         trace_size_limit_mb=config.trace_size_limit_mb,
         kernel_timeout_s=config.kernel_timeout_s,
         no_data_timeout_s=config.no_data_timeout_s,
@@ -427,6 +427,16 @@ def run_instrumented_target(
         raise ValueError("instrumented target argv must not be empty")
 
     _so_path, run_env = _resolve_and_build_env(config, reject_inherited_injection=False)
+    return _run_with_environment(argv, config, run_env, runner=runner)
+
+
+def _run_with_environment(
+    argv: Sequence[str],
+    config: InstrumentationConfig,
+    run_env: Mapping[str, str],
+    *,
+    runner: Optional[RunTarget] = None,
+) -> "subprocess.CompletedProcess[str]":
     command: object
     if config.shell:
         import shlex
