@@ -1,0 +1,29 @@
+diff --git a/kernel/blackwell_fa_ws_pipelined_persistent.py b/kernel/blackwell_fa_ws_pipelined_persistent.py
+index 816108a1c..a44e2f0ce 100644
+--- a/kernel/blackwell_fa_ws_pipelined_persistent.py
++++ b/kernel/blackwell_fa_ws_pipelined_persistent.py
+@@ -1935,6 +1935,9 @@ def _bwd_compute_inner_loop(
+ ):
+     start_block_n = start_n * BLOCK_N1
+     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
++    QK_READ_DONE_BAR: tl.constexpr = 10
++    DP_READ_DONE_BAR: tl.constexpr = 11
++    NUM_COMPUTE_THREADS: tl.constexpr = 8 * 32
+     if num_steps_override > 0:
+         num_steps = num_steps_override
+     else:
+@@ -1962,5 +1965,6 @@ def _bwd_compute_inner_loop(
+         # Store P to TMEM.
+         ppT = pT.to(do_out_dtype)
++        tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
+         # P aliases the QK TMEM region, so qk_empties (which frees that region for
+         # reuse) must be signaled after P is stored, not before. The
+@@ -1982,6 +1986,7 @@ def _bwd_compute_inner_loop(
+         tlx.barrier_arrive(d_empties[d_buf_id])
+         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+         dsT = dsT.to(q_out_dtype)
++        tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
+         # for reuse) must be signaled after dsT is stored, not before. The

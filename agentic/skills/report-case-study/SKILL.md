@@ -63,6 +63,11 @@ When the investigation was blind, preserve two phases:
 Do not rewrite the first phase as if the investigator knew the answer. Do not
 use later evidence to strengthen an earlier CUTracer verdict.
 
+When a human-authored report exists, keep it hidden during the blind phase.
+Compare it with the frozen agent conclusion only after the post-investigation
+reveal. Record agreements, contradictions, and evidence that the agent missed.
+Do not import a human claim into the agent evidence ledger.
+
 ## 2. Choose the narrowest defensible conclusion
 
 Select one report status:
@@ -137,20 +142,48 @@ Every report needs:
 1. a title in this form: `CUTracer investigates <exact symptom> in
    <kernel/operator/component> [on <platform>]: <confirmed cause or narrowest
    proven boundary>`;
-2. a status with a durable code pointer to the relevant `examples/` or `tests/`
-   entry when one exists;
+2. a status plus concise tags for the tool, subsystem, failure class, platform,
+   and kernel or operator terms that agents will search;
 3. a short human TL;DR in this order: symptom, conclusion, outcome, and CUTracer
    contribution;
-4. a case identity table with the recognition signature, affected component,
-   platform, discriminating test, validated action, and durable reproducer;
+4. a compact case identity table with the durable reproducer, affected
+   component or configuration, recognition signature, and validated action;
 5. portable reproduction instructions;
 6. an evidence summary from observation to conclusion;
 7. resolution and matched validation.
+
+When a human-authored report exists, add a comparison section after the blind
+or historical validation. Compare the investigation boundaries and evidence,
+not writing quality. State:
+
+- which conclusions agree;
+- which finding units differ, such as one static site versus one finding per
+  CTA;
+- what the agent found that the human report did not record;
+- what the agent missed or left unproven; and
+- which additional test, detector, sibling case, or tool would have closed
+  each material gap.
+
+Respect the target report's audience. A public case study must not link a
+private human report or copy private-only paths and measurements. Name the
+report without a link, use a public equivalent when one exists, and include
+only facts that are public or cleared for publication.
+
+Keep omissions distinct from errors. A narrower agent conclusion can be
+correct and incomplete. Do not call unrequested performance work or a broader
+sibling survey a diagnostic failure, but record the missing coverage when it
+changes how readers use the result.
 
 Do not add a generic scope, limitations, or artifacts section. Put each useful
 limit beside the affected claim. Link each decisive artifact where the report
 uses it. Omit limitations and artifact inventories that do not change how a
 reader interprets or reproduces the result.
+
+Keep the case identity table small. Add a platform only when it selects the
+affected path. Add software versions or artifact checksums only when they are
+part of the defect boundary or are needed to distinguish compared artifacts.
+Do not repeat details that the symptom, evidence, or validation sections make
+clear.
 
 Reproduction instructions must work for the intended audience. Include the
 dependency or wheel installation commands and the run command. Link the
@@ -159,8 +192,32 @@ repository for a public report. Do not expose private repository paths in a
 public report. Do not present a host-specific virtual environment or
 session-local script path as the reproduction command.
 
+For a TLX case, install the `fbtriton` wheel from PyPI. The distribution name
+is `fbtriton`, and it provides the `triton` Python import. Install it after
+PyTorch if PyTorch installs another Triton distribution. Pin `fbtriton` only
+when the compiler version is part of the defect boundary or reproducibility
+requires it. Otherwise install the current wheel and record the tested version
+as environment evidence. Do not tell the audience to build fbtriton from
+source or install the upstream `triton` PyPI package unless the case requires a
+specific compiler revision that is unavailable as an `fbtriton` wheel.
+
 Add a timeline only when sequence or elapsed time teaches something. When
 artifact timestamps are available, use a table with rounded `T+N min` values.
+Place the timeline immediately after the TL;DR so readers can scan the result
+and investigation sequence together.
+State the total investigation time above the table. Tie that duration to the
+last milestone that the report claims.
+List the coding-agent client and model beside the total time. If the runtime
+does not expose the model in the agent response, inspect the session trajectory
+or runtime metadata for its exact model identifier. Use the narrowest available
+model family and state that limitation only when the trajectory also omits the
+exact model. Do not infer an exact model.
+
+If a subagent performed the investigation, inspect that subagent's trajectory
+and record the coding agent and model shown there. Do not infer them from the
+parent agent or the later report-writing session. If the trajectory does not
+contain an exact model, state that it is unavailable.
+
 Mark when the immediate root cause was localized. Mark later confirmation of
 the defect boundary separately. Do not invent elapsed times.
 
@@ -177,6 +234,11 @@ Verify all of the following:
 - The title, TL;DR, body, and status use the same conclusion and scope.
 - Each case-specific fact comes from an inspected input or produced artifact.
 - Current and historical evidence are labeled separately.
+- A human report, when available, is compared only after the blind conclusion
+  and does not retroactively change the agent evidence.
+- The human comparison identifies material agent omissions and the test or
+  evidence needed to close them.
+- A public report does not link or quote a private human report.
 - Root cause, runtime manifestation, detector verdict, and resolution are not
   conflated.
 - Every number has a unit, a denominator when applicable, and an evidence
@@ -190,6 +252,8 @@ Verify all of the following:
 - The status links the relevant `examples/` or `tests/` code when it exists.
 - The TL;DR uses symptom, conclusion, outcome, and CUTracer contribution order.
 - Commands include portable setup and are runnable or explicitly illustrative.
+- TLX setup uses the PyPI `fbtriton` wheel. It pins the wheel only when the
+  compiler version is relevant to the defect boundary.
 - Public reports contain no private repository paths or source links.
 - Session-local paths are not presented as durable links.
 - The CUTracer contribution section emphasizes decisive contributions.
