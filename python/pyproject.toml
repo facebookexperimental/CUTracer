@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 [build-system]
-requires = ["setuptools>=64", "wheel", "setuptools-scm>=8.0.0"]
+requires = ["setuptools>=77", "wheel", "setuptools-scm>=8.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -42,6 +42,7 @@ cutracer = "cutracer.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cutracer*"]
+exclude = ["cutracer.fb", "cutracer.fb.*", "cutracer.*.fb", "cutracer.*.fb.*"]
 
 [tool.setuptools.package-data]
 "cutracer.validation.schemas" = ["*.json"]

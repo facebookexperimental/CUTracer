@@ -1,0 +1,3 @@
+prune cutracer/fb
+prune cutracer/analyze/fb
+prune tests/fb
