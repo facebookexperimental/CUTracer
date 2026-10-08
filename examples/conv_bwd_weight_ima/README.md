@@ -125,6 +125,7 @@ buck2 run //triton/tools/CUTracer:cutracer -c fbcode.nvcc_arch=b200a -- trace \
 
 | File | Description |
 |------|-------------|
+| `Investigation.md` | Blind investigation report with evidence, decision timeline, and post-investigation validation. |
 | `mini_repro_bwd_weight.py` | Standalone reproducer (torch + triton only). |
 | `example_mem_addr_excerpt.txt` | `mem_addr_trace` excerpt: the 32 lane addresses at `pc=0x2120` for thread (0,0,0), showing the ~17 GB OOB read. |
 | `example_reg_trace_excerpt.txt` | `reg_trace` excerpt: register-by-register provenance of the bad address (negative halo index `R35=-16`, corrupted high word `R21=0xfffa`). |

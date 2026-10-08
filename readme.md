@@ -130,6 +130,13 @@ cutracer validate output.ndjson
 > CUDA_INJECTION64_PATH=~/CUTracer/lib/cutracer.so ./your_app
 > ```
 
+## Agent skills
+
+Reusable CUTracer workflows for Codex, Claude, Muse, and other coding agents
+live under [`agentic/skills/`](agentic/README.md). The directory is the
+canonical source. Agents install or register matching skills with their own
+supported loader before use.
+
 ## Configuration (env vars)
 
 -   `CUTRACER_INSTRUMENT`: comma-separated modes: `opcode_only`, `reg_trace`, `mem_trace`, `random_delay`
