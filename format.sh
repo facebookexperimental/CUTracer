@@ -11,8 +11,34 @@
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 cd -- "$SCRIPT_DIR" || exit
 
+# --- Create the pinned formatter environment on first use ---
+FORMAT_REQUIREMENTS="$SCRIPT_DIR/requirements-format.txt"
+FORMAT_VENV="${CUTRACER_FORMAT_VENV:-$SCRIPT_DIR/.venv-format}"
+FORMAT_PYTHON="${CUTRACER_FORMAT_PYTHON:-python3}"
+FORMAT_REQUIREMENTS_ID=$(cksum "$FORMAT_REQUIREMENTS" | awk '{print $1 "-" $2}')
+FORMAT_ENV_MARKER="$FORMAT_VENV/.requirements-$FORMAT_REQUIREMENTS_ID"
+
+if [ ! -x "$FORMAT_VENV/bin/python" ] || [ ! -f "$FORMAT_ENV_MARKER" ]; then
+  echo "🔧  Preparing formatter environment in $FORMAT_VENV..."
+  if command -v uv &>/dev/null; then
+    if [ ! -x "$FORMAT_VENV/bin/python" ]; then
+      uv venv --python "$FORMAT_PYTHON" "$FORMAT_VENV" || exit 1
+    fi
+    uv pip install --python "$FORMAT_VENV/bin/python" --requirement "$FORMAT_REQUIREMENTS" || exit 1
+  else
+    if [ ! -x "$FORMAT_VENV/bin/python" ]; then
+      "$FORMAT_PYTHON" -m venv "$FORMAT_VENV" || exit 1
+    fi
+    "$FORMAT_VENV/bin/python" -m pip install --requirement "$FORMAT_REQUIREMENTS" || exit 1
+  fi
+  touch "$FORMAT_ENV_MARKER"
+fi
+
+export PATH="$FORMAT_VENV/bin:$PATH"
+
 # --- Check for dependencies ---
 CLANG_FORMAT_VERSION="21.1.2"
+RUFF_LINT_RULES="E4,E7,E9,F"
 
 if ! command -v clang-format &>/dev/null; then
   echo "❌ Error: clang-format is not installed or not in your PATH." >&2
@@ -40,12 +66,13 @@ FILE_PATTERNS=(-name "*.h" -o -name "*.hpp" -o -name "*.cpp" -o -name "*.cu" -o 
 # Function to process a single file.
 # It checks if a file needs formatting, formats it if necessary,
 # and prints the filename to stdout if it was changed.
+# shellcheck disable=SC2317  # Invoked by xargs through an exported function.
 format_and_report_changes() {
   file="$1"
   # Use diff to compare the original file with clang-format's output.
   # If they differ, format the file in-place and print its name.
   if ! diff -q "${file}" <(clang-format "${file}") >/dev/null; then
-    clang-format -i "${file}"
+    clang-format -i "${file}" || return 1
     echo "${file}"
   fi
 }
@@ -57,16 +84,22 @@ python_check() {
   local failed=0
 
   if command -v ufmt &>/dev/null; then
-    ufmt check .
-    [ $? -eq 0 ] || failed=1
+    if ! ufmt check .; then
+      failed=1
+    fi
   else
     echo "❌ ufmt not found (required for Python formatting)." >&2
     failed=1
   fi
 
   if command -v ruff &>/dev/null; then
-    ruff check . --diff
-    [ $? -eq 0 ] || failed=1
+    if ! ruff format --check .; then
+      failed=1
+    fi
+
+    if ! ruff check --select "$RUFF_LINT_RULES" . --diff; then
+      failed=1
+    fi
   else
     echo "❌ ruff not found (required for Python linting)." >&2
     failed=1
@@ -76,19 +109,32 @@ python_check() {
 }
 
 python_format() {
+  local failed=0
+
   if command -v ufmt &>/dev/null; then
     echo "🎨  Formatting Python code with ufmt..."
-    ufmt format .
+    if ! ufmt format .; then
+      failed=1
+    fi
   else
-    echo "⚠️  ufmt not found; skipping formatting." >&2
+    echo "❌ ufmt not found (required for Python formatting)." >&2
+    failed=1
   fi
 
   if command -v ruff &>/dev/null; then
     echo "🔧  Fixing Python linting issues with ruff..."
-    ruff check . --fix
+    if ! ruff check --select "$RUFF_LINT_RULES" . --fix; then
+      failed=1
+    fi
+    if ! ruff format .; then
+      failed=1
+    fi
   else
-    echo "⚠️  ruff not found; skipping lint fixes." >&2
+    echo "❌ ruff not found (required for Python linting)." >&2
+    failed=1
   fi
+
+  return $failed
 }
 
 # Function to print usage instructions
@@ -157,6 +203,7 @@ format)
   # The output will be a list of files that were actually changed.
   CHANGED_FILES=$(find "${EXISTING_DIRS[@]}" -type f \( "${FILE_PATTERNS[@]}" \) -print0 | \
     xargs -0 -P 0 -I {} bash -c 'format_and_report_changes "{}"')
+  CXX_STATUS=$?
 
   if [ -n "$CHANGED_FILES" ]; then
     echo "✨ Changed files:"
@@ -168,6 +215,11 @@ format)
 
   # Python formatting
   python_format
+  PY_STATUS=$?
+
+  if [ $CXX_STATUS -ne 0 ] || [ $PY_STATUS -ne 0 ]; then
+    exit 1
+  fi
 
   echo "✅  Formatting complete."
   ;;

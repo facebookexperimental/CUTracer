@@ -1,0 +1,16 @@
+---
+repos:
+  - repo: local
+    hooks:
+      - id: cutracer-format
+        name: CUTracer format and lint
+        entry: ./format.sh format
+        language: system
+        pass_filenames: false
+        files: >-
+          (?x)(
+            ^format\.sh$|
+            ^requirements-format\.txt$|
+            ^pyproject\.toml$|
+            \.(c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx|py)$
+          )

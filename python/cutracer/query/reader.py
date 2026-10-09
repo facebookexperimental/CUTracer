@@ -51,8 +51,8 @@ def _parse_single_filter(expr: str) -> Callable[[TraceRecord], bool]:
     try:
         int_value: Any = int(value, 0)
         # Match both string and int representations for backward compatibility
-        return (
-            lambda record: record.get(field) == value or record.get(field) == int_value
+        return lambda record: (
+            record.get(field) == value or record.get(field) == int_value
         )
     except ValueError:
         pass
