@@ -1,0 +1,37 @@
+Baseline, affected source:
+iteration 1: pass
+RACE REPRODUCED on iteration 2: dq: mismatches=1393, max_abs=0.135401, dk: mismatches=1453, max_abs=0.159302, dv: mismatches=1038, max_abs=0.0756836
+
+PyPI fbtriton 3.7.4 portable-setup revalidation:
+iterations 1-3: pass
+RACE REPRODUCED on iteration 4: dq: mismatches=1393, max_abs=0.135401, dk: mismatches=1453, max_abs=0.159302, dv: mismatches=1038, max_abs=0.0756836
+
+CUTracer stress summary:
+baseline requested/completed/reproduced: 5/5/0
+completed trials/reproductions: 61/1
+trigger: warp group 0, delay 50000 ns, enable probability 1.0
+saved configuration replay: reproduced
+
+Corrected CUTracer reduction:
+delay points: 600 -> 1
+essential point: PC 0x5000, STSM.16.M88.4 [R0+0x35800], R40
+independent saved-config replays: 3/3 reproduced
+
+Rejected release-order controls:
+late dq_empties release, natural run: reproduced on iteration 3
+late dq_empties release, targeted perturbation: reproduced on iteration 1
+late dp_empties release, natural run: reproduced on iteration 3
+
+Targeted affected source:
+RACE REPRODUCED on iteration 1: dq: mismatches=1363, max_abs=0.120339, dk: mismatches=1449, max_abs=0.129639, dv: mismatches=1167, max_abs=0.178467
+
+Blind QK/P barrier control:
+natural iterations: 100/100 passed
+targeted 50000 ns WG0 perturbation: 5/5 passed
+CUTracer detector findings: 0, down from 256 on affected source
+
+Two-barrier control derived from the historical fix, tested after reveal:
+natural iterations: 100/100 passed
+targeted perturbation: not rerun
+CUTracer detector: not rerun
+complete public fix: not backported or tested by this investigation

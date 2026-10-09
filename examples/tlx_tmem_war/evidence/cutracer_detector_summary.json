@@ -1,0 +1,59 @@
+{
+  "provenance": "Selected fields from complete CUTracer capture-completion records and intra_wg_tmem_war JSON reports.",
+  "affected": {
+    "kernel": {
+      "name": "_attn_bwd_ws",
+      "checksum": "5351267c2d3ba402",
+      "grid_dims": [8, 8, 4],
+      "block_dims": [512, 1, 1],
+      "warps_per_cta": 16,
+      "sm_family": 100
+    },
+    "capture_completion": {
+      "status": "complete",
+      "kernel_completed": true,
+      "channel_drained": true,
+      "trace_records_written": 16267429,
+      "dropped_records": 0,
+      "errors": []
+    },
+    "detector": {
+      "name": "intra_wg_tmem_war",
+      "finding_count": 256,
+      "aggregation_unit": "CTA",
+      "launched_ctas": 256,
+      "representative_finding": {
+        "cta": [0, 0, 0],
+        "store_pc": "0x1c60",
+        "store_base": "UR6",
+        "read_pcs": ["0x1320"],
+        "read_bases": ["UR8"],
+        "warps": [0, 1, 2, 3, 4, 5, 6, 7],
+        "status": "MISSING_WARPGROUP_BARRIER"
+      }
+    }
+  },
+  "blind_qk_p_control": {
+    "kernel": {
+      "name": "_attn_bwd_ws",
+      "checksum": "112e9b40257c377c",
+      "grid_dims": [8, 8, 4],
+      "block_dims": [512, 1, 1],
+      "warps_per_cta": 16,
+      "sm_family": 100
+    },
+    "capture_completion": {
+      "status": "complete",
+      "kernel_completed": true,
+      "channel_drained": true,
+      "trace_records_written": 16262914,
+      "dropped_records": 0,
+      "errors": []
+    },
+    "detector": {
+      "name": "intra_wg_tmem_war",
+      "finding_count": 0,
+      "scope": "QK/P intra-warpgroup TMEM WAR detector for this complete capture"
+    }
+  }
+}

@@ -286,9 +286,11 @@ The test script convention follows `llvm-reduce`: exit 0 = interesting (race occ
 
 ## Examples
 
-The [`examples/`](examples/) directory contains reference trace outputs for common workflows:
+The [`examples/`](examples/) directory contains reference outputs and
+reproducers for common workflows:
 
 -   **[Proton Trace](examples/proton_trace/)** -- sample instruction histogram CSV, CUTracer log, and a README explaining the end-to-end proton instrumentation workflow for a Triton vector-add kernel
+-   **[TLX TMEM WAR](examples/tlx_tmem_war/)** -- matched failing and fixed reproducer for an aliased-TMEM race in the 2-CTA attention-backward kernel
 
 ## Troubleshooting
 

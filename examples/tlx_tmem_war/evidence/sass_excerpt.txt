@@ -1,0 +1,20 @@
+Affected kernel, checksum 0x5351267c2d3ba402:
+
+Source line 1955: qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+/*1320*/ LDTM.x64 R4, tmem[UR8] ;
+
+Source line 1964: tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
+/*1c60*/ STTM.x32 tmem[UR6+0x40], R4 ;
+
+Blind QK/P barrier control, checksum 0x112e9b40257c377c:
+
+/*1c60*/ BAR.SYNC.DEFER_BLOCKING 0x9, 0x100 ;
+/*1c70*/ STTM.x32 tmem[UR6+0x40], R4 ;
+
+Historical second alias boundary, observed structurally in affected SASS:
+
+Source line 1978: dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+/*1d50*/ LDTM.x64 R4, tmem[UR8+0x80] ;
+
+Source line 1985: tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+/*2540*/ STTM.x32 tmem[UR6+0x80], R4 ;
