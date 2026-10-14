@@ -1,9 +1,9 @@
 # TLX named-barrier kernel hang
 
 This example reproduces a kernel hang in an affected TLX compiler. The public
-fix changes named-barrier lowering, but the handed-off investigation artifacts
-contain only the affected runtime capture. See [Investigation.md](Investigation.md)
-for the bounded conclusion and the separate source-level fix comparison.
+fix changes named-barrier lowering, but the preserved evidence contains only
+the affected runtime capture. See [Investigation.md](Investigation.md) for the
+bounded conclusion and the separate source-level fix comparison.
 
 ## Build the affected compiler
 
@@ -46,8 +46,8 @@ reproducer from blocking the calling shell.
 Triton commit
 [`a6ffe3ce`](https://github.com/facebookexperimental/triton/commit/a6ffe3ce5ee1ade3596332c85ce3a1e6ea377630)
 replaces PTX inline assembly for named barriers with convergent NVVM
-intrinsics. To create a matched treatment artifact, rebuild that exact revision
-in a separate environment and rerun the same command:
+intrinsics. For a matched comparison, build that exact revision in a separate
+environment and rerun the same command:
 
 ```bash
 git clone https://github.com/facebookexperimental/triton.git triton-fixed
@@ -71,5 +71,5 @@ The acceptance criterion for a fixed build is exit status 0 and:
 PASS: kernel completed with output [5, 99]
 ```
 
-This command is the required follow-up, not a result claimed by the preserved
-blind artifacts.
+The blind evidence does not include this run. Treat it as a follow-up, not a
+reported result.
