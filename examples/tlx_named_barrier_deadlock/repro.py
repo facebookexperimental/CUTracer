@@ -12,6 +12,8 @@ def _run_kernel(result_queue: multiprocessing.Queue) -> None:
         import triton.language as tl
         import triton.language.extra.tlx as tlx
 
+        # Reduced from Triton's `_run_kernel_diverge_both_1warp` regression,
+        # added in commit a6ffe3ce.
         @triton.jit
         def named_barrier_divergence(output_ptr):
             with tlx.async_tasks():
