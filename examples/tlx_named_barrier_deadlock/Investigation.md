@@ -1,6 +1,6 @@
 # CUTracer investigates a TLX named-barrier kernel hang on B200: the trace ends at complementary `WARPSYNC.ALL` sites before `BAR.SYNC`
 
-**Status:** Bounded | **Tags:** CUTracer, TLX, deadlock, B200, named barrier | **Example:** [repro.py](repro.py)
+**Status:** Bounded · **Tags:** CUTracer, TLX, deadlock, B200, named barrier · **Example:** [repro.py](repro.py)
 
 ## TL;DR
 
@@ -9,19 +9,29 @@
 - **Outcome:** The blind investigation left compiler ownership and the TLX source contract unresolved. A later comparison found a public Triton fix for non-convergent named-barrier lowering, but this investigation did not preserve a matched runtime run of that fix.
 - **CUTracer contribution:** CUTracer recorded the terminal PCs, active masks, launch shape, and capture completeness. Those records changed the next action from named-barrier state inspection to generated control-flow and compiler-lowering inspection.
 
+## Investigation timeline
+
+**Coding agent:** Codex · **Model:** GPT-5 · **Total investigation time:** T+4 min to the bounded runtime localization.
+
+| Elapsed | Action and evidence | Decision or next action |
+|---|---|---|
+| T+0 min | The baseline exceeded 15 seconds and exited 124. | Trace the launched kernel without assuming that the named barrier blocked. |
+| T+1 min | CUTracer identified `named_barrier_divergence`, one CTA, 256 threads, and 8 warps. A sync-only capture produced no dynamic records. | Treat the zero-record capture as inconclusive and capture all opcodes. |
+| T+2 min | The all-opcode capture recorded 172 instructions. Warp 6 ended at two predicated `WARPSYNC.ALL` PCs. | Capture active masks with `reg_trace`. |
+| **T+4 min, runtime boundary localized** | CUTracer recorded mask `0x1` at PC `0x220` and mask `0xfffffffe` at PC `0x280`. It recorded no later warp-6 instruction and no dynamic named-barrier instruction. | Bound the conclusion to generated synchronization and control flow before the named barriers. |
+
+The preserved evidence has no matched run of the fixed compiler. The investigation therefore has no defect-boundary confirmation milestone.
+
 ## Case identity
 
 | Field | Value |
 |---|---|
-| Reproducer | [repro.py](repro.py) |
-| Kernel | `named_barrier_divergence`; grid `(1, 1, 1)`; block `(256, 1, 1)`; 8 warps |
-| GPU | NVIDIA B200; SASS target `sm_100a` |
-| Capture software | CUTracer `reg_trace`; one-record channel flushing; CUDA 12.8 `ptxas` selected by the command manifest |
-| Original artifact | Kernel checksum `44f7b5fccc466eb5`; cubin SHA-256 `67edcfb2f1bc98de2dc20dc19e37bd28c2ddf4a1cbb6eaccf9427e91f3986376` |
-| Treatment artifact | None in the blind phase. Triton commit `a6ffe3ce` was inspected later as source evidence only. |
+| Reproducer | [repro.py](repro.py) at this report revision |
+| Affected component/configuration | `named_barrier_divergence`; grid `(1, 1, 1)`; block `(256, 1, 1)`; one TLX asynchronous task with one warp on NVIDIA B200 |
+| Original artifact | SASS target `sm_100a`; kernel checksum `44f7b5fccc466eb5`; cubin SHA-256 `67edcfb2f1bc98de2dc20dc19e37bd28c2ddf4a1cbb6eaccf9427e91f3986376` |
+| Treatment artifact | None. Triton commit `a6ffe3ce` was inspected later as source evidence only. |
 | Recognition signature | Warp 6 at PC `0x220` with mask `0x1` and PC `0x280` with mask `0xfffffffe`; zero records at PCs `0x270` and `0x2c0` |
-| Discriminating test | Open: run the same reproducer and environment at the affected revision and fix revision with separate caches |
-| Validated action | Inspect generated control flow and named-barrier lowering; no runtime fix was validated in the blind artifact set |
+| Validated action | Inspect generated control flow and named-barrier lowering. A matched parent-versus-fix runtime test remains open. |
 
 The blind artifacts omit the exact Triton, PyTorch, Python, driver, and CUTracer package versions. The commands selected CUDA 12.8 tools. A later check found the retained Triton checkout at the affected parent revision. That check does not establish the compiler version used during the original run.
 
@@ -29,7 +39,7 @@ The blind artifacts omit the exact Triton, PyTorch, Python, driver, and CUTracer
 
 The reproducer launches one CTA with 256 threads. One TLX asynchronous task uses one warp. Lane 0 stores one value before `tlx.named_barrier_wait(14, 32)` and another value after it. All 32 lanes request the barrier.
 
-Build the affected public Triton revision:
+The case depends on affected Triton source revision `d077424a67a74634e64ce35f644b2ac36eccd229`. The preserved evidence does not identify an equivalent `fbtriton` wheel. A current repository check found no exact release tag for the affected revision. Build the source revision to select the affected compiler:
 
 ```bash
 git clone https://github.com/facebookexperimental/triton.git
@@ -55,10 +65,10 @@ HANG REPRODUCED: kernel exceeded 15 seconds
 
 The reproducer terminated the child after 15 seconds. It exited after 15.33 seconds with status 124. This result comes from one run on one B200.
 
-| Run | Changed variable | Result | Evidence boundary |
+| Variant | Changed variable | Result | Evidence |
 |---|---|---|---|
-| Baseline | No CUTracer instrumentation | Exceeded 15 seconds; exit 124 | Confirms the high-level hang without instrumentation |
-| Decisive capture | `reg_trace`, one-record flushing, 8-second kernel timeout | 172 records; target terminated; trace marked truncated | Localizes the instrumented execution only; it is not a treatment or fix |
+| Original | No CUTracer instrumentation | Exceeded 15 seconds; exit 124 | One affected run confirms the high-level hang. |
+| Instrumented diagnostic, not a treatment | `reg_trace`, one-record flushing, 8-second kernel timeout | 172 records; target terminated; trace marked truncated | One affected capture localizes the recorded execution. It does not validate a fix. |
 
 ## Evidence summary
 
@@ -92,7 +102,7 @@ The active masks showed the lane split. Lane 0 was active at one `WARPSYNC.ALL`.
 
 These records ruled out a launch failure as the immediate boundary. They did not show that `BAR.SYNC` blocked. The next step was to inspect generated synchronization and compiler lowering.
 
-## Blind investigation and later fix comparison
+## Blind investigation and later validation
 
 ### Blind phase
 
@@ -107,7 +117,7 @@ These records ruled out a launch failure as the immediate boundary. They did not
 
 The blind diagnosis took about four minutes, from the 00:09:49 baseline start to the 00:13:45 decisive capture completion. The later fix comparison does not strengthen that conclusion.
 
-### Post-investigation comparison with the known fix
+### Post-investigation validation
 
 After the blind conclusion, the investigation compared Triton commit [`a6ffe3ce`](https://github.com/facebookexperimental/triton/commit/a6ffe3ce5ee1ade3596332c85ce3a1e6ea377630) with its parent, `d077424a`. The diff:
 
@@ -126,15 +136,28 @@ The blind investigation did not establish:
 
 The evidence set contains no runtime output from the fixed revision. This report therefore does not claim an exact parent-versus-fix A/B or upgrade the blind result to Confirmed.
 
+## Comparison with the human investigation
+
+Human report: [`[TLX] Fix named barrier deadlock caused by LLVM jump threading (#1040)`](https://github.com/facebookexperimental/triton/commit/a6ffe3ce5ee1ade3596332c85ce3a1e6ea377630)
+
+| Topic | Agent with CUTracer | Human report | Gap or next test |
+|---|---|---|---|
+| Root cause | Bounded the affected runtime to generated synchronization and control flow before the named barriers. | Identifies LLVM jump threading and missing convergent semantics in the inline-assembly lowering. | Run the same reproducer on the parent and fix with one environment and separate fresh caches. |
+| Hazard or failure coverage | Traced one `named_barrier_divergence` artifact on one B200. | Changes both named-barrier wait and arrive lowering and adds wait regression tests. | Trace the fixed wait artifact and test the arrive path separately. |
+| Finding unit | Reports dynamic PCs and active masks for warp 6 in one truncated capture. | Reports compiler IR, source lowering, and regression-test structure. | Map the fixed IR to its SASS and complete runtime trace. |
+| Independent validation | Preserves one affected baseline and one affected instrumented capture. | Records a test command and before-and-after compiler IR in the commit message. | Preserve public parent and fix outputs, generated-code identities, and exit statuses from a matched rerun. |
+
+The CUTracer capture adds the exact active-mask values `0x1` and `0xfffffffe` at the terminal recorded PCs. The public human report does not record those mask values. The agent investigation did not identify the compiler pass, prove the source-level cause, or validate the fix at runtime.
+
 ## Resolution and validation
 
 The known fix changes named-barrier lowering to convergent NVVM intrinsics. The exact parent-to-fix diff shows that code change. This investigation did not run the fixed kernel.
 
-| Gate | Affected artifact | Fix artifact | Acceptance criterion |
+| Gate | Original | Treatment | Acceptance criterion |
 |---|---:|---:|---|
-| Reproducer | Exit 124 after 15 seconds | Not run in this investigation | Fixed revision completes and returns `[5, 99]` |
-| Generated code | Two predicated `WARPSYNC.ALL` sites precede two predicated `BAR.SYNC` sites | Not captured | One converged named-barrier operation for the participating warp |
-| CUTracer | Runtime boundary localized on affected artifact | Not run | No terminal split at complementary full-warp synchronization sites |
-| Regression tests | Not run | Matching tests present in commit `a6ffe3ce` | Tests execute and pass on a supported GPU |
+| Reproducer | Exit 124 after 15 seconds | Not run in this investigation | Fixed revision exits 0 and returns `[5, 99]`. |
+| Independent oracle | Not preserved | Not run in this investigation | A matched parent-versus-fix run changes only the compiler revision. |
+| CUTracer | Runtime boundary localized on the affected artifact | Not run | The fixed artifact has no terminal split at complementary full-warp synchronization sites. |
+| Regression/performance | Tests not run; performance not measured | Matching tests are present in commit `a6ffe3ce`, but were not run here | Tests pass on a supported GPU. No performance claim is required. |
 
 To confirm causality, rebuild the parent and fix commits with the same GPU, driver, CUDA tools, Python packages, and launch configuration. Use separate fresh Triton caches. Preserve both outputs and generated-code identities.
