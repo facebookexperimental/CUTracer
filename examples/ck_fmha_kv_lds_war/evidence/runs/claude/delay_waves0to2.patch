@@ -1,0 +1,17 @@
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
+@@ -445,6 +445,14 @@
+             const auto bias_tile = load_tile(bias_dram_window); // load bias tile
+             auto v_buf           = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});
+             __builtin_amdgcn_sched_barrier(0);
++            // EXPERIMENT (delay injection): hold wave 0 between the barrier above and its
++            // K-tail LDS reads. This adds no memory operation, only latency.
++            if(get_warp_id() != 3)
++            {
++                for(int i_sleep = 0; i_sleep < 32; ++i_sleep)
++                    __builtin_amdgcn_s_sleep(127);
++            }
++            __builtin_amdgcn_sched_barrier(0);
+             { // tail
+                 gemm_0(
+                     s_acc,

@@ -1,0 +1,14 @@
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
+@@ -589,6 +589,11 @@
+                 s.get_tile_distribution()); // Pcompute{j}
+ 
+             __builtin_amdgcn_sched_barrier(0x7F);
++            // The first V stage reuses the LDS buffer of the last K stage (e.g. hdim 96:
++            // LdsSeq = 0,1,2 | 2,0,1,2). Other waves may still be reading that K tile in the
++            // tail gemm_0 above, so wait for all of them before overwriting it.
++            if constexpr(LdsSeq.at(number<k0_loops>{}) == LdsSeq.at(number<k0_loops - 1>{}))
++                block_sync_lds();
+             // store & prefetch next v, after the max reduction
+             if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
+             {

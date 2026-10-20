@@ -1,0 +1,18 @@
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async.hpp
+@@ -441,6 +441,15 @@
+ 
+             async_load_fence();
+             __builtin_amdgcn_s_barrier();
++
++            // Test only: delay wave 0 before it reads the last K stage.
++            __builtin_amdgcn_sched_barrier(0);
++            if(ck_tile::get_warp_id() == 0)
++            {
++                for(int i = 0; i < 64; ++i)
++                    asm volatile("s_sleep 10" ::: "memory");
++            }
++            __builtin_amdgcn_sched_barrier(0);
+ 
+             const auto bias_tile = load_tile(bias_dram_window); // load bias tile
+             auto v_buf           = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});

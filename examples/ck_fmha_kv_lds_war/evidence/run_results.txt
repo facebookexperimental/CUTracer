@@ -1,0 +1,19 @@
+# AMD Instinct MI350 (gfx950), ROCm 7.0, CK tile_example_fmha_fwd built as in README.md
+# Command: -prec=bf16 -b=4096 -h=1 -s=16 -s_k=200 -d=96 -lse=1 -v=2 -warmup=0 -repeat=1
+# -v=2 validates the output O against a reference computed on the GPU (not LSE).
+
+## README run, fresh clone (20 runs per row)
+affected                  20 valid:y
+fixed                     20 valid:y
+affected + delay_wave0    20 valid:n
+fixed + delay_wave0       20 valid:y
+
+## Default schedule, larger samples
+affected                  500 runs, 0 invalid
+fixed                     200 runs, 0 invalid
+affected, -s=4096 -h=16 (random inputs, -v=1)   80 runs, 0 invalid
+fixed,    -s=4096 -h=16 (random inputs, -v=1)   40 runs, 0 invalid
+
+## Separate delay run on the same commits (20 runs per row)
+affected + delay_wave0    20 of 20 invalid
+fixed + delay_wave0        0 of 20 invalid

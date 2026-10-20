@@ -292,6 +292,7 @@ reproducers for common workflows:
 -   **[Proton Trace](examples/proton_trace/)** -- sample instruction histogram CSV, CUTracer log, and a README explaining the end-to-end proton instrumentation workflow for a Triton vector-add kernel
 -   **[TLX TMEM WAR](examples/tlx_tmem_war/)** -- matched failing and fixed reproducer for an aliased-TMEM race in the 2-CTA attention-backward kernel
 -   **[TLX CLC GEMM](examples/tlx_gemm_clc/)** -- matched affected and fixed setup for a missing async-proxy fence after the CLC response read in the TLX Blackwell GEMM, with three blind agent audits using the `audit-memory-model` skill
+-   **[CK FMHA K/V LDS WAR](examples/ck_fmha_kv_lds_war/)** -- matched affected and fixed builds of the Composable Kernel FMHA forward example on MI350, a delay patch that exposes a missing workgroup barrier before the V tile reuses the K buffer in LDS, and three blind agent audits using the `audit-memory-model` skill
 
 ## Troubleshooting
 

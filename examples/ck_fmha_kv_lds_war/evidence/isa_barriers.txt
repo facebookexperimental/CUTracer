@@ -1,0 +1,12 @@
+# s_barrier count per bf16 BlockFmhaPipelineQRKSVSAsync kernel with tile 128x128x32x128x32x96
+# ROCm 7.0, gfx950, built as in README.md (count_barriers.py)
+
+== affected (CK 683865895e)
+48 kernels; s_barrier count -> number of kernels: {7: 24, 15: 24}
+== fixed (CK fe8b7d0c)
+48 kernels; s_barrier count -> number of kernels: {8: 24, 16: 24}
+
+# Every kernel gains exactly one s_barrier. In the audited kernel (code object 76,
+# ..._psskddv_nlogits_nbias_nmask_lse_ndropout_...), the affected ISA has no s_barrier
+# between the K-tail ds_read_b128 (0x2F0C-0x2F68) and the V stage-0 ds_write2_b32
+# (0x35D4-0x35EC); see runs/codex/edge-excerpts.isa.

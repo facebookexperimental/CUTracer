@@ -1,0 +1,46 @@
+--- original
++++ fix
+@@ -299,7 +299,7 @@
+ s_lshl_b32 s38, s33, 7
+ s_lshl_b32 s33, s3, 7
+ s_cmp_eq_u64 s[36:37], 0
+-s_cbranch_scc1 2163
++s_cbranch_scc1 2165
+ s_ashr_i32 s3, s2, 31
+ s_lshl_b64 s[44:45], s[2:3], 2
+ s_add_u32 s36, s36, s44
+@@ -466,7 +466,7 @@
+ buffer_load_dwordx4 v[2:5], v11, s[36:39], 0 offen
+ s_mov_b64 exec, s[44:45]
+ s_cmp_gt_i32 s25, 0
+-s_cbranch_scc0 1461
++s_cbranch_scc0 1463
+ s_add_i32 s0, s25, 0x7f
+ s_ashr_i32 s1, s0, 31
+ s_lshr_b32 s1, s1, 25
+@@ -1041,6 +1041,8 @@
+ buffer_load_dwordx4 v[194:197], v153, s[40:43], 0 offen
+ v_add_lshl_u32 v152, v162, s19, 1
+ v_add_lshl_u32 v156, v162, s20, 1
++s_waitcnt lgkmcnt(0)
++s_barrier
+ buffer_load_dwordx4 v[152:155], v152, s[40:43], 0 offen
+ s_nop 0
+ buffer_load_dwordx4 v[156:159], v156, s[40:43], 0 offen
+@@ -1530,7 +1532,7 @@
+ s_cbranch_scc0 6
+ v_mov_b32_e32 v188, v189
+ v_mov_b32_e32 v172, v64
+-s_branch 64342
++s_branch 64340
+ s_mov_b64 vcc, exec
+ s_cbranch_execnz 194
+ s_branch 243
+@@ -1841,5 +1843,5 @@
+ s_ashr_i32 s5, s4, 31
+ s_waitcnt lgkmcnt(0)
+ s_cmp_eq_u64 s[28:29], 0
+-s_cbranch_scc0 63401
+-s_branch 63407
++s_cbranch_scc0 63399
++s_branch 63405
