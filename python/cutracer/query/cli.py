@@ -32,6 +32,13 @@ from tabulate import tabulate
 from tritonparse._json_compat import dumps
 
 
+def _display_key(key: Any) -> Any:
+    """Show a group key the way the trace stores it: tuples back as lists."""
+    if isinstance(key, tuple):
+        return [_display_key(k) for k in key]
+    return key
+
+
 def _write_output(
     output: str,
     output_file: Optional[Path],
@@ -87,7 +94,7 @@ def _format_counts(
         sorted_counts = sorted_counts[:top_n]
 
     if output_format == "json":
-        output_data = {str(k): v for k, v in sorted_counts}
+        output_data = {str(_display_key(k)): v for k, v in sorted_counts}
         return dumps(output_data, indent=True)
     elif output_format == "csv":
         output = io.StringIO(newline="")
@@ -95,13 +102,15 @@ def _format_counts(
         if show_header:
             writer.writerow([group_field, "count"])
         for key, cnt in sorted_counts:
-            writer.writerow([key, cnt])
+            writer.writerow([_display_key(key), cnt])
         return output.getvalue().rstrip("\n").replace("\r", "")
     elif output_format == "ndjson":
-        lines = [dumps({group_field: k, "count": v}) for k, v in sorted_counts]
+        lines = [
+            dumps({group_field: _display_key(k), "count": v}) for k, v in sorted_counts
+        ]
         return "\n".join(lines)
     else:  # table
-        table_data = [[key, cnt] for key, cnt in sorted_counts]
+        table_data = [[_display_key(key), cnt] for key, cnt in sorted_counts]
         headers = [group_field.upper(), "COUNT"] if show_header else []
         return tabulate(table_data, headers=headers, tablefmt="plain")
 
@@ -134,7 +143,7 @@ def _format_groups(
             filtered_records = [
                 {f: r.get(f) for f in display_fields if f in r} for r in records
             ]
-            groups_data[str(group_key)] = filtered_records
+            groups_data[str(_display_key(group_key))] = filtered_records
 
         if warp_summary:
             output_data = {
@@ -161,7 +170,7 @@ def _format_groups(
                     out_record = {
                         f: record.get(f) for f in display_fields if f in record
                     }
-                out_record["_group"] = group_key
+                out_record["_group"] = _display_key(group_key)
                 output_parts.append(dumps(out_record))
         return "\n".join(output_parts)
 
@@ -172,7 +181,7 @@ def _format_groups(
                 continue
             display_fields = get_display_fields(records, fields)
             output_parts.append(
-                f"\n=== Group: {group_key} ({len(records)} records) ==="
+                f"\n=== Group: {_display_key(group_key)} ({len(records)} records) ==="
             )
             if output_format == "csv":
                 output_parts.append(
