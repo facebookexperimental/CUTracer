@@ -502,15 +502,27 @@ _CUTRACER_OPTIONS = [
         "--instrument",
         "-i",
         default=None,
-        help="Instrumentation type(s): opcode_only, reg_trace, mem_addr_trace, "
-        "mem_value_trace, tma_trace, random_delay. "
+        help="Instrumentation type(s), comma-separated: "
+        "opcode_only (PC and opcode per warp); "
+        "reg_trace (register values, recorded before the instruction executes); "
+        "mem_addr_trace (32-lane addresses of memory instructions); "
+        "mem_value_trace (addresses and loaded or stored values, recorded after "
+        "the instruction executes); "
+        "tma_trace (TMA descriptors); "
+        "random_delay (delays before synchronization instructions). "
         "If omitted, CUTracer acts as a kernel launch logger (no trace files).",
     ),
     click.option(
         "--analysis",
         "-a",
         default=None,
-        help="Analysis type(s): proton_instr_histogram, deadlock_detection, random_delay",
+        help="Analysis type(s): "
+        "deadlock_detection (classifies each warp as BARRIER, LOOPING, or "
+        "PROGRESSING, prints a warp report, and ends a hung run; enables "
+        "reg_trace); "
+        "random_delay (injects delays to expose races; needs --delay-ns); "
+        "proton_instr_histogram (instruction counts per clock-delimited region; "
+        "enables opcode_only)",
     ),
     click.option(
         "--kernel-filters",
@@ -545,7 +557,8 @@ _CUTRACER_OPTIONS = [
     click.option(
         "--cutracer-so",
         default=None,
-        help="Explicit path to cutracer.so (overrides buck2 build)",
+        help="Path to cutracer.so. Needed for a pip install unless you run from "
+        "a CUTracer checkout that has lib/cutracer.so",
     ),
     click.option(
         "--zstd-level",
@@ -733,8 +746,8 @@ def trace_command(
     """Trace a CUDA application with CUTracer instrumentation.
 
     Sets up CUTracer environment variables and runs the specified command.
-    The cutracer.so shared library is bundled via buck2 resources if not
-    explicitly provided.
+    cutracer.so comes from --cutracer-so, a copy bundled with the package if
+    there is one, or ./lib/cutracer.so in a CUTracer checkout.
 
     When --instrument is omitted, CUTracer acts as a lightweight kernel launch
     logger: kernel names, grid/block dims, and shared memory usage are printed
@@ -747,6 +760,28 @@ def trace_command(
       cutracer trace -i reg_trace --kernel-filters=matmul_kernel -- python -m pytest test.py
       cutracer trace -i tma_trace --cutracer-so=/path/to/cutracer.so -- ./app
       cutracer trace -- ./my_app  # kernel launch logger only (no instrumentation)
+      cutracer trace -i reg_trace -a deadlock_detection --channel-records 1 \\
+          --kernel-timeout-s 60 -k my_kernel -o out -- ./hanging_app
+
+    \b
+    Output files in the output directory:
+      kernel_<checksum>_iter<N>_<name>.ndjson      one per launch of a kernel
+      kernel_<checksum>_<hash>_<name>.cubin        the kernel's code, for `cutracer sass`
+      kernel_..._warp_status_summary.ndjson        warp report (deadlock_detection)
+      cutracer_kernel_events_<time>.ndjson         one record per launch (--kernel-events)
+      cutracer_main_<time>.log                     CUTracer's log
+
+    \b
+    Instrument only part of a kernel with environment variables:
+      INSTR_BEGIN=<i> INSTR_END=<j> cutracer trace ...
+    i and j are static instruction indices (the SASS PC divided by 16), in
+    decimal, counted per function, with j excluded.
+
+    \b
+    Exit status is the command's. When CUTracer ends a hung run (timeouts or
+    deadlock_detection) it sends SIGTERM, then SIGKILL, so the status is 241
+    or 247. See docs/ in https://github.com/facebookexperimental/CUTracer for
+    every environment variable and record field.
     """
     if not cmd:
         raise click.UsageError(
