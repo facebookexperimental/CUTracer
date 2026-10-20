@@ -1,0 +1,22 @@
+--- a/triton/language/extra/tlx/dynamic_launch.py
++++ b/triton/language/extra/tlx/dynamic_launch.py
+@@ -1,7 +1,7 @@
+ import triton.language.core as tl
+ 
+ from . import types as tlx
+-from .mem_ops import local_view
++from .mem_ops import local_view, fence
+ from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
+ from .utility import cluster_cta_rank
+ 
+@@ -172,6 +172,10 @@
+     stolen_tile_ids = _clc_query(response, _semantic=_semantic)
+     stolen_tile_id = stolen_tile_ids[0]
+ 
++    # The next try_cancel writes the response through the async proxy; order
++    # this thread's generic read of it before the release below.
++    fence(tl.constexpr("async_shared"), _semantic=_semantic)
++
+     # Signal completion: all CTAs signal CTA 0's bar_empty
+     # NOTE: if stolen_tile_id is -1, it means no more tile is available. We shouldn't expect
+     # the producer to run any more, and leader CTA could already exit now, so we skip the bar_empty arrival here

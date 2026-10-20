@@ -1,0 +1,28 @@
+# matmul_kernel_tma_ws_blackwell_clc, fbtriton 3.7.4, sm_100 (nvdisasm -c)
+# CLC response buffer: SMEM +0x200e0. bar_empty: +0x20100. try_cancel: UGETNEXTWORKID.
+
+## buggy (affected.patch applied), cubin sha256 1016c9452ed10e96
+FENCE.VIEW.ASYNC.S count in kernel: 4
+        /*0920*/                   @UP0 UGETNEXTWORKID.BROADCAST [UR4], [UR5] ;
+        /*1b40*/                   LDS.128 R4, [UR8+0x200e0] ;
+        /*1bc0*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR8+0x20100], RZ ;
+        /*2b90*/                   LDS.128 R4, [UR9+0x200e0] ;
+        /*2c20*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR9+0x20100], RZ ;
+        /*3730*/                   LDS.128 R4, [UR9+0x200e0] ;
+        /*37c0*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR9+0x20100], RZ ;
+
+## fixed (stock fbtriton 3.7.4), cubin sha256 5a5a84b0eceb5d83
+FENCE.VIEW.ASYNC.S count in kernel: 7
+        /*0920*/                   @UP0 UGETNEXTWORKID.BROADCAST [UR4], [UR5] ;
+        /*1b40*/                   LDS.128 R4, [UR8+0x200e0] ;
+        /*1b70*/                   MEMBAR.ALL.CTA ;
+        /*1b80*/                   FENCE.VIEW.ASYNC.S ;
+        /*1be0*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR8+0x20100], RZ ;
+        /*2bb0*/                   LDS.128 R4, [UR9+0x200e0] ;
+        /*2be0*/                   MEMBAR.ALL.CTA ;
+        /*2bf0*/                   FENCE.VIEW.ASYNC.S ;
+        /*2c60*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR9+0x20100], RZ ;
+        /*3770*/                   LDS.128 R4, [UR9+0x200e0] ;
+        /*37a0*/                   MEMBAR.ALL.CTA ;
+        /*37b0*/                   FENCE.VIEW.ASYNC.S ;
+        /*3820*/               @P0 SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR9+0x20100], RZ ;

@@ -1,0 +1,27 @@
+# B200 (driver 580.82.07), fbtriton 3.7.4, torch 2.14.1+cu130
+
+## Reproducer given to the agents (v1: atol=rtol=1e-2, inputs (randn+1)/K), affected source, 50 iterations each
+  == M=4096 N=4096 K=512
+  GPU=NVIDIA B200 M=4096 N=4096 K=512 iterations=50
+  0/50 iterations mismatched
+  == M=4096 N=1536 K=64
+  GPU=NVIDIA B200 M=4096 N=1536 K=64 iterations=50
+  0/50 iterations mismatched
+  == M=8192 N=8192 K=512
+  GPU=NVIDIA B200 M=8192 N=8192 K=512 iterations=50
+  0/50 iterations mismatched
+  == M=2048 N=2048 K=64
+  GPU=NVIDIA B200 M=2048 N=2048 K=64 iterations=50
+  0/50 iterations mismatched
+
+## examples/tlx_gemm_clc/repro.py, buggy, 100 iterations each
+  M=2048 N=2048 K=64 iterations=100 atol=0.0635 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=4096 N=1536 K=64 iterations=100 atol=0.06354 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=4096 N=4096 K=512 iterations=100 atol=0.1803 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=8192 N=8192 K=512 iterations=100 atol=0.1803 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+
+## examples/tlx_gemm_clc/repro.py, fixed, 100 iterations each
+  M=2048 N=2048 K=64 iterations=100 atol=0.0635 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=4096 N=1536 K=64 iterations=100 atol=0.06354 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=4096 N=4096 K=512 iterations=100 atol=0.1803 rtol=0.01 -> 0/100 iterations mismatched, exit=0
+  M=8192 N=8192 K=512 iterations=100 atol=0.1803 rtol=0.01 -> 0/100 iterations mismatched, exit=0

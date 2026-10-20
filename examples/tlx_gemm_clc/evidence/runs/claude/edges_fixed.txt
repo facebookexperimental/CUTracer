@@ -1,0 +1,4 @@
+  async->async                    0x920 -> 0x920    occurrences=108, same_warp=108, same_warp_fence_seen=108
+  generic_read->async_write      0x1b60 -> 0x920    occurrences=432, fence_seen=324, sync_linked=324, fence_and_link=324, same_warp=108, same_warp_lanes_unresolved=108
+  generic_read->async_write      0x2be0 -> 0x920    occurrences=108, fence_seen=108, no_sync_link=108, sync_lanes_unresolved=108
+  generic_read->async_write      0x37a0 -> 0x920    occurrences=108, fence_seen=108, no_sync_link=108, sync_lanes_unresolved=108

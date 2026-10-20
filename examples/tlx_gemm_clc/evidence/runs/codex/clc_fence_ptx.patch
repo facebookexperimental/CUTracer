@@ -1,0 +1,26 @@
+--- a/matmul_kernel_tma_ws_blackwell_clc.ptx
++++ b/matmul_kernel_tma_ws_blackwell_clc.ptx
+@@ -1043,6 +1043,7 @@
+     
+ 
+ 	// end inline asm
++	fence.proxy.async.shared::cta;
+ 	setp.gt.s32 	%p44, %r909, -1;
+ 	bar.sync 	0, 128;
+ 	bar.sync 	0, 128;
+@@ -1226,6 +1227,7 @@
+     
+ 
+ 	// end inline asm
++	fence.proxy.async.shared::cta;
+ 	setp.gt.s32 	%p33, %r169, -1;
+ 	bar.warp.sync 	-1;
+ 	bar.warp.sync 	-1;
+@@ -1625,6 +1627,7 @@
+     
+ 
+ 	// end inline asm
++	fence.proxy.async.shared::cta;
+ 	setp.gt.s32 	%p12, %r902, -1;
+ 	bar.warp.sync 	-1;
+ 	bar.warp.sync 	-1;
