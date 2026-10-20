@@ -18,6 +18,7 @@ IDE, repository host, or tool-call syntax.
 | Skill | Use it when |
 |---|---|
 | [`report-case-study`](skills/report-case-study/SKILL.md) | A CUTracer investigation is complete and needs an auditable, reusable report. |
+| [`audit-memory-model`](skills/audit-memory-model/SKILL.md) | A GPU kernel (NVIDIA Hopper or Blackwell, AMD CDNA3 or CDNA4) must be checked against the vendor memory model without a failing run, for example when the reproducer passes or a fence or wait may be missing. |
 
 Registration makes a skill discoverable. It does not start the workflow. Each
 skill defines its own invocation boundary. For example, `report-case-study`
