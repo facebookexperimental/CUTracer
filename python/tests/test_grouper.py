@@ -178,3 +178,33 @@ class TestConsumedBehavior(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestListValuedGroupField(unittest.TestCase):
+    """Grouping by a field whose values are lists, such as cta."""
+
+    def _records(self):
+        return iter(
+            [
+                {"cta": [0, 0, 0], "pc": 1},
+                {"cta": [1, 0, 0], "pc": 2},
+                {"cta": [0, 0, 0], "pc": 3},
+            ]
+        )
+
+    def test_count_per_group(self):
+        counts = StreamingGrouper(self._records(), "cta").count_per_group()
+        self.assertEqual(counts, {(0, 0, 0): 2, (1, 0, 0): 1})
+
+    def test_head_per_group(self):
+        groups = StreamingGrouper(self._records(), "cta").head_per_group(1)
+        self.assertEqual([r["pc"] for r in groups[(0, 0, 0)]], [1])
+
+    def test_tail_per_group(self):
+        groups = StreamingGrouper(self._records(), "cta").tail_per_group(1)
+        self.assertEqual([r["pc"] for r in groups[(0, 0, 0)]], [3])
+
+    def test_all_per_group(self):
+        groups = StreamingGrouper(self._records(), "cta").all_per_group()
+        self.assertEqual([r["pc"] for r in groups[(0, 0, 0)]], [1, 3])
+        self.assertEqual([r["pc"] for r in groups[(1, 0, 0)]], [2])

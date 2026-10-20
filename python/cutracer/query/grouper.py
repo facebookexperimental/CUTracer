@@ -13,6 +13,13 @@ from typing import Any, Iterator
 from cutracer.types import TraceRecord
 
 
+def _hashable(value: Any) -> Any:
+    """Return a dict key for a field value; lists (e.g. cta) become tuples."""
+    if isinstance(value, list):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
 class StreamingGrouper:
     """
     Stream-based grouper for trace records.
@@ -75,7 +82,7 @@ class StreamingGrouper:
         group_counts: Counter = Counter()
 
         for record in self._records:
-            key = record.get(self._group_field)
+            key = _hashable(record.get(self._group_field))
             if group_counts[key] < n:
                 groups[key].append(record)
                 group_counts[key] += 1
@@ -103,7 +110,7 @@ class StreamingGrouper:
         groups: dict[Any, deque] = defaultdict(lambda: deque(maxlen=n))
 
         for record in self._records:
-            key = record.get(self._group_field)
+            key = _hashable(record.get(self._group_field))
             groups[key].append(record)
 
         return {k: list(v) for k, v in groups.items()}
@@ -122,7 +129,7 @@ class StreamingGrouper:
         counts: Counter = Counter()
 
         for record in self._records:
-            key = record.get(self._group_field)
+            key = _hashable(record.get(self._group_field))
             counts[key] += 1
 
         return dict(counts)
@@ -142,7 +149,7 @@ class StreamingGrouper:
         groups: dict[Any, list[TraceRecord]] = defaultdict(list)
 
         for record in self._records:
-            key = record.get(self._group_field)
+            key = _hashable(record.get(self._group_field))
             groups[key].append(record)
 
         return dict(groups)

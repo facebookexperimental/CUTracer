@@ -197,6 +197,24 @@ class TestQueryCommand(BaseValidationTest):
         self.assertIn("=== Group:", result.output)
         self.assertIn("records) ===", result.output)
 
+    def test_group_by_list_field_count(self):
+        """Test --group-by on a list-valued field (cta) with --count."""
+        result = self.runner.invoke(
+            main,
+            ["query", str(REG_TRACE_NDJSON), "--group-by", "cta", "--count"],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("[0, 0, 0]", result.output)
+
+    def test_group_by_list_field_head(self):
+        """Test --group-by on a list-valued field (cta) with --head."""
+        result = self.runner.invoke(
+            main,
+            ["query", str(REG_TRACE_NDJSON), "--group-by", "cta", "--head", "1"],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("=== Group: [0, 0, 0]", result.output)
+
     def test_analyze_group_by_with_tail(self):
         """Test analyze with --group-by and --tail."""
         result = self.runner.invoke(
