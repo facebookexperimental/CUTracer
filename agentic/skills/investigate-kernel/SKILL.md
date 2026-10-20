@@ -1,6 +1,6 @@
 ---
 name: investigate-kernel
-description: Use when a CUDA or Triton GPU kernel misbehaves or its correctness is in doubt and no CUTracer workflow has been chosen yet, for example when asked to debug or investigate a kernel without a named symptom, when it is unclear whether the problem is in the kernel at all, or when the symptom is or a test that passes while the kernel's correctness is still in doubt.
+description: Use when a CUDA or Triton GPU kernel misbehaves or its correctness is in doubt and no CUTracer workflow has been chosen yet, for example when asked to debug or investigate a kernel without a named symptom, when it is unclear whether the problem is in the kernel at all, or when the symptom is CUDA error 700, an illegal or misaligned address, or a test that passes while the kernel's correctness is still in doubt.
 license: MIT
 compatibility: Trace-based workflows need an NVIDIA GPU and the cutracer CLI with cutracer.so (see the CUTracer readme, Quickstart). audit-memory-model needs the generated code and ISA for a supported target.
 ---
@@ -92,7 +92,10 @@ Otherwise, pick the workflow below.
 
 | Symptom | Use |
 |---|---|
+| A fault in device code: CUDA error 700, "unspecified launch failure", an illegal or misaligned address | `debug-illegal-access` |
 | Tests pass, but a fence, wait, or barrier may be missing, on a target and mechanism `audit-memory-model` lists | `audit-memory-model` |
+
+Take the first row that matches; an earlier symptom can hide a later one.
 
 ## End the investigation with evidence
 
