@@ -17,6 +17,7 @@ IDE, repository host, or tool-call syntax.
 
 | Skill | Use it when |
 |---|---|
+| [`investigate-kernel`](skills/investigate-kernel/SKILL.md) | A GPU kernel misbehaves and no workflow has been chosen yet. It routes to the matching debugging skill. |
 | [`report-case-study`](skills/report-case-study/SKILL.md) | A CUTracer investigation is complete and needs an auditable, reusable report. |
 | [`audit-memory-model`](skills/audit-memory-model/SKILL.md) | A GPU kernel (NVIDIA Hopper or Blackwell, AMD CDNA3 or CDNA4) must be checked against the vendor memory model without a failing run, for example when the reproducer passes or a fence or wait may be missing. |
 
