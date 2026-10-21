@@ -13,6 +13,10 @@ Each `SKILL.md` uses `name` and `description` frontmatter. Skill bodies describe
 decisions and evidence requirements without depending on a specific agent,
 IDE, repository host, or tool-call syntax.
 
+New skills come with an eval under `agentic/evals/<skill-name>/` that shows
+the skill helps and keeps it working when the skill changes; existing skills
+gain one when they are next revised.
+
 ## Available skills
 
 | Skill | Use it when |
@@ -60,3 +64,26 @@ the canonical instructions.
    that client's installation path in the canonical skill.
 5. Validate every relative link and test installation through at least one
    client-supported skill loader.
+6. Add an eval in `agentic/evals/<name>/` in the same change (see Evals).
+
+## Evals
+
+An eval is a set of cases with a known answer, a way to run an agent on them
+blind, and a rule for grading the result. A typical eval directory holds:
+
+```text
+agentic/evals/<skill-name>/
+├── README.md     cases, how to build and run them, grading rule, results
+├── prompt.md     the blind prompt, with placeholders
+└── cases/        inputs with the answer key, for example planted-bug programs
+```
+
+- Run each case with and without the skill on the same agent, and report
+  both. A skill that does not change the result for any agent tested is not
+  yet shown to help.
+- Fix the grading rule before looking at the runs, and leave out runs that
+  break the prompt's rules.
+- Keep the answer keys away from the agent under test: give it built inputs,
+  not this repository, and never link a skill to its eval.
+- When a change to the skill is meant to fix a failure, rerun the case that
+  showed it.

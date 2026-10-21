@@ -1,0 +1,10 @@
+{
+ "S1": "Our GPU bucket sort fails with 'bucket sort failed: an illegal memory access was encountered' on every run.",
+ "S2": "Traversal fails after the metadata refresh with an illegal memory access. The payload buffer stays allocated for the whole run. The refresh is only supposed to bump each entry's generation number.",
+ "S3": "row_scale crashes with an illegal memory access on our production matrix (40000 rows, leading dimension 65536). Smaller matrices work.",
+ "S4": "The forward pass of our 12-layer model fails: it prints 'forward done: an illegal memory access was encountered' at the end, every run.",
+ "S5": "Batched axpy over 24 batches fails with an illegal memory access on every run.",
+ "S6": "sum4 fails with a CUDA error ('misaligned address') on every run.",
+ "V1": "Our SpMV over a 4M-row CSR matrix fails with 'spmv: an illegal memory access was encountered' on every run. Smaller matrices work.",
+ "V2": "The routing pipeline consistently fails during the final download on this batch ('download: an illegal memory access was encountered'). The payload allocation remains live, and smaller routing tests pass."
+}
