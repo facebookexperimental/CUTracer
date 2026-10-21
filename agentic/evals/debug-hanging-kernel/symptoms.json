@@ -1,0 +1,9 @@
+{
+ "S1": "handoff never returns on this 8-tile input; we have to kill it. Every run.",
+ "S2": "stage_and_consume never finishes on this batch of 16 tiles. Every run.",
+ "S3": "two_phase works on small arrays but never finishes on our 200M-element array.",
+ "S4": "row_sums hangs on this batch of 24 tiles, every run. Other batches work.",
+ "S5": "tile_sum hangs on this dataset, every run. Most datasets work.",
+ "S6": "Our step loop prints step 0, step 1 and step 2, then hangs in step 3. Every run.",
+ "V1": "Our scan of 4M ints never finishes. 1M-element inputs work."
+}

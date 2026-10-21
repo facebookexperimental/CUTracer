@@ -22,6 +22,7 @@ gain one when they are next revised.
 | Skill | Use it when |
 |---|---|
 | [`investigate-kernel`](skills/investigate-kernel/SKILL.md) | A GPU kernel misbehaves and no workflow has been chosen yet. It routes to the matching debugging skill. |
+| [`debug-hanging-kernel`](skills/debug-hanging-kernel/SKILL.md) | A kernel hangs or never returns (NVIDIA). |
 | [`debug-illegal-access`](skills/debug-illegal-access/SKILL.md) | A kernel faults: CUDA error 700, an illegal or misaligned address (NVIDIA). |
 | [`report-case-study`](skills/report-case-study/SKILL.md) | A CUTracer investigation is complete and needs an auditable, reusable report. |
 | [`audit-memory-model`](skills/audit-memory-model/SKILL.md) | A GPU kernel (NVIDIA Hopper or Blackwell, AMD CDNA3 or CDNA4) must be checked against the vendor memory model without a failing run, for example when the reproducer passes or a fence or wait may be missing. |

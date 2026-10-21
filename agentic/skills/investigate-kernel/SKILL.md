@@ -1,6 +1,6 @@
 ---
 name: investigate-kernel
-description: Use when a CUDA or Triton GPU kernel misbehaves or its correctness is in doubt and no CUTracer workflow has been chosen yet, for example when asked to debug or investigate a kernel without a named symptom, when it is unclear whether the problem is in the kernel at all, or when the symptom is CUDA error 700, an illegal or misaligned address, or a test that passes while the kernel's correctness is still in doubt.
+description: Use when a CUDA or Triton GPU kernel misbehaves or its correctness is in doubt and no CUTracer workflow has been chosen yet, for example when asked to debug or investigate a kernel without a named symptom, when it is unclear whether the problem is in the kernel at all, or when the symptom is a hang, a timeout, CUDA error 700, an illegal or misaligned address, or a test that passes while the kernel's correctness is still in doubt.
 license: MIT
 compatibility: Trace-based workflows need an NVIDIA GPU and the cutracer CLI with cutracer.so (see the CUTracer readme, Quickstart). audit-memory-model needs the generated code and ISA for a supported target.
 ---
@@ -50,9 +50,10 @@ Collect the facts that decide the route:
 3. Whether a kernel runs, and which one.
    Check the compiler or runtime error first.
    `cutracer trace --kernel-events nostack -o <dir> -- <command>` writes a kernel-events file that lists every launch in order; an empty file means no kernel ran.
+   If the program may hang, run it and this command under `timeout -s INT`.
    The last launch before a hang or a fault is the suspect.
 4. How it fails.
-   Run the reproducer 5 to 10 times without CUTracer and record the exit code, the output, and the run time.
+   Run the reproducer 5 to 10 times without CUTracer and record the exit code, the output, and the run time. A hang that reproduces on each of the first two runs needs no more.
    Compare the error with the test's tolerance and with the precision of its reference.
    For NaN, Inf, or garbage output, check that the kernel's inputs are finite and initialized.
    For a timeout, check whether the program finishes when given several times longer.
@@ -93,6 +94,7 @@ Otherwise, pick the workflow below.
 | Symptom | Use |
 |---|---|
 | A fault in device code: CUDA error 700, "unspecified launch failure", an illegal or misaligned address | `debug-illegal-access` |
+| A device kernel stops making progress | `debug-hanging-kernel` |
 | Tests pass, but a fence, wait, or barrier may be missing, on a target and mechanism `audit-memory-model` lists | `audit-memory-model` |
 
 Take the first row that matches; an earlier symptom can hide a later one.
