@@ -234,7 +234,7 @@ def _format_groups(
     type=str,
     default=None,
     multiple=True,
-    help="Filter expression (e.g., 'warp=24', 'pc=0x43d0', 'pc=0x43d0;warp=24'). Can be specified multiple times for AND logic.",
+    help="Filter expression (e.g., 'warp=24', 'pc=0x43d0', 'pc=0x43d0;warp=24', 'cta=[4,0,0]'). Values must be written as the trace writes them: pc=0x1a0 matches, pc=0x01a0 and pc=416 match nothing. Can be specified multiple times for AND logic.",
 )
 @click.option(
     "--format",
@@ -248,7 +248,7 @@ def _format_groups(
     "--fields",
     type=str,
     default=None,
-    help="Comma-separated list of fields to display (e.g., 'warp,pc,sass'), or '*'/'all' for all fields.",
+    help="Comma-separated list of fields to display (e.g., 'warp,pc,sass'), or '*'/'all' for all fields. Instruction records also carry cta, active_mask, opcode_id, and by mode: regs, regs_indices, uregs, uregs_indices (reg_trace; regs[i] holds the 32 lane values of register regs_indices[i]); addrs, values (mem_addr_trace, mem_value_trace). Use --format ndjson to see array fields in full.",
 )
 @click.option(
     "--no-header",
