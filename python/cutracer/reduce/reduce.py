@@ -8,8 +8,11 @@ Implements two strategies:
 - Bisect: ddmin-style bisection (O(N log N) worst case, often much faster)
 """
 
+import glob
+import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping, Optional, Sequence
@@ -29,6 +32,7 @@ class ReplayOutcome(str, Enum):
     NOT_INTERESTING = "not_interesting"
     INFRA_ERROR = "infra_error"
     TIMED_OUT = "timed_out"
+    STALE_INPUT = "stale_input"
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,8 @@ class ReplayConfig:
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
     capture_output: bool = True
+    expected_kernel_name: Optional[str] = None
+    expected_kernel_checksum: Optional[str] = None
     # Exact non-zero oracle codes that mean a valid non-reproduction. An empty
     # tuple makes every non-zero code unexpected rather than accepting all.
     not_interesting_exit_codes: tuple[int, ...] = (1,)
@@ -53,6 +59,20 @@ class ReplayConfig:
     def __post_init__(self) -> None:
         if self.timeout <= 0:
             raise ValueError("replay timeout must be positive")
+        if (self.expected_kernel_name is None) != (
+            self.expected_kernel_checksum is None
+        ):
+            raise ValueError(
+                "expected replay kernel name and checksum must be provided together"
+            )
+        if self.expected_kernel_name is not None and (
+            not self.expected_kernel_name.strip()
+            or not self.expected_kernel_checksum
+            or not self.expected_kernel_checksum.strip()
+        ):
+            raise ValueError(
+                "expected replay kernel name and checksum must be non-empty"
+            )
 
 
 @dataclass(frozen=True)
@@ -142,20 +162,166 @@ def _replay_delay_ns(config_path: str) -> int:
     return delay_ns
 
 
-def run_replay(
+_MAX_KERNEL_EVENT_LINE_BYTES = 1024 * 1024
+
+
+def _scan_kernel_event_file(
+    event_path: str,
+    *,
+    expected_checksum: str,
+    sample_limit: int,
+) -> tuple[bool, list[tuple[str, str]], list[str]]:
+    observed: list[tuple[str, str]] = []
+    parse_errors: list[str] = []
+    with open(event_path, "rb") as events:
+        while line := events.readline(_MAX_KERNEL_EVENT_LINE_BYTES + 1):
+            if len(line) > _MAX_KERNEL_EVENT_LINE_BYTES:
+                while line and not line.endswith(b"\n"):
+                    line = events.readline(_MAX_KERNEL_EVENT_LINE_BYTES + 1)
+                if len(parse_errors) < 3:
+                    parse_errors.append(
+                        f"{os.path.basename(event_path)}: kernel event line "
+                        f"exceeds {_MAX_KERNEL_EVENT_LINE_BYTES} bytes"
+                    )
+                continue
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError) as exc:
+                if len(parse_errors) < 3:
+                    parse_errors.append(f"{os.path.basename(event_path)}: {exc}")
+                continue
+            if not isinstance(event, dict) or event.get("type") != "kernel_launch":
+                continue
+            identity = (
+                str(event.get("kernel_name") or ""),
+                str(event.get("kernel_checksum") or ""),
+            )
+            # Delay configs record the mangled kernel name, while launch events
+            # record the demangled name. The checksum is their shared identity;
+            # retain names only for mismatch diagnostics.
+            if identity[1] == expected_checksum:
+                return True, observed, parse_errors
+            if len(observed) < sample_limit:
+                observed.append(identity)
+    return False, observed, parse_errors
+
+
+def _scan_replay_kernel_events(
+    event_paths: list[str],
+    *,
+    expected_checksum: str,
+) -> tuple[bool, list[tuple[str, str]], list[str], list[str]]:
+    observed: list[tuple[str, str]] = []
+    parse_errors: list[str] = []
+    read_errors: list[str] = []
+    for event_path in event_paths:
+        try:
+            matched, samples, errors = _scan_kernel_event_file(
+                event_path,
+                expected_checksum=expected_checksum,
+                sample_limit=max(0, 5 - len(observed)),
+            )
+        except OSError as exc:
+            if len(read_errors) < 3:
+                read_errors.append(f"{os.path.basename(event_path)}: {exc}")
+            continue
+        observed.extend(samples)
+        if len(parse_errors) < 3:
+            parse_errors.extend(errors[: 3 - len(parse_errors)])
+        if matched:
+            return True, observed, parse_errors, read_errors
+    return False, observed, parse_errors, read_errors
+
+
+def _validate_replay_kernel_identity(
+    output_dir: str,
+    *,
+    expected_name: str,
+    expected_checksum: str,
+) -> Optional[tuple[ReplayOutcome, str]]:
+    """Classify missing/corrupt replay evidence for the pinned kernel."""
+    event_paths = sorted(
+        glob.glob(os.path.join(output_dir, "cutracer_kernel_events_*.ndjson"))
+    )
+    if not event_paths:
+        return (
+            ReplayOutcome.INFRA_ERROR,
+            "replay emitted no kernel event files for identity validation",
+        )
+
+    matched, observed, parse_errors, read_errors = _scan_replay_kernel_events(
+        event_paths,
+        expected_checksum=expected_checksum,
+    )
+    if matched:
+        return None
+
+    # A corrupt record could contain the expected launch, so incomplete
+    # evidence cannot prove that the observed checksum mismatch is stale input.
+    if read_errors:
+        return (
+            ReplayOutcome.INFRA_ERROR,
+            "could not validate replay kernel events: " + "; ".join(read_errors[:3]),
+        )
+
+    if parse_errors:
+        return (
+            ReplayOutcome.INFRA_ERROR,
+            "could not parse replay kernel events: " + "; ".join(parse_errors[:3]),
+        )
+
+    if not observed:
+        return (
+            ReplayOutcome.INFRA_ERROR,
+            "replay emitted no valid kernel launch events for identity validation",
+        )
+
+    detail = ", ".join(f"{name}:{checksum}" for name, checksum in observed[:5])
+    return (
+        ReplayOutcome.STALE_INPUT,
+        f"replay did not launch pinned kernel {expected_name}:{expected_checksum}; "
+        f"observed {detail}",
+    )
+
+
+def _classify_replay_process(
+    proc: subprocess.CompletedProcess[str],
+    config: ReplayConfig,
+) -> ReplayResult:
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if proc.returncode == 0:
+        return ReplayResult(
+            outcome=ReplayOutcome.INTERESTING,
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if proc.returncode in config.not_interesting_exit_codes:
+        return ReplayResult(
+            outcome=ReplayOutcome.NOT_INTERESTING,
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return ReplayResult(
+        outcome=ReplayOutcome.INFRA_ERROR,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        error=f"oracle exited with unexpected code {proc.returncode}",
+    )
+
+
+def _run_replay_once(
     config_path: str,
     config: ReplayConfig,
     *,
+    output_dir: Optional[str],
     runner: Optional[RunTarget] = None,
 ) -> ReplayResult:
-    """Replay one candidate using the CUTracer library from this Python package."""
-    if not config.oracle_argv:
-        return ReplayResult(
-            outcome=ReplayOutcome.INFRA_ERROR,
-            returncode=None,
-            error="replay oracle argv must not be empty",
-        )
-
     try:
         proc = run_instrumented_target(
             config.oracle_argv,
@@ -164,12 +330,15 @@ def run_replay(
                 instrument="random_delay",
                 analysis="random_delay",
                 kernel_filters=config.kernel_filters,
-                output_dir=config.output_dir,
+                output_dir=output_dir,
                 delay_ns=_replay_delay_ns(config_path),
                 delay_mode=config.delay_mode,
                 delay_warpgroup_id=config.delay_warpgroup_id,
                 delay_warp_mask=config.delay_warp_mask,
                 delay_load_path=config_path,
+                kernel_events=(
+                    "nostack" if config.expected_kernel_name is not None else None
+                ),
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
@@ -190,24 +359,76 @@ def run_replay(
             error=str(exc),
         )
 
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
-    if proc.returncode == 0:
-        outcome = ReplayOutcome.INTERESTING
-        error = None
-    elif proc.returncode in config.not_interesting_exit_codes:
-        outcome = ReplayOutcome.NOT_INTERESTING
-        error = None
-    else:
-        outcome = ReplayOutcome.INFRA_ERROR
-        error = f"oracle exited with unexpected code {proc.returncode}"
-    return ReplayResult(
-        outcome=outcome,
-        returncode=proc.returncode,
-        stdout=stdout,
-        stderr=stderr,
-        error=error,
-    )
+    replay_result = _classify_replay_process(proc, config)
+    if replay_result.outcome == ReplayOutcome.INFRA_ERROR:
+        return replay_result
+
+    if config.expected_kernel_name is not None:
+        assert config.expected_kernel_checksum is not None
+        assert output_dir is not None
+        identity_failure = _validate_replay_kernel_identity(
+            output_dir,
+            expected_name=config.expected_kernel_name,
+            expected_checksum=config.expected_kernel_checksum,
+        )
+        if identity_failure is not None:
+            outcome, reason = identity_failure
+            return ReplayResult(
+                outcome=outcome,
+                returncode=proc.returncode,
+                stdout=replay_result.stdout,
+                stderr=replay_result.stderr,
+                error=reason,
+            )
+    return replay_result
+
+
+def run_replay(
+    config_path: str,
+    config: ReplayConfig,
+    *,
+    runner: Optional[RunTarget] = None,
+) -> ReplayResult:
+    """Replay one candidate using the CUTracer library from this Python package."""
+    if not config.oracle_argv:
+        return ReplayResult(
+            outcome=ReplayOutcome.INFRA_ERROR,
+            returncode=None,
+            error="replay oracle argv must not be empty",
+        )
+
+    if config.expected_kernel_name is None:
+        return _run_replay_once(
+            config_path,
+            config,
+            output_dir=config.output_dir,
+            runner=runner,
+        )
+
+    parent = config.output_dir or tempfile.gettempdir()
+    try:
+        os.makedirs(parent, exist_ok=True)
+        # Per-candidate kernel events are verification scratch, not user-facing
+        # evidence. ReplayResult retains stdout/stderr and a compact identity
+        # failure summary; deleting the raw directory avoids one leak per
+        # reducer candidate. The service preserves the final reduction report.
+        with tempfile.TemporaryDirectory(
+            prefix="cutracer_replay_",
+            dir=parent,
+            ignore_cleanup_errors=True,
+        ) as replay_output_dir:
+            return _run_replay_once(
+                config_path,
+                config,
+                output_dir=replay_output_dir,
+                runner=runner,
+            )
+    except OSError as exc:
+        return ReplayResult(
+            outcome=ReplayOutcome.INFRA_ERROR,
+            returncode=None,
+            error=f"could not manage replay evidence directory: {exc}",
+        )
 
 
 def run_test(
@@ -253,7 +474,11 @@ def _candidate_is_interesting(config: ReduceConfig, config_path: str) -> bool:
             config.replay,
             runner=config.replay_runner,
         )
-        if result.outcome in (ReplayOutcome.INFRA_ERROR, ReplayOutcome.TIMED_OUT):
+        if result.outcome in (
+            ReplayOutcome.INFRA_ERROR,
+            ReplayOutcome.TIMED_OUT,
+            ReplayOutcome.STALE_INPUT,
+        ):
             detail = result.error or result.stderr or result.outcome.value
             raise ReplayExecutionError(
                 f"could not evaluate replay candidate: {detail}",

@@ -240,6 +240,16 @@ class ReplayTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "timeout must be positive"):
                     ReplayConfig(oracle_argv=["oracle"], timeout=timeout)
 
+    def test_replay_config_rejects_empty_kernel_identity(self):
+        for name, checksum in (("", "hash"), ("kernel", ""), (" ", "hash")):
+            with self.subTest(name=name, checksum=checksum):
+                with self.assertRaisesRegex(ValueError, "must be non-empty"):
+                    ReplayConfig(
+                        oracle_argv=["oracle"],
+                        expected_kernel_name=name,
+                        expected_kernel_checksum=checksum,
+                    )
+
     def test_replay_uses_current_runtime_and_structured_argv(self):
         calls = []
 
@@ -300,6 +310,153 @@ class ReplayTest(unittest.TestCase):
             runner=runner,
         )
         self.assertEqual(empty_allowlist.outcome, ReplayOutcome.INFRA_ERROR)
+
+    def test_replay_classifies_missing_or_empty_kernel_events_as_infra(self):
+        def runner_for(event_contents):
+            def runner(argv, **kwargs):
+                output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if event_contents is not None:
+                    (output_dir / "cutracer_kernel_events_test.ndjson").write_bytes(
+                        event_contents
+                    )
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            return runner
+
+        cases = (
+            ("missing", None, "no kernel event files"),
+            ("empty", b"", "no valid kernel launch events"),
+        )
+        for label, contents, diagnostic in cases:
+            with self.subTest(label=label):
+                result = run_replay(
+                    str(self.config_path),
+                    ReplayConfig(
+                        oracle_argv=["./oracle"],
+                        cutracer_so=str(self.cutracer_so),
+                        output_dir=str(self.temp_dir / f"events-{label}"),
+                        expected_kernel_name="matmul_kernel",
+                        expected_kernel_checksum="a1b2c3d4e5f60001",
+                    ),
+                    runner=runner_for(contents),
+                )
+
+                self.assertEqual(result.outcome, ReplayOutcome.INFRA_ERROR)
+                self.assertIn(diagnostic, result.error or "")
+
+    def test_replay_accepts_renamed_kernel_with_matching_checksum(self):
+        def runner(argv, **kwargs):
+            output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            event = {
+                "type": "kernel_launch",
+                "kernel_name": "demangled_kernel_name",
+                "kernel_checksum": "a1b2c3d4e5f60001",
+            }
+            (output_dir / "cutracer_kernel_events_test.ndjson").write_text(
+                json.dumps(event) + "\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        result = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                output_dir=str(self.temp_dir / "events-match"),
+                expected_kernel_name="mangled_kernel_name",
+                expected_kernel_checksum="a1b2c3d4e5f60001",
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual(result.outcome, ReplayOutcome.INTERESTING)
+        self.assertIsNone(result.error)
+
+    def test_replay_classifies_observed_checksum_mismatch_as_stale(self):
+        def runner(argv, **kwargs):
+            output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            event = {
+                "type": "kernel_launch",
+                "kernel_name": "other_kernel",
+                "kernel_checksum": "different",
+            }
+            (output_dir / "cutracer_kernel_events_test.ndjson").write_text(
+                json.dumps(event) + "\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        result = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                output_dir=str(self.temp_dir / "events-mismatch"),
+                expected_kernel_name="matmul_kernel",
+                expected_kernel_checksum="a1b2c3d4e5f60001",
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual(result.outcome, ReplayOutcome.STALE_INPUT)
+        self.assertIn("observed other_kernel:different", result.error or "")
+
+    def test_replay_classifies_undecodable_kernel_events_as_infra(self):
+        def runner(argv, **kwargs):
+            output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            event = json.dumps(
+                {
+                    "type": "kernel_launch",
+                    "kernel_name": "other_kernel",
+                    "kernel_checksum": "different",
+                }
+            ).encode()
+            (output_dir / "cutracer_kernel_events_test.ndjson").write_bytes(
+                event + b"\n\xff\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        result = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                output_dir=str(self.temp_dir / "events"),
+                expected_kernel_name="matmul_kernel",
+                expected_kernel_checksum="a1b2c3d4e5f60001",
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual(result.outcome, ReplayOutcome.INFRA_ERROR)
+        self.assertIn("could not parse replay kernel events", result.error or "")
+
+    def test_replay_rejects_oversized_kernel_event_line_as_infra(self):
+        def runner(argv, **kwargs):
+            output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "cutracer_kernel_events_test.ndjson").write_bytes(
+                b"{" + b"x" * (1024 * 1024) + b"}\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        result = run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                output_dir=str(self.temp_dir / "events"),
+                expected_kernel_name="matmul_kernel",
+                expected_kernel_checksum="a1b2c3d4e5f60001",
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual(result.outcome, ReplayOutcome.INFRA_ERROR)
+        self.assertIn("kernel event line exceeds", result.error or "")
 
     def test_reducer_aborts_on_replay_infra_error(self):
         def runner(argv, **kwargs):
