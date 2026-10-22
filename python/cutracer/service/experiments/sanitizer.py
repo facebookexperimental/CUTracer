@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
@@ -18,8 +20,9 @@ from cutracer.compute_sanitizer.run import (
     RunTarget,
     SupportsTensorOps,
 )
-from cutracer.service.artifacts import local_artifact
+from cutracer.service.artifacts import publish_local_artifact
 from cutracer.service.contracts import (
+    ArtifactRef,
     ExecutionProvenance,
     ExecutionStatus,
     ExperimentKind,
@@ -48,6 +51,16 @@ def _default_reader(path: str) -> str:
     # report instead of turning one bad byte into an infrastructure failure.
     with open(path, errors="replace") as fh:
         return fh.read()
+
+
+def _append_error(error: Optional[str], detail: str) -> str:
+    return detail if error is None else f"{error}; {detail}"
+
+
+def _record_artifact_failure(status: ExecutionStatus) -> ExecutionStatus:
+    if status == ExecutionStatus.SUCCEEDED:
+        return ExecutionStatus.INFRA_ERROR
+    return status
 
 
 def _parse_racecheck_evidence(text: str) -> _RacecheckEvidence:
@@ -94,6 +107,165 @@ def parse_racecheck_log(text: str) -> List[FindingRecord]:
     return _parse_racecheck_evidence(text).findings
 
 
+def _invoke_sanitizer(
+    spec: ExperimentSpec,
+    *,
+    tool: str,
+    attempt_dir: str,
+    runner: Optional[RunTarget],
+    compute_sanitizer: Optional[str],
+    supports_tensor_ops: Optional[SupportsTensorOps],
+    timeout: int,
+) -> tuple[ExecutionStatus, str | None, str]:
+    log_path = os.path.join(attempt_dir, f"{tool}.log")
+    try:
+        captured = run_compute_sanitizer(
+            ComputeSanitizerConfig(
+                argv=spec.unit.argv,
+                tool=tool,
+                output_dir=attempt_dir,
+                compute_sanitizer=compute_sanitizer,
+                cwd=spec.unit.cwd or None,
+                timeout=timeout,
+                base_env=os.environ,
+                env=spec.unit.env,
+            ),
+            runner=runner,
+            supports_tensor_ops=supports_tensor_ops,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return ExecutionStatus.TIMED_OUT, str(exc), log_path
+    except (ClickException, OSError, ValueError) as exc:
+        return ExecutionStatus.INFRA_ERROR, str(exc), log_path
+
+    status = (
+        ExecutionStatus.SUCCEEDED
+        if captured.process.returncode == 0
+        else ExecutionStatus.FAILED
+    )
+    error = (
+        None
+        if captured.process.returncode == 0
+        else captured.process.stderr or "process failed"
+    )
+    return status, error, captured.log_path or log_path
+
+
+def _read_and_publish_log(
+    log_path: str,
+    *,
+    out_dir: str,
+    tool: str,
+    read: Reader,
+    status: ExecutionStatus,
+    error: str | None,
+) -> tuple[str, ArtifactRef | None, ExecutionStatus, str | None]:
+    try:
+        text = read(log_path)
+    except FileNotFoundError:
+        return (
+            "",
+            None,
+            _record_artifact_failure(status),
+            _append_error(error, "sanitizer completed without producing its log"),
+        )
+    except OSError as exc:
+        return (
+            "",
+            None,
+            _record_artifact_failure(status),
+            _append_error(error, f"could not read sanitizer log {log_path}: {exc}"),
+        )
+
+    try:
+        log = publish_local_artifact(log_path, os.path.join(out_dir, f"{tool}.log"))
+    except OSError as exc:
+        return (
+            text,
+            None,
+            _record_artifact_failure(status),
+            _append_error(error, f"could not publish sanitizer log: {exc}"),
+        )
+    return text, log, status, error
+
+
+def _sanitizer_outcome(
+    racecheck: _RacecheckEvidence | None,
+    *,
+    status: ExecutionStatus,
+    log: ArtifactRef | None,
+) -> SanitizerOutcome:
+    if racecheck is None or racecheck.completeness != ResultCompleteness.COMPLETE:
+        return SanitizerOutcome.UNKNOWN
+    if racecheck.summary is not None and racecheck.summary.is_positive:
+        return SanitizerOutcome.FINDING
+    if status == ExecutionStatus.SUCCEEDED and log is not None:
+        return SanitizerOutcome.CLEAN
+    return SanitizerOutcome.UNKNOWN
+
+
+def _run_sanitizer_attempt(
+    spec: ExperimentSpec,
+    *,
+    out_dir: str,
+    attempt_dir: str,
+    runner: Optional[RunTarget] = None,
+    reader: Optional[Reader] = None,
+    compute_sanitizer: Optional[str] = None,
+    supports_tensor_ops: Optional[SupportsTensorOps] = None,
+    timeout: int = 1800,
+) -> SanitizerSweepResult:
+    if spec.sanitizer_tool is None:
+        raise ValueError("sanitizer experiment requires a sanitizer_tool")
+    read = reader or _default_reader
+    tool = spec.sanitizer_tool
+    started = time.monotonic()
+    status, error, log_path = _invoke_sanitizer(
+        spec,
+        tool=tool,
+        attempt_dir=attempt_dir,
+        runner=runner,
+        compute_sanitizer=compute_sanitizer,
+        supports_tensor_ops=supports_tensor_ops,
+        timeout=timeout,
+    )
+    text, log, status, error = _read_and_publish_log(
+        log_path,
+        out_dir=out_dir,
+        tool=tool,
+        read=read,
+        status=status,
+        error=error,
+    )
+
+    racecheck = _parse_racecheck_evidence(text) if tool == "racecheck" else None
+    findings = [] if racecheck is None else racecheck.findings
+    summary = None if racecheck is None else racecheck.summary
+    completeness = (
+        ResultCompleteness.UNKNOWN if racecheck is None else racecheck.completeness
+    )
+    summary_issues = [] if racecheck is None else racecheck.issues
+
+    return SanitizerSweepResult(
+        experiment_id=spec.experiment_id,
+        execution_status=status,
+        outcome=_sanitizer_outcome(racecheck, status=status, log=log),
+        tool=tool,
+        findings=findings,
+        provenance=ExecutionProvenance(
+            source_revision=spec.unit.source_revision,
+            arch=spec.unit.arch,
+            kernel=spec.unit.kernel,
+        ),
+        log=log,
+        duration_s=time.monotonic() - started,
+        error=error,
+        summary=summary,
+        completeness=completeness,
+        summary_issues=summary_issues,
+    )
+
+
 def run_sanitizer_experiment(
     spec: ExperimentSpec,
     *,
@@ -111,90 +283,19 @@ def run_sanitizer_experiment(
         raise ValueError("sanitizer experiment requires a sanitizer_tool")
 
     os.makedirs(out_dir, exist_ok=True)
-    read = reader or _default_reader
-    tool = spec.sanitizer_tool
-    started = time.monotonic()
-    log_path = os.path.join(out_dir, f"{tool}.log")
-    log = None
-    text = ""
-
+    attempt_dir = tempfile.mkdtemp(prefix=".sanitizer_attempt_", dir=out_dir)
+    result: Optional[SanitizerSweepResult] = None
     try:
-        captured = run_compute_sanitizer(
-            ComputeSanitizerConfig(
-                argv=spec.unit.argv,
-                tool=tool,
-                output_dir=out_dir,
-                compute_sanitizer=compute_sanitizer,
-                cwd=spec.unit.cwd or None,
-                timeout=timeout,
-                base_env=os.environ,
-                env=spec.unit.env,
-            ),
+        result = _run_sanitizer_attempt(
+            spec,
+            out_dir=out_dir,
+            attempt_dir=attempt_dir,
             runner=runner,
+            reader=reader,
+            compute_sanitizer=compute_sanitizer,
             supports_tensor_ops=supports_tensor_ops,
+            timeout=timeout,
         )
-        proc = captured.process
-        log_path = captured.log_path or log_path
-        status = (
-            ExecutionStatus.SUCCEEDED
-            if proc.returncode == 0
-            else ExecutionStatus.FAILED
-        )
-        error = None if proc.returncode == 0 else (proc.stderr or "process failed")
-    except subprocess.TimeoutExpired as exc:
-        status = ExecutionStatus.TIMED_OUT
-        error = str(exc)
-    except (ClickException, OSError, ValueError) as exc:
-        status = ExecutionStatus.INFRA_ERROR
-        error = str(exc)
-
-    try:
-        text = read(log_path)
-        log = local_artifact(log_path)
-    except FileNotFoundError:
-        if status == ExecutionStatus.SUCCEEDED:
-            status = ExecutionStatus.INFRA_ERROR
-            error = "sanitizer completed without producing its log"
-    except OSError as exc:
-        if status == ExecutionStatus.SUCCEEDED:
-            status = ExecutionStatus.INFRA_ERROR
-            error = f"could not read sanitizer log {log_path}: {exc}"
-
-    racecheck = _parse_racecheck_evidence(text) if tool == "racecheck" else None
-    findings = [] if racecheck is None else racecheck.findings
-    summary = None if racecheck is None else racecheck.summary
-    completeness = (
-        ResultCompleteness.UNKNOWN if racecheck is None else racecheck.completeness
-    )
-    summary_issues = [] if racecheck is None else racecheck.issues
-
-    if racecheck is None or racecheck.completeness != ResultCompleteness.COMPLETE:
-        outcome = SanitizerOutcome.UNKNOWN
-    elif summary is not None and summary.is_positive:
-        # A complete positive summary is useful evidence even if the target
-        # process itself returned non-zero. Execution and semantic outcome are
-        # intentionally kept separate.
-        outcome = SanitizerOutcome.FINDING
-    elif status == ExecutionStatus.SUCCEEDED and log is not None:
-        outcome = SanitizerOutcome.CLEAN
-    else:
-        outcome = SanitizerOutcome.UNKNOWN
-
-    return SanitizerSweepResult(
-        experiment_id=spec.experiment_id,
-        execution_status=status,
-        outcome=outcome,
-        tool=tool,
-        findings=findings,
-        provenance=ExecutionProvenance(
-            source_revision=spec.unit.source_revision,
-            arch=spec.unit.arch,
-            kernel=spec.unit.kernel,
-        ),
-        log=log,
-        duration_s=time.monotonic() - started,
-        error=error,
-        summary=summary,
-        completeness=completeness,
-        summary_issues=summary_issues,
-    )
+        return result
+    finally:
+        shutil.rmtree(attempt_dir, ignore_errors=True)
