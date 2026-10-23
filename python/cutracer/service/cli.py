@@ -6,7 +6,8 @@ import tempfile
 from typing import Callable, Optional
 
 import click
-from cutracer.runtime_version import get_runtime_version
+from cutracer.runner import resolve_cutracer_so
+from cutracer.service.artifacts import local_artifact, runtime_identity_is_missing
 from cutracer.service.contracts import SessionReport, WorkUnit
 from cutracer.service.runner import (
     FileReportSink,
@@ -17,6 +18,15 @@ from cutracer.service.runner import (
 )
 
 RunLocalFn = Callable[..., SessionReport]
+
+
+def _cutracer_runtime_identity(cutracer_so: str) -> str:
+    artifact = local_artifact(cutracer_so, include_sha256=True)
+    if artifact.sha256 is None:
+        raise click.ClickException(
+            f"could not identify the CUTracer runtime library: {cutracer_so}"
+        )
+    return f"sha256:{artifact.sha256}"
 
 
 def run_diagnosis(
@@ -31,6 +41,12 @@ def run_diagnosis(
     run_local_fn: RunLocalFn,
 ) -> SessionReport:
     """Load a work unit and drive the shared session loop on this host."""
+    toolchain_identity = toolchain_version.strip()
+    if runtime_identity_is_missing(toolchain_identity):
+        raise click.ClickException(
+            "--toolchain-version must identify the immutable target toolchain"
+        )
+
     with open(target) as fh:
         unit = WorkUnit.from_json(fh)
 
@@ -39,13 +55,15 @@ def run_diagnosis(
         artifact_dir = tempfile.mkdtemp(prefix="cutracer_diagnose_")
         click.echo(f"cutracer diagnose: writing artifacts to {artifact_dir}", err=True)
 
+    resolved_cutracer_so = resolve_cutracer_so(cutracer_so)
+
     executor = LocalExperimentExecutor(
         LocalRuntimeConfig(
             out_dir=artifact_dir,
-            cutracer_so=cutracer_so,
+            cutracer_so=resolved_cutracer_so,
             compute_sanitizer=compute_sanitizer,
-            cutracer_version=get_runtime_version(),
-            toolchain_version=toolchain_version,
+            cutracer_version=_cutracer_runtime_identity(resolved_cutracer_so),
+            toolchain_version=toolchain_identity,
         )
     )
     store = None if state is None else FileSessionStore(state)
@@ -77,7 +95,11 @@ def run_diagnosis(
     default=None,
     help="Override the CUTracer library bundled with this command.",
 )
-@click.option("--toolchain-version", default="")
+@click.option(
+    "--toolchain-version",
+    required=True,
+    help="Immutable identity of the target CUDA/Triton toolchain.",
+)
 def diagnose_command(
     target: str,
     local: bool,

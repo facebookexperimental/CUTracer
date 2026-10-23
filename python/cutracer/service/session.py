@@ -16,12 +16,15 @@ from cutracer.service.contracts import (
     DecisionKind,
     EvidenceBundle,
     EvidenceSufficiency,
+    ExecutionStatus,
     ExperimentKind,
     ExperimentPhase,
     ExperimentResult,
     ExperimentSpec,
     ExplainReport,
     ReduceExperimentResult,
+    ReduceOutcome,
+    ResultCompleteness,
     SanitizerOutcome,
     SanitizerSweepResult,
     SessionBudget,
@@ -38,6 +41,7 @@ from cutracer.service.policy import (
     ExperimentGuardPolicy,
     InitialCampaignPolicy,
 )
+from cutracer.service.triage import initial_evidence_requires_inconclusive
 
 
 class EffectKind(str, Enum):
@@ -215,6 +219,8 @@ def _validate_triggering_config(
         or config.source_revision != unit.source_revision
         or config.arch != unit.arch
         or config.kernel != unit.kernel
+        or config.cutracer_version != result.provenance.tool_version
+        or config.toolchain_version != result.provenance.toolchain_version
     ):
         _reject_result(
             "trigger_config_mismatch",
@@ -271,9 +277,24 @@ def _validate_sanitizer_result(
             "sanitizer_result_inconsistent",
             "finding outcome has no finding block or positive summary",
         )
+    if result.outcome == SanitizerOutcome.CLEAN and not result.has_trustworthy_clean:
+        _reject_result(
+            "sanitizer_result_inconsistent",
+            "clean outcome requires a complete zero racecheck summary",
+        )
+    if result.completeness == ResultCompleteness.COMPLETE and result.summary_issues:
+        _reject_result(
+            "sanitizer_result_inconsistent",
+            "complete sanitizer result cannot retain summary diagnostics",
+        )
+    if result.completeness == ResultCompleteness.COMPLETE_EARLY:
+        _reject_result(
+            "sanitizer_result_inconsistent",
+            "sanitizer checks do not support complete-early results",
+        )
 
 
-def _validate_stress_result(
+def _validate_stress_counts(
     spec: ExperimentSpec,
     result: StressTestResult,
 ) -> None:
@@ -303,6 +324,12 @@ def _validate_stress_result(
         _reject_result(
             "stress_plan_mismatch", "stress campaign counts are outside the plan"
         )
+
+
+def _validate_stress_triggering_config(
+    spec: ExperimentSpec,
+    result: StressTestResult,
+) -> None:
     if result.triggering_config is not None:
         if result.reproductions == 0:
             _reject_result(
@@ -310,6 +337,34 @@ def _validate_stress_result(
                 "triggering config has no reproduced trial",
             )
         _validate_triggering_config(spec, result, result.triggering_config)
+
+
+def _validate_skipped_stress_outcome(result: StressTestResult) -> None:
+    if result.outcome != StressOutcome.SKIPPED:
+        return
+    skipped_scope_is_invalid = (
+        result.execution_status != ExecutionStatus.SUCCEEDED
+        or result.planned_trials != 0
+        or result.completed_trials != 0
+        or result.reproductions != 0
+        or result.unattributed_reproductions != 0
+        or result.infra_errors != 0
+        or result.timed_out_trials != 0
+        or result.triggering_config is not None
+        or result.completeness != ResultCompleteness.SKIPPED
+    )
+    if skipped_scope_is_invalid:
+        _reject_result(
+            "stress_result_inconsistent",
+            "skipped stress result must have an empty skipped scope",
+        )
+
+
+def _validate_stress_outcome(
+    spec: ExperimentSpec,
+    result: StressTestResult,
+) -> None:
+    _validate_stress_triggering_config(spec, result)
     if result.outcome == StressOutcome.REPRODUCED and (
         result.reproductions == 0 or result.triggering_config is None
     ):
@@ -326,6 +381,84 @@ def _validate_stress_result(
             "stress_result_inconsistent",
             "unattributed outcome requires only unattributed reproductions",
         )
+    if (
+        result.outcome == StressOutcome.NOT_REPRODUCED
+        and not result.has_trustworthy_non_reproduction
+    ):
+        _reject_result(
+            "stress_result_inconsistent",
+            "non-reproduced outcome requires complete error-free trial coverage",
+        )
+    _validate_skipped_stress_outcome(result)
+
+
+def _validate_stress_completeness(
+    spec: ExperimentSpec,
+    result: StressTestResult,
+) -> None:
+    assert spec.stress is not None
+    if result.outcome != StressOutcome.SKIPPED:
+        if result.completeness == ResultCompleteness.SKIPPED:
+            _reject_result(
+                "stress_result_inconsistent",
+                "only a skipped outcome can claim skipped completeness",
+            )
+    if result.outcome == StressOutcome.INCOMPLETE and result.completeness in (
+        ResultCompleteness.COMPLETE,
+        ResultCompleteness.COMPLETE_EARLY,
+    ):
+        _reject_result(
+            "stress_result_inconsistent",
+            "incomplete outcome cannot claim complete coverage",
+        )
+    if result.completeness == ResultCompleteness.COMPLETE and (
+        result.completed_trials != result.planned_trials
+        or result.infra_errors != 0
+        or result.timed_out_trials != 0
+    ):
+        _reject_result(
+            "stress_result_inconsistent",
+            "complete stress result must account for every planned trial",
+        )
+    if result.completeness == ResultCompleteness.COMPLETE_EARLY and (
+        result.outcome != StressOutcome.REPRODUCED
+        or not spec.stress.stop_on_first_reproduction
+        or result.completed_trials >= result.planned_trials
+        or result.infra_errors != 0
+        or result.timed_out_trials != 0
+    ):
+        _reject_result(
+            "stress_result_inconsistent",
+            "complete-early stress result requires an error-free early reproduction",
+        )
+
+
+def _validate_stress_result(
+    spec: ExperimentSpec,
+    result: StressTestResult,
+) -> None:
+    _validate_stress_counts(spec, result)
+    _validate_stress_outcome(spec, result)
+    _validate_stress_completeness(spec, result)
+
+
+def _validate_trace_result(result: TraceExperimentResult) -> None:
+    if result.execution_status == ExecutionStatus.SUCCEEDED:
+        if result.trace is None or result.error is not None:
+            _reject_result(
+                "trace_result_inconsistent",
+                "successful trace result requires a trace and no error",
+            )
+    elif result.trace is not None:
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace result cannot publish a completed trace",
+        )
+    elif not result.error:
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace result requires a non-empty error",
+        )
 
 
 def _validate_reduce_result(
@@ -338,6 +471,45 @@ def _validate_reduce_result(
             "reduce_input_config_mismatch",
             "reduction input differs from the pending triggering config",
         )
+    if result.outcome == ReduceOutcome.REDUCED:
+        if (
+            result.execution_status != ExecutionStatus.SUCCEEDED
+            or result.report is None
+            or result.error is not None
+        ):
+            _reject_result(
+                "reduce_result_inconsistent",
+                "reduced outcome requires a successful report and no error",
+            )
+    else:
+        if (
+            result.minimized_config is not None
+            or result.report is not None
+            or result.essential_points
+        ):
+            _reject_result(
+                "reduce_result_inconsistent",
+                "unsuccessful reduction cannot publish reduced artifacts",
+            )
+        expected_statuses = {
+            ReduceOutcome.NON_REPRODUCIBLE: (ExecutionStatus.FAILED,),
+            ReduceOutcome.STALE_INPUT: (ExecutionStatus.FAILED,),
+            ReduceOutcome.INFRA_ERROR: (
+                ExecutionStatus.INFRA_ERROR,
+                ExecutionStatus.TIMED_OUT,
+            ),
+        }
+        expected = expected_statuses.get(result.outcome)
+        if expected is None:
+            _reject_result(
+                "reduce_result_inconsistent",
+                f"unsupported reduction outcome: {result.outcome.value}",
+            )
+        if result.execution_status not in expected:
+            _reject_result(
+                "reduce_result_inconsistent",
+                "reduction outcome does not match its execution status",
+            )
 
 
 def _validate_result_against_spec(
@@ -377,6 +549,8 @@ def _validate_result_against_spec(
         _validate_sanitizer_result(spec, result)
     elif isinstance(result, StressTestResult):
         _validate_stress_result(spec, result)
+    elif isinstance(result, TraceExperimentResult):
+        _validate_trace_result(result)
     elif isinstance(result, ReduceExperimentResult):
         _validate_reduce_result(spec, result)
 
@@ -500,6 +674,10 @@ def record_experiment_result(
     updated.completed_experiment_ids.append(result.experiment_id)
     if updated.pending_experiments:
         return Transition(session=updated, effects=())
+    if spec.phase == ExperimentPhase.INITIAL and initial_evidence_requires_inconclusive(
+        updated.evidence
+    ):
+        return _terminate_inconclusive(updated, "initial evidence is incomplete")
     updated.status = SessionStatus.WAITING_REASONER
     return Transition(
         session=updated,
@@ -524,10 +702,14 @@ def record_analysis_decision(
     *,
     guard_policy: Optional[ExperimentGuardPolicy] = None,
 ) -> Transition:
+    if session.status != SessionStatus.WAITING_REASONER:
+        raise ValueError(f"reasoner result in invalid state: {session.status}")
     updated = _clone(session)
-    if updated.status != SessionStatus.WAITING_REASONER:
-        raise ValueError(f"reasoner result in invalid state: {updated.status}")
     updated.turns.append(AnalysisTurn(turn_index=len(updated.turns), decision=decision))
+    if session.round_index == 0 and initial_evidence_requires_inconclusive(
+        session.evidence
+    ):
+        return _terminate_inconclusive(updated, "initial evidence is incomplete")
 
     if decision.kind == DecisionKind.FINAL:
         if decision.report is None:

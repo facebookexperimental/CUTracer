@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from typing import List, Sequence
+from typing import Any, List, Optional, Sequence
 
 from cutracer.service.contracts import (
     AnalysisSession,
@@ -20,6 +20,7 @@ from cutracer.service.contracts import (
     StressOutcome,
     StressTestResult,
     TraceOptions,
+    TriggeringDelayConfig,
     WorkUnit,
 )
 
@@ -37,6 +38,17 @@ def _experiment_id(
 
 def _fingerprint(kind: ExperimentKind, discriminator: str = "") -> str:
     return f"{kind.value}:{discriminator}"
+
+
+def _request_discriminator(
+    request: ExperimentRequest,
+    config: Optional[TriggeringDelayConfig],
+) -> str:
+    if request.kind == ExperimentKind.COMPUTE_SANITIZER:
+        return "racecheck"
+    if request.kind == ExperimentKind.REDUCE_DELAY_CONFIG and config is not None:
+        return config.artifact.uri
+    return ""
 
 
 def experiment_spec_fingerprint(spec: ExperimentSpec) -> str:
@@ -140,6 +152,98 @@ class ExperimentGuardPolicy:
 
     default_trace_size_limit_mb: int = 1024
     auto_reduce_triggering_config: bool = True
+    require_kernel_identity_for_reduce: bool = True
+
+    def _reduce_identity_rejection(
+        self,
+        unit: WorkUnit,
+        config: TriggeringDelayConfig,
+    ) -> Optional[str]:
+        if not self.require_kernel_identity_for_reduce:
+            return None
+        kernel = unit.kernel
+        config_kernel = config.kernel
+        if (
+            kernel is None
+            or not kernel.name.strip()
+            or not kernel.cubin_hash.strip()
+            or config_kernel is None
+            or not config_kernel.name.strip()
+            or not config_kernel.cubin_hash.strip()
+        ):
+            return "reduce requires kernel name and cubin identity"
+        if config_kernel != kernel:
+            return "reduce triggering config kernel identity differs from work unit"
+        return None
+
+    def _build_reduce_spec(
+        self,
+        session: AnalysisSession,
+        config: Optional[TriggeringDelayConfig],
+        common: dict[str, Any],
+    ) -> tuple[Optional[ExperimentSpec], Optional[str]]:
+        if config is None or session.unit.oracle is None:
+            return None, "reduce requires a reproduced config and its approved oracle"
+        rejection = self._reduce_identity_rejection(session.unit, config)
+        if rejection is not None:
+            return None, rejection
+        return (
+            ExperimentSpec(
+                **common,
+                reduction=ReduceOptions(
+                    triggering_config=config,
+                    require_kernel_identity=self.require_kernel_identity_for_reduce,
+                ),
+            ),
+            None,
+        )
+
+    def _build_spec(
+        self,
+        session: AnalysisSession,
+        request: ExperimentRequest,
+        config: Optional[TriggeringDelayConfig],
+        *,
+        index: int,
+        discriminator: str,
+    ) -> tuple[Optional[ExperimentSpec], Optional[str]]:
+        common = {
+            "experiment_id": _experiment_id(
+                session.session_id,
+                ExperimentPhase.FOLLOWUP,
+                session.round_index + 1,
+                request.kind,
+                f"{index}:{discriminator}",
+            ),
+            "session_id": session.session_id,
+            "phase": ExperimentPhase.FOLLOWUP,
+            "kind": request.kind,
+            "unit": session.unit,
+            "round_index": session.round_index + 1,
+        }
+        if request.kind == ExperimentKind.COMPUTE_SANITIZER:
+            return ExperimentSpec(**common, sanitizer_tool="racecheck"), None
+        if request.kind == ExperimentKind.RANDOM_DELAY_STRESS:
+            if session.unit.oracle is None:
+                return None, "random-delay stress requires an approved oracle"
+            return ExperimentSpec(**common, stress=StressOptions()), None
+        if request.kind in (
+            ExperimentKind.REG_TRACE,
+            ExperimentKind.MEM_VALUE_TRACE,
+        ):
+            return (
+                ExperimentSpec(
+                    **common,
+                    trace=TraceOptions(
+                        mode=request.kind,
+                        trace_size_limit_mb=self.default_trace_size_limit_mb,
+                    ),
+                ),
+                None,
+            )
+        if request.kind == ExperimentKind.REDUCE_DELAY_CONFIG:
+            return self._build_reduce_spec(session, config, common)
+        return None, f"unsupported experiment kind: {request.kind.value}"
 
     def expand(
         self,
@@ -167,11 +271,7 @@ class ExperimentGuardPolicy:
         fingerprints: List[str] = []
         rejections: List[str] = []
         for index, request in enumerate(requested):
-            discriminator = ""
-            if request.kind == ExperimentKind.COMPUTE_SANITIZER:
-                discriminator = "racecheck"
-            elif request.kind == ExperimentKind.REDUCE_DELAY_CONFIG:
-                discriminator = "" if config is None else config.artifact.uri
+            discriminator = _request_discriminator(request, config)
             fingerprint = _fingerprint(request.kind, discriminator)
             if (
                 fingerprint in session.experiment_fingerprints
@@ -180,51 +280,16 @@ class ExperimentGuardPolicy:
                 rejections.append(f"duplicate experiment: {fingerprint}")
                 continue
 
-            common = {
-                "experiment_id": _experiment_id(
-                    session.session_id,
-                    ExperimentPhase.FOLLOWUP,
-                    session.round_index + 1,
-                    request.kind,
-                    f"{index}:{discriminator}",
-                ),
-                "session_id": session.session_id,
-                "phase": ExperimentPhase.FOLLOWUP,
-                "kind": request.kind,
-                "unit": session.unit,
-                "round_index": session.round_index + 1,
-            }
-            if request.kind == ExperimentKind.COMPUTE_SANITIZER:
-                spec = ExperimentSpec(**common, sanitizer_tool="racecheck")
-            elif request.kind == ExperimentKind.RANDOM_DELAY_STRESS:
-                if session.unit.oracle is None:
-                    rejections.append("random-delay stress requires an approved oracle")
-                    continue
-                spec = ExperimentSpec(**common, stress=StressOptions())
-            elif request.kind in (
-                ExperimentKind.REG_TRACE,
-                ExperimentKind.MEM_VALUE_TRACE,
-            ):
-                spec = ExperimentSpec(
-                    **common,
-                    trace=TraceOptions(
-                        mode=request.kind,
-                        trace_size_limit_mb=self.default_trace_size_limit_mb,
-                    ),
-                )
-            elif request.kind == ExperimentKind.REDUCE_DELAY_CONFIG:
-                if config is not None and session.unit.oracle is not None:
-                    spec = ExperimentSpec(
-                        **common,
-                        reduction=ReduceOptions(triggering_config=config),
-                    )
-                else:
-                    rejections.append(
-                        "reduce requires a reproduced config and its approved oracle"
-                    )
-                    continue
-            else:
-                rejections.append(f"unsupported experiment kind: {request.kind.value}")
+            spec, rejection = self._build_spec(
+                session,
+                request,
+                config,
+                index=index,
+                discriminator=discriminator,
+            )
+            if spec is None:
+                if rejection is not None:
+                    rejections.append(rejection)
                 continue
             specs.append(spec)
             fingerprints.append(fingerprint)

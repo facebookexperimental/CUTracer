@@ -35,7 +35,7 @@ Examples:
   cutracer query trace.ndjson -f "pc=0x43d0;warp=24"
   cutracer query trace.ndjson --group-by warp --count
   cutracer analyze warp-summary trace.ndjson
-  cutracer diagnose work_unit.json --out report.json
+  cutracer diagnose work_unit.json --toolchain-version <immutable-id> --out report.json
 """
 
 

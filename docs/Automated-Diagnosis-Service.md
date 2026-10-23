@@ -46,6 +46,14 @@ experiments or a short-lived
 Sandcastle reasoning turn. No MAST process calls Claude, and no Sandcastle worker
 waits for a long-running GPU job.
 
+Local diagnosis requires the immutable identity of the CUDA/Triton toolchain:
+
+```bash
+cutracer diagnose work_unit.json \
+  --toolchain-version <immutable-toolchain-id> \
+  --out report.json
+```
+
 Distributed session updates use revisioned compare-and-swap. Pending experiment
 specs are part of the durable session so `resume()` can safely re-submit them;
 MAST, Sandcastle, and report adapters must deduplicate their stable dispatch

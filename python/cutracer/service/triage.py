@@ -8,6 +8,44 @@ from typing import Any, Dict, List
 from cutracer.service.contracts import EvidenceBundle, FindingRecord
 
 
+def has_correctness_signal(evidence: EvidenceBundle) -> bool:
+    """Whether either initial detector produced a positive correctness signal."""
+    return any(result.has_positive_signal for result in evidence.sanitizer) or any(
+        result.has_positive_signal for result in evidence.stress
+    )
+
+
+def sanitizer_is_trustworthy_clean(evidence: EvidenceBundle) -> bool:
+    """Require every declared sanitizer result to prove a complete clean run."""
+    return bool(evidence.sanitizer) and all(
+        result.has_trustworthy_clean for result in evidence.sanitizer
+    )
+
+
+def stress_is_trustworthy_non_reproduction(evidence: EvidenceBundle) -> bool:
+    """Require every stress result to cover its complete declared trial scope."""
+    return bool(evidence.stress) and all(
+        result.has_trustworthy_non_reproduction for result in evidence.stress
+    )
+
+
+def both_initial_sources_are_trustworthy_clean(evidence: EvidenceBundle) -> bool:
+    """An absent or partial peer source is incomplete rather than neutral."""
+    return sanitizer_is_trustworthy_clean(
+        evidence
+    ) and stress_is_trustworthy_non_reproduction(evidence)
+
+
+def initial_evidence_requires_inconclusive(evidence: EvidenceBundle) -> bool:
+    """Reject a no-signal initial fan-in unless both peer sources are complete."""
+    has_initial_evidence = bool(evidence.sanitizer or evidence.stress)
+    return (
+        has_initial_evidence
+        and not has_correctness_signal(evidence)
+        and not both_initial_sources_are_trustworthy_clean(evidence)
+    )
+
+
 @dataclasses.dataclass
 class CorrelatedFinding:
     correlation_key: str

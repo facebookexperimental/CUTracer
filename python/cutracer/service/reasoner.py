@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
+from cutracer.service.artifacts import local_path
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
@@ -19,7 +20,13 @@ from cutracer.service.contracts import (
     ExperimentRequest,
     ExplainReport,
 )
-from cutracer.service.triage import correlate_evidence
+from cutracer.service.triage import (
+    correlate_evidence,
+    has_correctness_signal,
+    initial_evidence_requires_inconclusive,
+    sanitizer_is_trustworthy_clean,
+    stress_is_trustworthy_non_reproduction,
+)
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 ArtifactLoader = Callable[[ArtifactRef, int], Optional[str]]
@@ -185,7 +192,7 @@ def _decision_from_dict(raw: Dict[str, Any], raw_ai_output: str) -> AnalysisDeci
 def _local_artifact_loader(ref: ArtifactRef, max_bytes: int) -> Optional[str]:
     if not ref.uri.startswith("file://"):
         return None
-    path = ref.uri[len("file://") :]
+    path = local_path(ref)
     with open(path, "rb") as fh:
         payload = fh.read(max_bytes + 1)
     truncated = len(payload) > max_bytes
@@ -290,28 +297,15 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
 
 
 def _has_correctness_signal(session: AnalysisSession) -> bool:
-    return any(
-        result.has_positive_signal for result in session.evidence.sanitizer
-    ) or any(result.has_positive_signal for result in session.evidence.stress)
+    return has_correctness_signal(session.evidence)
 
 
 def _sanitizer_is_trustworthy_clean(session: AnalysisSession) -> bool:
-    return bool(session.evidence.sanitizer) and all(
-        result.has_trustworthy_clean for result in session.evidence.sanitizer
-    )
+    return sanitizer_is_trustworthy_clean(session.evidence)
 
 
 def _stress_is_trustworthy_non_reproduction(session: AnalysisSession) -> bool:
-    return bool(session.evidence.stress) and all(
-        result.has_trustworthy_non_reproduction for result in session.evidence.stress
-    )
-
-
-def _both_initial_sources_are_trustworthy_clean(session: AnalysisSession) -> bool:
-    """Require both peer detectors; an absent source is incomplete, not neutral."""
-    return _sanitizer_is_trustworthy_clean(
-        session
-    ) and _stress_is_trustworthy_non_reproduction(session)
+    return stress_is_trustworthy_non_reproduction(session.evidence)
 
 
 def fallback_decision(session: AnalysisSession, reason: str) -> AnalysisDecision:
@@ -370,11 +364,7 @@ class ClaudeReasoner:
         self._max_artifact_bytes = max_artifact_bytes
 
     def analyze(self, session: AnalysisSession) -> AnalysisDecision:
-        if (
-            (session.evidence.sanitizer or session.evidence.stress)
-            and not _has_correctness_signal(session)
-            and not _both_initial_sources_are_trustworthy_clean(session)
-        ):
+        if initial_evidence_requires_inconclusive(session.evidence):
             # Completeness is a deterministic service invariant. Do not let a
             # model promote legacy or partial initial evidence to clean.
             return fallback_decision(session, "initial evidence is incomplete")
