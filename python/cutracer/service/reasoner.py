@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
@@ -20,6 +21,11 @@ from cutracer.service.contracts import (
     ExperimentRequest,
     ExplainReport,
 )
+from cutracer.service.prompt_projection import (
+    project_artifact_context,
+    project_session_context,
+    PromptProjectionError,
+)
 from cutracer.service.triage import (
     correlate_evidence,
     has_correctness_signal,
@@ -30,6 +36,7 @@ from cutracer.service.triage import (
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 ArtifactLoader = Callable[[ArtifactRef, int], Optional[str]]
+logger: logging.Logger = logging.getLogger(__name__)
 
 _DECISION_SCHEMA = json.dumps(
     {
@@ -279,26 +286,10 @@ def _artifact_context(
     loader: ArtifactLoader,
     max_bytes: int,
 ) -> str:
-    sections: List[str] = []
-    seen = set()
-    for ref in _artifact_refs(session):
-        if ref.uri in seen:
-            continue
-        seen.add(ref.uri)
-        try:
-            content = loader(ref, max_bytes)
-        # Loaders are deployment injection points and may wrap remote stores;
-        # evidence retrieval failures must degrade the turn, not abort it.
-        except Exception as exc:
-            content = f"[artifact unavailable: {exc}]"
-        if content is None:
-            content = "[artifact content was not materialized for this reasoning turn]"
-        sections.append(f"--- {ref.uri} ({ref.media_type}) ---\n{content}")
-    return "\n\n".join(sections) if sections else "[no artifact content]"
+    return project_artifact_context(_artifact_refs(session), loader, max_bytes)
 
 
-def _prompt(session: AnalysisSession, artifact_context: str) -> str:
-    triage = correlate_evidence(session.unit.unit_id, session.evidence)
+def _prompt(projected_state: str, artifact_context: str) -> str:
     return (
         "You are analyzing a GPU correctness issue. The initial evidence sources "
         "compute-sanitizer and CUTracer random-delay stress are peers. Decide whether "
@@ -314,13 +305,14 @@ def _prompt(session: AnalysisSession, artifact_context: str) -> str:
         "one. When that config exists, the service will automatically add "
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "
         "and return inconclusive rather than inventing a root cause. Deterministic "
-        "trace-analysis evidence embedded in SESSION is the primary interpretation "
+        "trace-analysis evidence embedded in PROJECTED SESSION is the primary "
+        "interpretation "
         "of a trace; consult its structured summaries and findings before using raw "
-        "trace excerpts as supporting evidence.\n\nSESSION:\n"
-        + json.dumps(session.to_dict(), indent=2)
-        + "\n\nCORRELATED TRIAGE:\n"
-        + json.dumps(triage.to_dict(), indent=2)
-        + "\n\nBOUNDED ARTIFACT CONTENT:\n"
+        "trace excerpts as supporting evidence. Projection omissions are explicit; "
+        "do not infer facts from omitted history or content.\n\n"
+        "PROJECTED SESSION AND CORRELATED TRIAGE (JSON):\n"
+        + projected_state
+        + "\n\nBOUNDED ARTIFACT CONTENT (JSON):\n"
         + artifact_context
     )
 
@@ -413,6 +405,7 @@ class ClaudeReasoner:
         timeout: int = 1800,
         available: Optional[bool] = None,
         artifact_loader: Optional[ArtifactLoader] = None,
+        max_session_bytes: int = 64 * 1024,
         max_artifact_bytes: int = 64 * 1024,
     ) -> None:
         self._runner = runner
@@ -420,6 +413,7 @@ class ClaudeReasoner:
         self._timeout = timeout
         self._available = available
         self._artifact_loader = artifact_loader or _local_artifact_loader
+        self._max_session_bytes = max_session_bytes
         self._max_artifact_bytes = max_artifact_bytes
 
     def analyze(self, session: AnalysisSession) -> AnalysisDecision:
@@ -435,14 +429,25 @@ class ClaudeReasoner:
         if not available:
             return fallback_decision(session, "Claude is unavailable")
         run = self._runner or _subprocess_runner
-        prompt = _prompt(
-            session,
-            _artifact_context(
-                session,
-                self._artifact_loader,
-                self._max_artifact_bytes,
-            ),
-        )
+        try:
+            triage = correlate_evidence(session.unit.unit_id, session.evidence)
+            prompt = _prompt(
+                project_session_context(
+                    session,
+                    triage.to_dict(),
+                    self._max_session_bytes,
+                ),
+                _artifact_context(
+                    session,
+                    self._artifact_loader,
+                    self._max_artifact_bytes,
+                ),
+            )
+        except PromptProjectionError as exc:
+            logger.warning("reasoner prompt projection failed: %s", exc)
+            return fallback_decision(
+                session, f"reasoner prompt projection failed: {exc}"
+            )
         try:
             proc = run(
                 [
