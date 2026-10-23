@@ -13,6 +13,13 @@ from urllib.parse import unquote, urlparse
 
 from cutracer.service.contracts import ArtifactRef
 
+UNKNOWN_RUNTIME_IDENTITY = "0+unknown"
+
+
+def runtime_identity_is_missing(value: str) -> bool:
+    normalized = value.strip()
+    return not normalized or normalized == UNKNOWN_RUNTIME_IDENTITY
+
 
 @dataclasses.dataclass(frozen=True)
 class VerifiedLocalArtifact:

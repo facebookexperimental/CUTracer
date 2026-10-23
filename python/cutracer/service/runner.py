@@ -113,6 +113,8 @@ class LocalExperimentExecutor:
                 runner=self._reduce_runner,
                 cutracer_so=self._runtime.cutracer_so,
                 timeout=self._runtime.reduce_timeout,
+                cutracer_version=self._runtime.cutracer_version,
+                toolchain_version=self._runtime.toolchain_version,
             )
         raise ValueError(f"unsupported experiment kind: {spec.kind}")
 

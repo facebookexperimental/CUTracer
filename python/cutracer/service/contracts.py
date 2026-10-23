@@ -389,8 +389,22 @@ class StressOutcome(str, Enum):
 
 class ReduceOutcome(str, Enum):
     REDUCED = "reduced"
+    NON_REPRODUCIBLE = "non_reproducible"
+    INFRA_ERROR = "infra_error"
+    STALE_INPUT = "stale_input"
+
+    # Legacy values remain readable while new producers emit unambiguous
+    # semantic outcomes.
     REPLAY_FAILED = "replay_failed"
     FAILED = "failed"
+
+    @classmethod
+    def from_wire(cls, value: str) -> "ReduceOutcome":
+        if value == cls.REPLAY_FAILED.value:
+            return cls.NON_REPRODUCIBLE
+        if value == cls.FAILED.value:
+            return cls.INFRA_ERROR
+        return cls(value)
 
 
 class DecisionKind(str, Enum):
@@ -737,12 +751,18 @@ class ReduceOptions:
     triggering_config: TriggeringDelayConfig
     strategy: str = "bisect"
     confidence_runs: int = 3
+    require_kernel_identity: bool = True
+
+    def __post_init__(self) -> None:
+        if self.strategy not in ("linear", "bisect"):
+            raise ValueError(f"unknown reduction strategy: {self.strategy}")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "triggering_config": self.triggering_config.to_dict(),
             "strategy": self.strategy,
             "confidence_runs": self.confidence_runs,
+            "require_kernel_identity": self.require_kernel_identity,
         }
 
     @classmethod
@@ -751,6 +771,7 @@ class ReduceOptions:
             triggering_config=TriggeringDelayConfig.from_dict(d["triggering_config"]),
             strategy=d.get("strategy", "bisect"),
             confidence_runs=int(d.get("confidence_runs", 3)),
+            require_kernel_identity=_as_bool(d.get("require_kernel_identity", True)),
         )
 
 
@@ -1125,7 +1146,7 @@ class ReduceExperimentResult:
         return cls(
             experiment_id=d["experiment_id"],
             execution_status=ExecutionStatus(d["execution_status"]),
-            outcome=ReduceOutcome(d["outcome"]),
+            outcome=ReduceOutcome.from_wire(d["outcome"]),
             provenance=ExecutionProvenance.from_dict(d["provenance"]),
             input_config=TriggeringDelayConfig.from_dict(d["input_config"]),
             minimized_config=(
