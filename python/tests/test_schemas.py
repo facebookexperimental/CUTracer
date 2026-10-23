@@ -211,6 +211,51 @@ class KernelMetadataSchemaTest(unittest.TestCase):
             ):
                 jsonschema.validate(value, schema)
 
+    def test_targeted_trace_selector_fields(self):
+        """Test the selector values the runtime writes into every header."""
+        base_record = {
+            "type": "kernel_metadata",
+            "mangled_name": "_Z6kernelPfS_i",
+            "unmangled_name": "kernel(float*, float*, int)",
+            "kernel_checksum": "a1b2c3d4e5f67890",
+            "func_addr": "0x7f1234567890",
+            "nregs": 32,
+            "shmem_static": 0,
+            "grid": [128, 1, 1],
+            "block": [256, 1, 1],
+            "shmem_dynamic": 0,
+            "trace_instr_categories": None,
+            "trace_launch_id": None,
+            "trace_warp_mask": None,
+            "trace_pc_offsets": None,
+            "trace_pc_filter_valid": True,
+        }
+        for fields in (
+            {},
+            {
+                "trace_instr_categories": ["sync", "tma"],
+                "trace_launch_id": 2**64 - 2,
+                "trace_warp_mask": 0xFFFFFFFF,
+                "trace_pc_offsets": [0x100, 0x200],
+            },
+            {"trace_instr_categories": []},
+            {"trace_pc_filter_valid": False},
+        ):
+            with self.subTest(fields=fields):
+                jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
+        for fields in (
+            {"trace_instr_categories": ["ldst"]},
+            {"trace_launch_id": -1},
+            {"trace_warp_mask": 2**32},
+            {"trace_pc_offsets": [0x100, 0x100]},
+            {"trace_pc_filter_valid": None},
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaises(jsonschema.ValidationError),
+            ):
+                jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
+
 
 class DelayConfigSchemaTest(unittest.TestCase):
     """Tests for delay injection configuration schema."""

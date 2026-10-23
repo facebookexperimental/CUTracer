@@ -247,6 +247,42 @@
         "enum": ["mma", "tma", "sync"]
       },
       "description": "Effective instruction-category filter (post init_instr_categories). null when CUTRACER_INSTR_CATEGORIES is unset -> no filter (all categories instrumented); otherwise an array of lowercase tokens matching the env-var convention. Optional for backward compat. ProxyFenceDetector and similar broad-coverage detectors require null."
+    },
+    "trace_instr_categories": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "string",
+        "enum": ["mma", "tma", "sync"]
+      },
+      "uniqueItems": true,
+      "description": "Targeted trace instruction-category filter, or null when all categories are captured"
+    },
+    "trace_launch_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 18446744073709551615,
+      "description": "Requested process-global launch id, or null when all launches are targeted"
+    },
+    "trace_warp_mask": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 4294967295,
+      "description": "Requested CTA-local warp mask, or null when all warps are targeted"
+    },
+    "trace_pc_offsets": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 18446744073709551615
+      },
+      "maxItems": 32,
+      "uniqueItems": true,
+      "description": "Requested SASS PC offsets, or null when all PCs are targeted"
+    },
+    "trace_pc_filter_valid": {
+      "type": "boolean",
+      "description": "Whether CUTRACER_TRACE_PC_OFFSETS parsed successfully"
     }
   },
   "additionalProperties": false
