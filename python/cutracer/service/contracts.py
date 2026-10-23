@@ -1029,6 +1029,190 @@ class StressTestResult:
         )
 
 
+class TraceAnalysisSeverity(str, Enum):
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+
+@dataclasses.dataclass(frozen=True)
+class TraceDetectorSummary:
+    source_tool: str
+    sub_component: str
+    verdict: str
+    severity: TraceAnalysisSeverity
+    finding_count: int
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.source_tool.strip() or not self.sub_component.strip():
+            raise ValueError("detector summary requires structured source identity")
+        if self.finding_count < 0:
+            raise ValueError("detector finding_count must be non-negative")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_tool": self.source_tool,
+            "sub_component": self.sub_component,
+            "verdict": self.verdict,
+            "severity": self.severity.value,
+            "finding_count": self.finding_count,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TraceDetectorSummary":
+        return cls(
+            source_tool=d["source_tool"],
+            sub_component=d["sub_component"],
+            verdict=d["verdict"],
+            severity=TraceAnalysisSeverity(d["severity"]),
+            finding_count=int(d.get("finding_count", 0)),
+            description=d.get("description", ""),
+        )
+
+
+@dataclasses.dataclass
+class TraceAnalysisFinding:
+    """Compact detector finding.
+
+    ``warps``, ``pcs``, and ``trace_indices`` are independent sets of relevant
+    identifiers, matching the analyzer's generic Finding contract. Only source
+    locations are positional: when present, they are parallel to ``pcs``.
+    """
+
+    source_tool: str
+    sub_component: str
+    severity: TraceAnalysisSeverity
+    category: str
+    description: str = ""
+    ctas: List[List[int]] = dataclasses.field(default_factory=list)
+    warps: List[int] = dataclasses.field(default_factory=list)
+    pcs: List[str] = dataclasses.field(default_factory=list)
+    trace_indices: List[int] = dataclasses.field(default_factory=list)
+    source_locations: List[Optional[SourceLoc]] = dataclasses.field(
+        default_factory=list
+    )
+
+    def __post_init__(self) -> None:
+        if not self.source_tool.strip() or not self.sub_component.strip():
+            raise ValueError("analysis finding requires structured source identity")
+        if self.source_locations and len(self.source_locations) != len(self.pcs):
+            raise ValueError("source_locations must be empty or parallel to pcs")
+        if any(len(cta) != 3 for cta in self.ctas):
+            raise ValueError("each CTA coordinate must have exactly three dimensions")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_tool": self.source_tool,
+            "sub_component": self.sub_component,
+            "severity": self.severity.value,
+            "category": self.category,
+            "description": self.description,
+            "ctas": [list(cta) for cta in self.ctas],
+            "warps": list(self.warps),
+            "pcs": list(self.pcs),
+            "trace_indices": list(self.trace_indices),
+            "source_locations": [
+                None if location is None else location.to_dict()
+                for location in self.source_locations
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TraceAnalysisFinding":
+        return cls(
+            source_tool=d["source_tool"],
+            sub_component=d["sub_component"],
+            severity=TraceAnalysisSeverity(d["severity"]),
+            category=d["category"],
+            description=d.get("description", ""),
+            ctas=[[int(value) for value in cta] for cta in d.get("ctas", [])],
+            warps=[int(value) for value in d.get("warps", [])],
+            pcs=[str(value) for value in d.get("pcs", [])],
+            trace_indices=[int(value) for value in d.get("trace_indices", [])],
+            source_locations=[
+                None if location is None else SourceLoc.from_dict(location)
+                for location in d.get("source_locations", [])
+            ],
+        )
+
+
+TRACE_ANALYSIS_SCHEMA_VERSION = 1
+
+
+@dataclasses.dataclass
+class TraceAnalysisEvidence:
+    analyzer: str
+    execution_status: ExecutionStatus
+    detector_summaries: List[TraceDetectorSummary]
+    findings: List[TraceAnalysisFinding]
+    total_findings: int
+    warnings: List[str] = dataclasses.field(default_factory=list)
+    artifact: Optional[ArtifactRef] = None
+    error: Optional[str] = None
+    schema_version: int = TRACE_ANALYSIS_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != TRACE_ANALYSIS_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"unsupported TraceAnalysisEvidence schema_version: {self.schema_version}"
+            )
+        if not self.analyzer.strip():
+            raise ValueError("trace analysis requires analyzer identity")
+        if self.total_findings < 0:
+            raise ValueError("total_findings must be non-negative")
+        if self.total_findings < len(self.findings):
+            raise ValueError("total_findings cannot be smaller than sampled findings")
+
+    @property
+    def omitted_findings(self) -> int:
+        return self.total_findings - len(self.findings)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "analyzer": self.analyzer,
+            "execution_status": self.execution_status.value,
+            "detector_summaries": [
+                summary.to_dict() for summary in self.detector_summaries
+            ],
+            "findings": [finding.to_dict() for finding in self.findings],
+            "total_findings": self.total_findings,
+            "warnings": list(self.warnings),
+            "artifact": None if self.artifact is None else self.artifact.to_dict(),
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TraceAnalysisEvidence":
+        if "schema_version" not in d:
+            raise ValueError("TraceAnalysisEvidence requires schema_version")
+        if "total_findings" not in d:
+            raise ValueError("TraceAnalysisEvidence requires total_findings")
+        artifact = d.get("artifact")
+        return cls(
+            analyzer=d["analyzer"],
+            execution_status=ExecutionStatus(d["execution_status"]),
+            detector_summaries=[
+                TraceDetectorSummary.from_dict(summary)
+                for summary in d.get("detector_summaries", [])
+            ],
+            findings=[
+                TraceAnalysisFinding.from_dict(finding)
+                for finding in d.get("findings", [])
+            ],
+            total_findings=int(d["total_findings"]),
+            warnings=[str(warning) for warning in d.get("warnings", [])],
+            artifact=None if artifact is None else ArtifactRef.from_dict(artifact),
+            error=d.get("error"),
+            schema_version=d["schema_version"],
+        )
+
+
 @dataclasses.dataclass
 class TraceExperimentResult:
     experiment_id: str
@@ -1037,6 +1221,7 @@ class TraceExperimentResult:
     provenance: ExecutionProvenance
     trace: Optional[ArtifactRef] = None
     log: Optional[ArtifactRef] = None
+    analysis: Optional[TraceAnalysisEvidence] = None
     duration_s: float = 0.0
     error: Optional[str] = None
 
@@ -1057,6 +1242,7 @@ class TraceExperimentResult:
             "provenance": self.provenance.to_dict(),
             "trace": None if self.trace is None else self.trace.to_dict(),
             "log": None if self.log is None else self.log.to_dict(),
+            "analysis": None if self.analysis is None else self.analysis.to_dict(),
             "duration_s": self.duration_s,
             "error": self.error,
         }
@@ -1065,6 +1251,7 @@ class TraceExperimentResult:
     def from_dict(cls, d: Dict[str, Any]) -> "TraceExperimentResult":
         trace = d.get("trace")
         log = d.get("log")
+        analysis = d.get("analysis")
         return cls(
             experiment_id=d["experiment_id"],
             execution_status=ExecutionStatus(d["execution_status"]),
@@ -1072,6 +1259,9 @@ class TraceExperimentResult:
             provenance=ExecutionProvenance.from_dict(d["provenance"]),
             trace=None if trace is None else ArtifactRef.from_dict(trace),
             log=None if log is None else ArtifactRef.from_dict(log),
+            analysis=(
+                None if analysis is None else TraceAnalysisEvidence.from_dict(analysis)
+            ),
             duration_s=float(d.get("duration_s", 0.0)),
             error=d.get("error"),
         )
