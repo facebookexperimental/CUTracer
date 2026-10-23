@@ -27,6 +27,41 @@ bool dump_cubin;
 // kernel name filters
 std::vector<std::string> kernel_filters;
 
+static ExactKernelSelector& mutable_exact_kernel_selector() {
+  static ExactKernelSelector selector;
+  return selector;
+}
+
+const ExactKernelSelector& exact_kernel_selector() {
+  return mutable_exact_kernel_selector();
+}
+
+// Targeted trace selectors (independent from random-delay targeting).
+static uint64_t& mutable_trace_launch_id() {
+  static uint64_t value = UINT64_MAX;
+  return value;
+}
+
+static uint32_t& mutable_trace_warp_mask() {
+  static uint32_t value = 0;
+  return value;
+}
+
+static std::unordered_set<uint64_t>& mutable_trace_pc_offsets() {
+  static std::unordered_set<uint64_t> value;
+  return value;
+}
+
+static bool& mutable_trace_pc_filter_valid() {
+  static bool value = true;
+  return value;
+}
+
+static std::unordered_set<InstrCategory>& mutable_trace_instr_categories() {
+  static std::unordered_set<InstrCategory> value;
+  return value;
+}
+
 // Instrumentation configuration - single source of truth
 // enabled_instrument_types_ordered: preserves insertion order for IPOINT mapping
 // instrument_type_to_index: O(1) lookup for "is enabled" check (replaces the old set)
@@ -37,6 +72,7 @@ std::unordered_map<InstrumentType, int> instrument_type_to_index;
 std::unordered_set<AnalysisType> enabled_analysis_types;
 // enabled instruction categories for conditional instrumentation
 std::unordered_set<InstrCategory> enabled_instr_categories;
+static bool trace_instr_category_filter_requested = false;
 
 // Uniform IPOINT for all instrumentation (CUTRACER_INSTRUMENT_IPOINT_UNIFORM)
 IPointType uniform_ipoint = IPointType::DEFAULT;
@@ -189,6 +225,60 @@ static void parse_kernel_filters(const std::string& filters_env) {
   for (const auto& filter : kernel_filters) {
     printf("  - %s\n", filter.c_str());
   }
+}
+
+static void parse_trace_pc_offsets(const std::string& offsets_env) {
+  auto& offsets = mutable_trace_pc_offsets();
+  auto& filter_valid = mutable_trace_pc_filter_valid();
+  offsets.clear();
+  filter_valid = true;
+  if (offsets_env.empty()) return;
+
+  std::istringstream stream(offsets_env);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) token.erase(0, 1);
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
+    if (token.empty()) continue;
+
+    char* end = nullptr;
+    uint64_t pc = strtoull(token.c_str(), &end, 0);
+    if (end == token.c_str() || *end != '\0') {
+      fprintf(stderr, "ERROR: Invalid CUTRACER_TRACE_PC_OFFSETS token '%s'; trace records are disabled.\n",
+              token.c_str());
+      offsets.clear();
+      filter_valid = false;
+      return;
+    }
+    offsets.insert(pc);
+    if (offsets.size() > 32) {
+      fprintf(stderr, "ERROR: CUTRACER_TRACE_PC_OFFSETS exceeds 32 unique PCs; trace records are disabled.\n");
+      offsets.clear();
+      filter_valid = false;
+      return;
+    }
+  }
+}
+
+bool should_instrument_trace_pc(uint64_t pc_offset) {
+  const auto& offsets = trace_pc_offsets();
+  return trace_pc_filter_valid() && (offsets.empty() || offsets.count(pc_offset) != 0);
+}
+
+uint64_t trace_launch_id() {
+  return mutable_trace_launch_id();
+}
+
+uint32_t trace_warp_mask() {
+  return mutable_trace_warp_mask();
+}
+
+const std::unordered_set<uint64_t>& trace_pc_offsets() {
+  return mutable_trace_pc_offsets();
+}
+
+bool trace_pc_filter_valid() {
+  return mutable_trace_pc_filter_valid();
 }
 
 // Helper function for reading environment variables
@@ -653,6 +743,45 @@ void init_instr_categories(const std::string& categories_str) {
   }
 }
 
+void init_trace_instr_categories(const std::string& categories_str) {
+  auto& categories = mutable_trace_instr_categories();
+  categories.clear();
+  trace_instr_category_filter_requested = !categories_str.empty();
+  if (categories_str.empty()) return;
+
+  std::istringstream stream(categories_str);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) token.erase(0, 1);
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
+    for (char& c : token) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (token == "mma") {
+      categories.insert(InstrCategory::MMA);
+    } else if (token == "tma") {
+      categories.insert(InstrCategory::TMA);
+    } else if (token == "sync") {
+      categories.insert(InstrCategory::SYNC);
+    } else if (!token.empty()) {
+      loprintf("WARNING: Ignoring invalid CUTRACER_TRACE_INSTR_CATEGORIES token '%s'.\n", token.c_str());
+    }
+  }
+  if (categories.empty()) {
+    loprintf("WARNING: CUTRACER_TRACE_INSTR_CATEGORIES has no valid categories; targeted trace will be empty.\n");
+  }
+}
+
+bool should_instrument_trace_category(InstrCategory category) {
+  return !trace_instr_category_filter_requested || trace_instr_categories().count(category) > 0;
+}
+
+const std::unordered_set<InstrCategory>& trace_instr_categories() {
+  return mutable_trace_instr_categories();
+}
+
+bool has_trace_category_filter_enabled() {
+  return trace_instr_category_filter_requested;
+}
+
 /**
  * @brief Check if a specific instruction category should be instrumented
  *
@@ -940,6 +1069,13 @@ void init_config_from_env() {
               "Instrumentation types to enable (opcode_only,reg_trace,mem_addr_trace)");
   std::string kernel_filters_env;
   get_var_str(kernel_filters_env, "KERNEL_FILTERS", "", "Kernel name filters");
+  auto& exact_selector = mutable_exact_kernel_selector();
+  get_var_str(exact_selector.name, "CUTRACER_EXACT_KERNEL_NAME", "", "Exact launch-root kernel name");
+  get_var_str(exact_selector.checksum, "CUTRACER_EXACT_KERNEL_CHECKSUM", "", "Exact launch-root kernel checksum");
+  if (exact_selector.name.empty() != exact_selector.checksum.empty()) {
+    fprintf(stderr, "CUTracer: exact kernel name and checksum must be provided together\n");
+    exit(1);
+  }
   std::string analysis_str;
   get_var_str(analysis_str, "CUTRACER_ANALYSIS", "",
               "Analysis types to enable (proton_instr_histogram, deadlock_detection, random_delay)");
@@ -1033,6 +1169,22 @@ void init_config_from_env() {
   get_var_str(instr_categories_str, "CUTRACER_INSTR_CATEGORIES", "",
               "Instruction categories to instrument (mma,tma,sync). Empty = all instructions");
   init_instr_categories(instr_categories_str);
+
+  std::string trace_instr_categories_str;
+  get_var_str(trace_instr_categories_str, "CUTRACER_TRACE_INSTR_CATEGORIES", "",
+              "Service-targeted instruction categories (mma,tma,sync). Empty = all instructions");
+  init_trace_instr_categories(trace_instr_categories_str);
+
+  // Targeted trace selectors. These filter trace records only; random-delay
+  // warp targeting has separate variables and semantics.
+  get_var_uint64(mutable_trace_launch_id(), "CUTRACER_TRACE_LAUNCH_ID", UINT64_MAX,
+                 "Only record this global kernel launch id (unset = all launches)");
+  get_var_uint32_auto(mutable_trace_warp_mask(), "CUTRACER_TRACE_WARP_MASK", 0,
+                      "CTA-local warp mask for trace records (0 = all warps)");
+  std::string trace_pc_offsets_str;
+  get_var_str(trace_pc_offsets_str, "CUTRACER_TRACE_PC_OFFSETS", "",
+              "Comma-separated SASS PC offsets to trace (empty = all PCs)");
+  parse_trace_pc_offsets(trace_pc_offsets_str);
 
   // CPU call stack capture mode (default: auto)
   // Supports: auto, pytorch, backtrace, 0 (disabled), 1 (=auto, backward compat)

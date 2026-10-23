@@ -55,6 +55,8 @@ class ReplayConfig:
     # Exact non-zero oracle codes that mean a valid non-reproduction. An empty
     # tuple makes every non-zero code unexpected rather than accepting all.
     not_interesting_exit_codes: tuple[int, ...] = (1,)
+    exact_kernel_name: Optional[str] = None
+    exact_kernel_checksum: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.timeout <= 0:
@@ -330,6 +332,8 @@ def _run_replay_once(
                 instrument="random_delay",
                 analysis="random_delay",
                 kernel_filters=config.kernel_filters,
+                exact_kernel_name=config.exact_kernel_name,
+                exact_kernel_checksum=config.exact_kernel_checksum,
                 output_dir=output_dir,
                 delay_ns=_replay_delay_ns(config_path),
                 delay_mode=config.delay_mode,

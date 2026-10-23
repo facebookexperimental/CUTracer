@@ -185,6 +185,30 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_DELAY_LOAD_PATH"], "/tmp/load.json")
 
     @patch("cutracer.runner.resources")
+    def test_sets_targeted_trace_filters(self, mock_resources: MagicMock) -> None:
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
+        env = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument="reg_trace",
+            analysis=None,
+            kernel_filters="kernel",
+            instr_categories="sync,mma",
+            trace_instr_categories="sync",
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=None,
+            trace_launch_id=7,
+            trace_warp_mask="0xf0",
+            trace_pc_offsets="0x100,0x200",
+        )
+        self.assertEqual(env["CUTRACER_TRACE_LAUNCH_ID"], "7")
+        self.assertEqual(env["CUTRACER_TRACE_WARP_MASK"], "0xf0")
+        self.assertEqual(env["CUTRACER_TRACE_PC_OFFSETS"], "0x100,0x200")
+        self.assertEqual(env["CUTRACER_TRACE_INSTR_CATEGORIES"], "sync")
+
+    @patch("cutracer.runner.resources")
     def test_dump_cubin_flag(self, mock_resources: MagicMock) -> None:
         """CUTRACER_DUMP_CUBIN is set to '1' when dump_cubin is True."""
         mock_resources.files.side_effect = ModuleNotFoundError("no resource")
@@ -332,6 +356,63 @@ class PersistExtractedCudaToolsTest(unittest.TestCase):
 
 
 class RunInstrumentedTargetTest(unittest.TestCase):
+    def test_exact_kernel_selector_is_explicit_and_not_csv(self) -> None:
+        inherited = {
+            "CUTRACER_EXACT_KERNEL_NAME": "stale-kernel",
+            "CUTRACER_EXACT_KERNEL_CHECKSUM": "stale-hash",
+        }
+        for name in (None, "bug(int*, int*)", "_Z3bugPiS_"):
+            with self.subTest(name=name):
+                calls = []
+
+                def runner(command, *, captured=calls, **kwargs):
+                    captured.append(kwargs["env"])
+                    return MagicMock(returncode=0, stdout="", stderr="")
+
+                with tempfile.NamedTemporaryFile(suffix=".so") as so:
+                    run_instrumented_target(
+                        ["./oracle"],
+                        InstrumentationConfig(
+                            cutracer_so=so.name,
+                            kernel_filters="foo,bar",
+                            exact_kernel_name=name,
+                            exact_kernel_checksum=None if name is None else "hash",
+                            base_env=inherited,
+                        ),
+                        runner=runner,
+                    )
+
+                env = calls[0]
+                self.assertEqual(env["KERNEL_FILTERS"], "foo,bar")
+                if name is None:
+                    self.assertNotIn("CUTRACER_EXACT_KERNEL_NAME", env)
+                    self.assertNotIn("CUTRACER_EXACT_KERNEL_CHECKSUM", env)
+                else:
+                    self.assertEqual(env["CUTRACER_EXACT_KERNEL_NAME"], name)
+                    self.assertEqual(env["CUTRACER_EXACT_KERNEL_CHECKSUM"], "hash")
+
+    def test_invalid_exact_selector_does_not_launch_target(self) -> None:
+        runner = MagicMock()
+        for name, checksum in (
+            ("kernel", None),
+            (None, "hash"),
+            ("", "hash"),
+            ("kernel", " "),
+        ):
+            with self.subTest(name=name, checksum=checksum):
+                with tempfile.NamedTemporaryFile(suffix=".so") as so:
+                    with self.assertRaisesRegex(ValueError, "exact kernel"):
+                        run_instrumented_target(
+                            ["./oracle"],
+                            InstrumentationConfig(
+                                cutracer_so=so.name,
+                                exact_kernel_name=name,
+                                exact_kernel_checksum=checksum,
+                            ),
+                            runner=runner,
+                        )
+        runner.assert_not_called()
+
     @patch("cutracer.runner.resolve_cutracer_so", return_value="/current/cutracer.so")
     def test_programmatic_runner_overrides_inherited_injection(self, resolve) -> None:
         calls = []

@@ -265,6 +265,8 @@ class ReplayTest(unittest.TestCase):
                 base_env={
                     "PATH": "/bin",
                     "CUDA_INJECTION64_PATH": "/feature-installed/cutracer.so",
+                    "CUTRACER_EXACT_KERNEL_NAME": "inherited-kernel",
+                    "CUTRACER_EXACT_KERNEL_CHECKSUM": "inherited-hash",
                 },
             ),
             runner=runner,
@@ -276,6 +278,8 @@ class ReplayTest(unittest.TestCase):
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["env"]["CUDA_INJECTION64_PATH"], str(self.cutracer_so))
         self.assertEqual(kwargs["env"]["CUTRACER_DELAY_NS"], "100")
+        self.assertNotIn("CUTRACER_EXACT_KERNEL_NAME", kwargs["env"])
+        self.assertNotIn("CUTRACER_EXACT_KERNEL_CHECKSUM", kwargs["env"])
         self.assertEqual(
             kwargs["env"]["CUTRACER_DELAY_LOAD_PATH"], str(self.config_path)
         )

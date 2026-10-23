@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <random>
@@ -572,6 +573,12 @@ static bool should_instrument_instr_by_category(Instr* instr) {
   return should_instrument;
 }
 
+static bool should_instrument_instr_by_trace_category(Instr* instr) {
+  if (!has_trace_category_filter_enabled()) return true;
+  InstrCategory category = detect_instr_category(instr->getSass());
+  return should_instrument_trace_category(category);
+}
+
 /**
  * @brief Check if an instruction should receive delay injection.
  *
@@ -656,6 +663,13 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
   meta.cubin_sha256 = digest;
 }
 
+static bool matches_exact_kernel_selector(CUcontext ctx, CUfunction func) {
+  const auto& selector = exact_kernel_selector();
+  if (!selector.enabled()) return true;
+  const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
+  return selector.matches(meta.mangled_name, meta.unmangled_name, meta.kernel_checksum);
+}
+
 /**
  * @brief Conditionally instruments a CUDA function by delegating to specialized
  * instrumentation functions.
@@ -679,7 +693,7 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
  * @return `true` if instrumentation should be enabled, `false` otherwise.
  */
 bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
-  if (!has_any_instrumentation_enabled()) {
+  if (!has_any_instrumentation_enabled() || !matches_exact_kernel_selector(ctx, func)) {
     return false;
   }
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
@@ -695,24 +709,27 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
   /* add kernel itself to the related function vector */
   related_functions.push_back(func);
 
-  // No filters specified implies we want to instrument all functions
-  bool should_instrument = kernel_filters.empty();
+  // Exact selection applies to the launch root, not its device callees.
+  const bool exact_selection = exact_kernel_selector().enabled();
+  bool should_instrument = exact_selection || kernel_filters.empty();
   /* iterate on function */
   for (auto f : related_functions) {
     const char* unmangled_name = nvbit_get_func_name(ctx, f, false);
     const char* mangled_name = nvbit_get_func_name(ctx, f, true);
 
     // Check if the current function matches any kernel filter
-    bool kernel_filter_matched = kernel_filters.empty();
-    for (const auto& filter : kernel_filters) {
-      if ((unmangled_name && strstr(unmangled_name, filter.c_str()) != NULL) ||
-          (mangled_name && strstr(mangled_name, filter.c_str()) != NULL)) {
-        kernel_filter_matched = true;
-        // Update return value (determines if instrumented code should run)
-        should_instrument = true;
-        loprintf_v("Found matching kernel for filter '%s': %s (mangled: %s)\n", filter.c_str(),
-                   unmangled_name ? unmangled_name : "unknown", mangled_name ? mangled_name : "unknown");
-        break;
+    bool kernel_filter_matched = exact_selection || kernel_filters.empty();
+    if (!exact_selection) {
+      for (const auto& filter : kernel_filters) {
+        if ((unmangled_name && strstr(unmangled_name, filter.c_str()) != NULL) ||
+            (mangled_name && strstr(mangled_name, filter.c_str()) != NULL)) {
+          kernel_filter_matched = true;
+          // Update return value (determines if instrumented code should run)
+          should_instrument = true;
+          loprintf_v("Found matching kernel for filter '%s': %s (mangled: %s)\n", filter.c_str(),
+                     unmangled_name ? unmangled_name : "unknown", mangled_name ? mangled_name : "unknown");
+          break;
+        }
       }
     }
 
@@ -765,6 +782,8 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       OperandContext op_ctx;  // Context for implicit register collection
       int mref_idx = 0;
       int opcode_id = instr->getIdx();
+      const bool trace_instruction_selected =
+          should_instrument_instr_by_trace_category(instr) && should_instrument_trace_pc(instr->getOffset());
       ctx_state->id_to_sass_map[f][opcode_id] = std::string(instr->getSass());
 
       // Collect SASS binary encoding (nvbit 1.8+)
@@ -845,11 +864,11 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
           }
 
           // Use new instrumentation interface for memory tracing
-          if (is_instrument_type_enabled(InstrumentType::MEM_ADDR_TRACE)) {
+          if (trace_instruction_selected && is_instrument_type_enabled(InstrumentType::MEM_ADDR_TRACE)) {
             instrument_memory_addr_trace(instr, opcode_id, ctx_state, mref_idx);
           }
           // Memory value tracing (captures addresses + values at IPOINT_AFTER)
-          if (is_instrument_type_enabled(InstrumentType::MEM_VALUE_TRACE)) {
+          if (trace_instruction_selected && is_instrument_type_enabled(InstrumentType::MEM_VALUE_TRACE)) {
             int mem_space = (int)instr->getMemorySpace();
             instrument_memory_value_trace(instr, opcode_id, ctx_state, mref_idx, mem_space);
           }
@@ -890,7 +909,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       }
 
       // Choose instrumentation based on enabled types (only if this instruction passes category filter)
-      if (should_instrument_instr_by_category(instr)) {
+      if (trace_instruction_selected && should_instrument_instr_by_category(instr)) {
         if (is_instrument_type_enabled(InstrumentType::OPCODE_ONLY)) {
           // Lightweight instrumentation for instruction histogram analysis.
           // This sends minimal data (opcode_id, warp_id) to the CPU, reducing
@@ -1150,6 +1169,32 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
     if (enabled_instr_categories.count(InstrCategory::SYNC)) cats.push_back("sync");
     md["instr_categories"] = cats;
   }
+
+  if (!has_trace_category_filter_enabled()) {
+    md["trace_instr_categories"] = nullptr;
+  } else {
+    nlohmann::json cats = nlohmann::json::array();
+    const auto& trace_categories = trace_instr_categories();
+    if (trace_categories.count(InstrCategory::MMA)) cats.push_back("mma");
+    if (trace_categories.count(InstrCategory::TMA)) cats.push_back("tma");
+    if (trace_categories.count(InstrCategory::SYNC)) cats.push_back("sync");
+    md["trace_instr_categories"] = cats;
+  }
+
+  const uint64_t selected_launch_id = trace_launch_id();
+  md["trace_launch_id"] =
+      selected_launch_id == UINT64_MAX ? nlohmann::json(nullptr) : nlohmann::json(selected_launch_id);
+  const uint32_t selected_warp_mask = trace_warp_mask();
+  md["trace_warp_mask"] = selected_warp_mask == 0 ? nlohmann::json(nullptr) : nlohmann::json(selected_warp_mask);
+  const auto& selected_pc_offsets = trace_pc_offsets();
+  if (selected_pc_offsets.empty()) {
+    md["trace_pc_offsets"] = nullptr;
+  } else {
+    std::vector<uint64_t> pcs(selected_pc_offsets.begin(), selected_pc_offsets.end());
+    std::sort(pcs.begin(), pcs.end());
+    md["trace_pc_offsets"] = pcs;
+  }
+  md["trace_pc_filter_valid"] = trace_pc_filter_valid();
 
   return md;
 }
@@ -1722,7 +1767,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
 
   // Create TraceWriter for this graph node launch only if instrumentation is enabled
   // Otherwise, trace files would be empty (no data to write)
-  if (has_any_instrumentation_enabled() && !ctx_state->channel_failed) {
+  if (has_any_instrumentation_enabled() && !ctx_state->channel_failed && matches_exact_kernel_selector(ctx, func)) {
     const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
     std::string base_filename = generate_kernel_log_basename(ctx, func, kernel_iter_map[func]++, meta.kernel_checksum);
     auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cluster, cpu_callstack,

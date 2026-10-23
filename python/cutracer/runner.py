@@ -38,6 +38,10 @@ class InstrumentationConfig:
     analysis: Optional[str] = None
     kernel_filters: Optional[str] = None
     instr_categories: Optional[str] = None
+    trace_instr_categories: Optional[str] = None
+    trace_launch_id: Optional[int] = None
+    trace_warp_mask: Optional[str] = None
+    trace_pc_offsets: Optional[str] = None
     trace_format: Optional[str] = None
     output_dir: Optional[str] = None
     verbose: Optional[int] = None
@@ -64,6 +68,8 @@ class InstrumentationConfig:
     base_env: Optional[Mapping[str, str]] = None
     capture_output: bool = True
     shell: bool = False
+    exact_kernel_name: Optional[str] = None
+    exact_kernel_checksum: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +279,10 @@ def build_cutracer_env(
     verbose: Optional[int],
     zstd_level: Optional[int],
     delay_ns: Optional[int],
+    trace_launch_id: Optional[int] = None,
+    trace_warp_mask: Optional[str] = None,
+    trace_pc_offsets: Optional[str] = None,
+    trace_instr_categories: Optional[str] = None,
     delay_min_ns: Optional[int] = None,
     delay_enable_prob: Optional[float] = None,
     delay_mode: Optional[str] = None,
@@ -290,10 +300,26 @@ def build_cutracer_env(
     kernel_timeout_s: int = 0,
     no_data_timeout_s: int = 15,
     base_env: Optional[Mapping[str, str]] = None,
+    exact_kernel_name: Optional[str] = None,
+    exact_kernel_checksum: Optional[str] = None,
 ) -> dict:
     """Build environment dict with CUTracer variables."""
+    if (exact_kernel_name is None) != (exact_kernel_checksum is None):
+        raise ValueError("exact kernel name and checksum must be provided together")
+    if exact_kernel_name is not None and (
+        not exact_kernel_name.strip()
+        or not exact_kernel_checksum
+        or not exact_kernel_checksum.strip()
+    ):
+        raise ValueError("exact kernel name and checksum must be non-empty")
     env = dict(os.environ if base_env is None else base_env)
     env["CUDA_INJECTION64_PATH"] = cutracer_so
+    # Exact selection is owned by this invocation, never inherited by discovery.
+    env.pop("CUTRACER_EXACT_KERNEL_NAME", None)
+    env.pop("CUTRACER_EXACT_KERNEL_CHECKSUM", None)
+    if exact_kernel_name is not None and exact_kernel_checksum is not None:
+        env["CUTRACER_EXACT_KERNEL_NAME"] = exact_kernel_name
+        env["CUTRACER_EXACT_KERNEL_CHECKSUM"] = exact_kernel_checksum
 
     if instrument is not None:
         env["CUTRACER_INSTRUMENT"] = instrument
@@ -304,6 +330,14 @@ def build_cutracer_env(
         env["KERNEL_FILTERS"] = kernel_filters
     if instr_categories is not None:
         env["CUTRACER_INSTR_CATEGORIES"] = instr_categories
+    if trace_launch_id is not None:
+        env["CUTRACER_TRACE_LAUNCH_ID"] = str(trace_launch_id)
+    if trace_warp_mask is not None:
+        env["CUTRACER_TRACE_WARP_MASK"] = trace_warp_mask
+    if trace_pc_offsets is not None:
+        env["CUTRACER_TRACE_PC_OFFSETS"] = trace_pc_offsets
+    if trace_instr_categories is not None:
+        env["CUTRACER_TRACE_INSTR_CATEGORIES"] = trace_instr_categories
     if trace_format is not None:
         env["CUTRACER_TRACE_FORMAT"] = str(trace_format)
     if output_dir is not None:
@@ -389,12 +423,18 @@ def _resolve_and_build_env(
         instrument=config.instrument,
         analysis=config.analysis,
         kernel_filters=config.kernel_filters,
+        exact_kernel_name=config.exact_kernel_name,
+        exact_kernel_checksum=config.exact_kernel_checksum,
         instr_categories=config.instr_categories,
         trace_format=config.trace_format,
         output_dir=config.output_dir,
         verbose=config.verbose,
         zstd_level=config.zstd_level,
         delay_ns=config.delay_ns,
+        trace_launch_id=config.trace_launch_id,
+        trace_warp_mask=config.trace_warp_mask,
+        trace_pc_offsets=config.trace_pc_offsets,
+        trace_instr_categories=config.trace_instr_categories,
         delay_min_ns=config.delay_min_ns,
         delay_enable_prob=config.delay_enable_prob,
         delay_mode=config.delay_mode,
@@ -465,6 +505,8 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_INSTRUMENT",
         "CUTRACER_ANALYSIS",
         "KERNEL_FILTERS",
+        "CUTRACER_EXACT_KERNEL_NAME",
+        "CUTRACER_EXACT_KERNEL_CHECKSUM",
         "CUTRACER_INSTR_CATEGORIES",
         "CUTRACER_TRACE_FORMAT",
         "CUTRACER_OUTPUT_DIR",

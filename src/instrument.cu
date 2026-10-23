@@ -109,6 +109,10 @@ bool instrument_register_trace(Instr* instr, int opcode_id, CTXstate* ctx_state,
   nvbit_add_call_arg_launch_val64(instr, 0);
   /* add instruction offset */
   nvbit_add_call_arg_const_val64(instr, instr->getOffset());
+  /* optional global kernel launch id filter (UINT64_MAX = all launches) */
+  nvbit_add_call_arg_const_val64(instr, trace_launch_id());
+  /* optional CTA-local warp mask (0 = all warps) */
+  nvbit_add_call_arg_const_val32(instr, trace_warp_mask());
   /* how many register values are passed next */
   nvbit_add_call_arg_const_val32(instr, operands.reg_nums.size());
   nvbit_add_call_arg_const_val32(instr, operands.ureg_nums.size());
@@ -162,6 +166,10 @@ void instrument_memory_addr_trace(Instr* instr, int opcode_id, CTXstate* ctx_sta
   nvbit_add_call_arg_const_val64(instr, instr->getOffset());
   /* add pointer to channel_dev*/
   nvbit_add_call_arg_const_val64(instr, (uint64_t)ctx_state->channel_dev);
+  /* optional global kernel launch id filter (UINT64_MAX = all launches) */
+  nvbit_add_call_arg_const_val64(instr, trace_launch_id());
+  /* optional CTA-local warp mask (0 = all warps) */
+  nvbit_add_call_arg_const_val32(instr, trace_warp_mask());
 }
 
 /**
@@ -339,6 +347,10 @@ void instrument_memory_value_trace(Instr* instr, int opcode_id, CTXstate* ctx_st
   nvbit_add_call_arg_launch_val64(instr, 0);
   // Instruction offset (PC)
   nvbit_add_call_arg_const_val64(instr, instr->getOffset());
+  // Optional global kernel launch id filter (UINT64_MAX = all launches)
+  nvbit_add_call_arg_const_val64(instr, trace_launch_id());
+  // Optional CTA-local warp mask (0 = all warps)
+  nvbit_add_call_arg_const_val32(instr, trace_warp_mask());
 
   // Add register values as variadic arguments
   for (int reg_num : value_reg_nums) {

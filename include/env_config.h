@@ -14,6 +14,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "kernel_selection.h"
+
 // Forward declaration to avoid circular dependency
 enum class InstrumentType;
 enum class InstrCategory;
@@ -65,6 +67,14 @@ extern bool dump_cubin;
 
 // Kernel name filters
 extern std::vector<std::string> kernel_filters;
+const ExactKernelSelector& exact_kernel_selector();
+
+// Targeted trace selectors. UINT64_MAX / 0 / an empty PC set mean no filter.
+uint64_t trace_launch_id();
+uint32_t trace_warp_mask();
+const std::unordered_set<uint64_t>& trace_pc_offsets();
+bool trace_pc_filter_valid();
+bool should_instrument_trace_pc(uint64_t pc_offset);
 
 // Instrumentation configuration
 // Uses instrument_type_to_index map for O(1) lookup (replaces the old unordered_set)
@@ -225,6 +235,13 @@ extern int channel_buffer_size;
 // If empty, all instructions are instrumented
 // If set, only instructions in the specified categories are instrumented
 extern std::unordered_set<InstrCategory> enabled_instr_categories;
+
+// Service-targeted category filter. Kept separate so the historical
+// CUTRACER_INSTR_CATEGORIES behavior for memory traces remains unchanged.
+const std::unordered_set<InstrCategory>& trace_instr_categories();
+void init_trace_instr_categories(const std::string& categories_str);
+bool should_instrument_trace_category(InstrCategory category);
+bool has_trace_category_filter_enabled();
 
 // Kernel execution time limit in seconds (0 = disabled)
 // When set, any kernel running longer than this value is automatically

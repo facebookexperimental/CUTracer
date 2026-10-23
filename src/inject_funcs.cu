@@ -21,10 +21,29 @@
 
 /* Based on NVIDIA NVBit reg_trace example with Meta modifications for
 message type, unified register, and kernel launch id support*/
+__device__ __forceinline__ bool trace_record_selected(uint64_t kernel_launch_id, uint64_t launch_filter,
+                                                      uint32_t warp_mask) {
+  if (launch_filter != UINT64_MAX && kernel_launch_id != launch_filter) {
+    return false;
+  }
+  if (warp_mask == 0) {
+    return true;
+  }
+  // CUDA permits at most 1024 threads (32 warps) per CTA, so a uint32_t
+  // selector covers every legal CTA-local warp id.
+  const uint32_t linear_thread_id = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  const uint32_t local_warp_id = linear_thread_id / 32;
+  return local_warp_id < 32 && (warp_mask & (1u << local_warp_id)) != 0;
+}
+
 extern "C" __device__ __noinline__ void instrument_reg_val(int pred, int opcode_id, uint64_t pchannel_dev,
-                                                           uint64_t kernel_launch_id, uint64_t pc, int32_t num_regs,
-                                                           int32_t num_uregs, ...) {
+                                                           uint64_t kernel_launch_id, uint64_t pc,
+                                                           uint64_t trace_launch_id, uint32_t trace_warp_mask,
+                                                           int32_t num_regs, int32_t num_uregs, ...) {
   if (!pred) {
+    return;
+  }
+  if (!trace_record_selected(kernel_launch_id, trace_launch_id, trace_warp_mask)) {
     return;
   }
 
@@ -80,9 +99,13 @@ extern "C" __device__ __noinline__ void instrument_reg_val(int pred, int opcode_
 
 /* Based on NVIDIA NVBit mem_trace example with Meta modifications for message type */
 extern "C" __device__ __noinline__ void instrument_mem(int pred, int opcode_id, uint64_t addr, int static_memory_space,
-                                                       uint64_t kernel_launch_id, uint64_t pc, uint64_t pchannel_dev) {
+                                                       uint64_t kernel_launch_id, uint64_t pc, uint64_t pchannel_dev,
+                                                       uint64_t trace_launch_id, uint32_t trace_warp_mask) {
   /* if thread is predicated off, return */
   if (!pred) {
+    return;
+  }
+  if (!trace_record_selected(kernel_launch_id, trace_launch_id, trace_warp_mask)) {
     return;
   }
 
@@ -231,8 +254,12 @@ __device__ __forceinline__ uint32_t loadSmemValue32(uint64_t smemAddr) {
 extern "C" __device__ __noinline__ void instrument_mem_value(int pred, int opcode_id, uint64_t addr, int access_size,
                                                              int mem_space, int is_load, int num_regs,
                                                              uint64_t pchannel_dev, uint64_t kernel_launch_id,
-                                                             uint64_t pc, ...) {
+                                                             uint64_t pc, uint64_t trace_launch_id,
+                                                             uint32_t trace_warp_mask, ...) {
   if (!pred) {
+    return;
+  }
+  if (!trace_record_selected(kernel_launch_id, trace_launch_id, trace_warp_mask)) {
     return;
   }
 
@@ -293,7 +320,7 @@ extern "C" __device__ __noinline__ void instrument_mem_value(int pred, int opcod
     // Global/Local memory: read values from variadic register arguments
     if (num_regs > 0) {
       va_list vl;
-      va_start(vl, pc);
+      va_start(vl, trace_warp_mask);
 
       int regs_to_process = num_regs;
       if (regs_to_process > 4) regs_to_process = 4;
