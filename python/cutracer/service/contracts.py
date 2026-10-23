@@ -18,6 +18,7 @@ Design notes:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from enum import Enum
 from typing import Any, Dict, List, Optional, TextIO, Type, TypeVar, Union
@@ -1181,6 +1182,164 @@ def experiment_result_from_dict(d: Dict[str, Any]) -> ExperimentResult:
     if kind == ExperimentKind.REDUCE_DELAY_CONFIG:
         return ReduceExperimentResult.from_dict(d)
     raise ValueError(f"unknown experiment kind: {kind}")
+
+
+EXPERIMENT_ENVELOPE_SCHEMA_VERSION = 1
+
+
+def experiment_dispatch_key(
+    session_id: str,
+    experiment_id: str,
+    analyzed_state_revision: int,
+) -> str:
+    """Return the stable idempotency key for one analyzed-state dispatch."""
+    identity = {
+        "analyzed_state_revision": analyzed_state_revision,
+        "experiment_id": experiment_id,
+        "session_id": session_id,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return f"dispatch-{hashlib.sha256(encoded).hexdigest()}"
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperimentDispatchBinding:
+    """Immutable callback identity issued with an experiment dispatch."""
+
+    session_id: str
+    experiment_id: str
+    analyzed_state_revision: int
+    dispatch_key: str
+
+    def __post_init__(self) -> None:
+        if not self.session_id.strip():
+            raise ValueError("experiment binding requires session_id")
+        if not self.experiment_id.strip():
+            raise ValueError("experiment binding requires experiment_id")
+        if type(self.analyzed_state_revision) is not int:
+            raise ValueError("analyzed_state_revision must be an integer")
+        if self.analyzed_state_revision < 0:
+            raise ValueError("analyzed_state_revision must be non-negative")
+        expected = experiment_dispatch_key(
+            self.session_id,
+            self.experiment_id,
+            self.analyzed_state_revision,
+        )
+        if self.dispatch_key != expected:
+            raise ValueError("dispatch_key does not match experiment binding")
+
+    @classmethod
+    def create(
+        cls,
+        session_id: str,
+        experiment_id: str,
+        analyzed_state_revision: int,
+    ) -> "ExperimentDispatchBinding":
+        return cls(
+            session_id=session_id,
+            experiment_id=experiment_id,
+            analyzed_state_revision=analyzed_state_revision,
+            dispatch_key=experiment_dispatch_key(
+                session_id,
+                experiment_id,
+                analyzed_state_revision,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "experiment_id": self.experiment_id,
+            "analyzed_state_revision": self.analyzed_state_revision,
+            "dispatch_key": self.dispatch_key,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ExperimentDispatchBinding":
+        return cls(
+            session_id=d["session_id"],
+            experiment_id=d["experiment_id"],
+            analyzed_state_revision=d["analyzed_state_revision"],
+            dispatch_key=d["dispatch_key"],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperimentEnvelope:
+    """Versioned wire callback carrying exactly one typed experiment result."""
+
+    session_id: str
+    experiment_id: str
+    analyzed_state_revision: int
+    dispatch_key: str
+    result: ExperimentResult
+    schema_version: int = EXPERIMENT_ENVELOPE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EXPERIMENT_ENVELOPE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported ExperimentEnvelope schema_version: {self.schema_version}"
+            )
+        ExperimentDispatchBinding(
+            session_id=self.session_id,
+            experiment_id=self.experiment_id,
+            analyzed_state_revision=self.analyzed_state_revision,
+            dispatch_key=self.dispatch_key,
+        )
+        if self.result.experiment_id != self.experiment_id:
+            raise ValueError("envelope result does not match experiment_id")
+
+    @property
+    def binding(self) -> ExperimentDispatchBinding:
+        return ExperimentDispatchBinding(
+            session_id=self.session_id,
+            experiment_id=self.experiment_id,
+            analyzed_state_revision=self.analyzed_state_revision,
+            dispatch_key=self.dispatch_key,
+        )
+
+    @classmethod
+    def bind(
+        cls,
+        binding: ExperimentDispatchBinding,
+        result: ExperimentResult,
+    ) -> "ExperimentEnvelope":
+        return cls(
+            session_id=binding.session_id,
+            experiment_id=binding.experiment_id,
+            analyzed_state_revision=binding.analyzed_state_revision,
+            dispatch_key=binding.dispatch_key,
+            result=result,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "session_id": self.session_id,
+            "experiment_id": self.experiment_id,
+            "analyzed_state_revision": self.analyzed_state_revision,
+            "dispatch_key": self.dispatch_key,
+            "result": self.result.to_dict(),
+        }
+
+    def to_json(self, **kwargs: Any) -> str:
+        return json.dumps(self.to_dict(), **kwargs)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ExperimentEnvelope":
+        version = int(d.get("schema_version", 0))
+        return cls(
+            session_id=d["session_id"],
+            experiment_id=d["experiment_id"],
+            analyzed_state_revision=d["analyzed_state_revision"],
+            dispatch_key=d["dispatch_key"],
+            result=experiment_result_from_dict(d["result"]),
+            schema_version=version,
+        )
+
+    @classmethod
+    def from_json(cls, source: Union[str, bytes, TextIO]) -> "ExperimentEnvelope":
+        return cls.from_dict(json.loads(_load_source(source)))
 
 
 @dataclasses.dataclass
