@@ -85,6 +85,8 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
         if result.log is not None:
             refs.append(result.log.uri)
     for result in evidence.traces:
+        if result.analysis is not None and result.analysis.artifact is not None:
+            refs.append(result.analysis.artifact.uri)
         if result.trace is not None:
             refs.append(result.trace.uri)
     for result in evidence.reductions:
@@ -458,6 +460,24 @@ def _validate_trace_result(result: TraceExperimentResult) -> None:
         _reject_result(
             "trace_result_inconsistent",
             "unsuccessful trace result requires a non-empty error",
+        )
+    if result.analysis is None:
+        return
+    if result.execution_status != ExecutionStatus.SUCCEEDED:
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace result cannot publish deterministic analysis",
+        )
+    if result.analysis.execution_status == ExecutionStatus.SUCCEEDED:
+        if result.analysis.artifact is None or result.analysis.error is not None:
+            _reject_result(
+                "trace_result_inconsistent",
+                "successful deterministic analysis requires an artifact and no error",
+            )
+    elif result.analysis.error is None or not result.analysis.error.strip():
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful deterministic analysis requires an error",
         )
 
 

@@ -70,12 +70,14 @@ class LocalExperimentExecutor:
         sanitizer_runner: Optional[Any] = None,
         stress_runner: Optional[Any] = None,
         trace_runner: Optional[Any] = None,
+        trace_analyzer: Optional[Any] = None,
         reduce_runner: Optional[Any] = None,
     ) -> None:
         self._runtime = runtime
         self._sanitizer_runner = sanitizer_runner
         self._stress_runner = stress_runner
         self._trace_runner = trace_runner
+        self._trace_analyzer = trace_analyzer
         self._reduce_runner = reduce_runner
 
     def execute(self, spec: ExperimentSpec) -> ExperimentResult:
@@ -103,6 +105,7 @@ class LocalExperimentExecutor:
                 spec,
                 out_dir=work_dir,
                 runner=self._trace_runner,
+                trace_analyzer=self._trace_analyzer,
                 cutracer_so=self._runtime.cutracer_so,
                 timeout=self._runtime.timeout,
             )

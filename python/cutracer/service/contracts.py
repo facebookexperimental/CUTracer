@@ -1224,6 +1224,7 @@ class TraceExperimentResult:
     analysis: Optional[TraceAnalysisEvidence] = None
     duration_s: float = 0.0
     error: Optional[str] = None
+    analysis_duration_s: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
@@ -1244,6 +1245,7 @@ class TraceExperimentResult:
             "log": None if self.log is None else self.log.to_dict(),
             "analysis": None if self.analysis is None else self.analysis.to_dict(),
             "duration_s": self.duration_s,
+            "analysis_duration_s": self.analysis_duration_s,
             "error": self.error,
         }
 
@@ -1263,6 +1265,7 @@ class TraceExperimentResult:
                 None if analysis is None else TraceAnalysisEvidence.from_dict(analysis)
             ),
             duration_s=float(d.get("duration_s", 0.0)),
+            analysis_duration_s=float(d.get("analysis_duration_s", 0.0)),
             error=d.get("error"),
         )
 

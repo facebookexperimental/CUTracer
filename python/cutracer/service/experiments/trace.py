@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import subprocess
 import time
@@ -17,10 +18,14 @@ from cutracer.service.contracts import (
     ExecutionStatus,
     ExperimentKind,
     ExperimentSpec,
+    TraceAnalysisEvidence,
     TraceExperimentResult,
 )
+from cutracer.service.trace_analysis import run_trace_analysis
 
 TraceLocator = Callable[[str], Optional[str]]
+TraceAnalysisRunner = Callable[..., TraceAnalysisEvidence]
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _default_trace_locator(out_dir: str) -> Optional[str]:
@@ -49,12 +54,39 @@ def _capture_to_log(
         return None
 
 
+def _run_trace_analyzer(
+    trace_path: str,
+    *,
+    arch: str,
+    out_dir: str,
+    trace_analyzer: Optional[TraceAnalysisRunner],
+) -> TraceAnalysisEvidence:
+    analysis_runner = trace_analyzer or run_trace_analysis
+    try:
+        return analysis_runner(trace_path, arch=arch, out_dir=out_dir)
+    except Exception as exc:
+        logger.exception("deterministic trace analysis runner failed")
+        candidate = getattr(analysis_runner, "__name__", "")
+        name = candidate.strip() if isinstance(candidate, str) else ""
+        if not name:
+            name = type(analysis_runner).__name__.strip() or "trace_analyzer"
+        return TraceAnalysisEvidence(
+            analyzer=name,
+            execution_status=ExecutionStatus.INFRA_ERROR,
+            detector_summaries=[],
+            findings=[],
+            total_findings=0,
+            error=f"deterministic trace analysis failed: {exc}",
+        )
+
+
 def run_trace_experiment(
     spec: ExperimentSpec,
     *,
     out_dir: str,
     runner: Optional[RunTarget] = None,
     trace_locator: Optional[TraceLocator] = None,
+    trace_analyzer: Optional[TraceAnalysisRunner] = None,
     cutracer_so: Optional[str] = None,
     timeout: int = 1800,
 ) -> TraceExperimentResult:
@@ -74,6 +106,8 @@ def run_trace_experiment(
         else None
     )
     started = time.monotonic()
+    capture_finished: Optional[float] = None
+    analysis_duration_s = 0.0
     log_path = os.path.join(out_dir, "trace.log")
     try:
         proc = run_instrumented_target(
@@ -102,18 +136,30 @@ def run_trace_experiment(
                 else "application/x-ndjson"
             )
             trace = local_artifact(trace_path, media_type=media_type)
+            capture_finished = time.monotonic()
+            analysis_started = capture_finished
+            analysis = _run_trace_analyzer(
+                trace_path,
+                arch=spec.unit.arch,
+                out_dir=out_dir,
+                trace_analyzer=trace_analyzer,
+            )
+            analysis_duration_s = time.monotonic() - analysis_started
         elif proc.returncode == 0:
             status = ExecutionStatus.INFRA_ERROR
             error = "CUTracer completed without producing a trace"
             trace = None
+            analysis = None
         else:
             status = ExecutionStatus.FAILED
             error = proc.stderr or "instrumented target failed"
             trace = None
+            analysis = None
     except subprocess.TimeoutExpired as exc:
         status = ExecutionStatus.TIMED_OUT
         error = str(exc)
         trace = None
+        analysis = None
         # The child is killed at the deadline, but subprocess still captured
         # whatever it emitted beforehand; persist it instead of dropping it.
         log = _capture_to_log(log_path, exc.stdout, exc.stderr)
@@ -121,6 +167,7 @@ def run_trace_experiment(
         status = ExecutionStatus.INFRA_ERROR
         error = str(exc)
         trace = None
+        analysis = None
         log = None
 
     return TraceExperimentResult(
@@ -134,6 +181,11 @@ def run_trace_experiment(
         ),
         trace=trace,
         log=log,
-        duration_s=time.monotonic() - started,
+        analysis=analysis,
+        duration_s=(
+            (capture_finished if capture_finished is not None else time.monotonic())
+            - started
+        ),
+        analysis_duration_s=analysis_duration_s,
         error=error,
     )

@@ -203,24 +203,26 @@ def _local_artifact_loader(ref: ArtifactRef, max_bytes: int) -> Optional[str]:
 def _artifact_refs(session: AnalysisSession) -> List[ArtifactRef]:
     refs: List[ArtifactRef] = []
     for result in session.evidence.sanitizer:
-        if result.log is not None:
-            refs.append(result.log)
+        refs.extend(_present_artifacts(result.log))
     for result in session.evidence.stress:
-        if result.triggering_config is not None:
-            refs.append(result.triggering_config.artifact)
-        if result.log is not None:
-            refs.append(result.log)
+        triggering = result.triggering_config
+        refs.extend(
+            _present_artifacts(
+                None if triggering is None else triggering.artifact,
+                result.log,
+            )
+        )
     for result in session.evidence.traces:
-        if result.trace is not None:
-            refs.append(result.trace)
-        if result.log is not None:
-            refs.append(result.log)
+        refs.extend(_present_artifacts(result.trace, result.log))
     for result in session.evidence.reductions:
-        if result.minimized_config is not None:
-            refs.append(result.minimized_config)
-        if result.report is not None:
-            refs.append(result.report)
+        refs.extend(_present_artifacts(result.minimized_config, result.report))
     return refs
+
+
+def _present_artifacts(
+    *artifacts: Optional[ArtifactRef],
+) -> List[ArtifactRef]:
+    return [artifact for artifact in artifacts if artifact is not None]
 
 
 def _artifact_context(
@@ -259,7 +261,10 @@ def _prompt(session: AnalysisSession, artifact_context: str) -> str:
         "a triggering random-delay config; reduction never discovers or synthesizes "
         "one. When that config exists, the service will automatically add "
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "
-        "and return inconclusive rather than inventing a root cause.\n\nSESSION:\n"
+        "and return inconclusive rather than inventing a root cause. Deterministic "
+        "trace-analysis evidence embedded in SESSION is the primary interpretation "
+        "of a trace; consult its structured summaries and findings before using raw "
+        "trace excerpts as supporting evidence.\n\nSESSION:\n"
         + json.dumps(session.to_dict(), indent=2)
         + "\n\nCORRELATED TRIAGE:\n"
         + json.dumps(triage.to_dict(), indent=2)
@@ -278,6 +283,8 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
         if result.triggering_config is not None:
             refs.append(result.triggering_config.artifact.uri)
     for result in session.evidence.traces:
+        if result.analysis is not None and result.analysis.artifact is not None:
+            refs.append(result.analysis.artifact.uri)
         if result.trace is not None:
             refs.append(result.trace.uri)
     for result in session.evidence.reductions:
