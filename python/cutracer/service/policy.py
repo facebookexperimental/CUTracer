@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 from typing import Any, List, Optional, Sequence
 
 from cutracer.service.contracts import (
     AnalysisSession,
+    ArtifactRef,
     ExecutionProvenance,
     ExecutionStatus,
     ExperimentKind,
@@ -19,7 +21,9 @@ from cutracer.service.contracts import (
     StressOptions,
     StressOutcome,
     StressTestResult,
+    TraceConfigSource,
     TraceOptions,
+    TraceSelector,
     TriggeringDelayConfig,
     WorkUnit,
 )
@@ -61,9 +65,75 @@ def experiment_spec_fingerprint(spec: ExperimentSpec) -> str:
     discriminator = ""
     if spec.kind == ExperimentKind.COMPUTE_SANITIZER:
         discriminator = spec.sanitizer_tool or ""
+    elif (
+        spec.kind in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE)
+        and spec.trace is not None
+    ):
+        discriminator = _trace_options_discriminator(spec.trace, spec.unit)
     elif spec.kind == ExperimentKind.REDUCE_DELAY_CONFIG and spec.reduction is not None:
         discriminator = spec.reduction.triggering_config.artifact.uri
     return _fingerprint(spec.kind, discriminator)
+
+
+def _trace_options_discriminator(options: TraceOptions, unit: WorkUnit) -> str:
+    selector = options.selector.to_dict()
+    if options.selector.kernel == unit.kernel:
+        selector["kernel"] = None
+    artifact = options.config_artifact
+    artifact_identity = None
+    if artifact is not None:
+        artifact_identity = (
+            {"sha256": artifact.sha256, "size_bytes": artifact.size_bytes}
+            if artifact.sha256 is not None and artifact.size_bytes is not None
+            else {"uri": artifact.uri}
+        )
+    if (
+        all(value is None or value == [] for value in selector.values())
+        and artifact_identity is None
+    ):
+        return ""
+    payload = {"selector": selector, "config_artifact": artifact_identity}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _selected_config_artifact(
+    session: AnalysisSession,
+    source: TraceConfigSource,
+) -> ArtifactRef | None:
+    if source == TraceConfigSource.TRIGGERING:
+        config = session.evidence.triggering_config()
+        return None if config is None else config.artifact
+    for result in reversed(session.evidence.reductions):
+        if (
+            result.execution_status == ExecutionStatus.SUCCEEDED
+            and result.minimized_config is not None
+        ):
+            return result.minimized_config
+    return None
+
+
+def _resolve_trace_options(
+    session: AnalysisSession,
+    request: ExperimentRequest,
+    trace_size_limit_mb: int,
+) -> TraceOptions:
+    selector = request.trace_selector or TraceSelector()
+    if selector.kernel is not None and selector.kernel != session.unit.kernel:
+        raise ValueError("trace selector kernel does not match the pinned WorkUnit")
+    artifact = None
+    if selector.config_source is not None:
+        artifact = _selected_config_artifact(session, selector.config_source)
+        if artifact is None:
+            raise ValueError(
+                f"trace selector requires available {selector.config_source.value} config"
+            )
+    return TraceOptions(
+        mode=request.kind,
+        trace_size_limit_mb=trace_size_limit_mb,
+        selector=selector,
+        config_artifact=artifact,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,6 +276,7 @@ class ExperimentGuardPolicy:
         *,
         index: int,
         discriminator: str,
+        trace_options: Optional[TraceOptions] = None,
     ) -> tuple[Optional[ExperimentSpec], Optional[str]]:
         common = {
             "experiment_id": _experiment_id(
@@ -231,13 +302,12 @@ class ExperimentGuardPolicy:
             ExperimentKind.REG_TRACE,
             ExperimentKind.MEM_VALUE_TRACE,
         ):
+            if trace_options is None:
+                return None, "trace options could not be resolved"
             return (
                 ExperimentSpec(
                     **common,
-                    trace=TraceOptions(
-                        mode=request.kind,
-                        trace_size_limit_mb=self.default_trace_size_limit_mb,
-                    ),
+                    trace=trace_options,
                 ),
                 None,
             )
@@ -271,7 +341,26 @@ class ExperimentGuardPolicy:
         fingerprints: List[str] = []
         rejections: List[str] = []
         for index, request in enumerate(requested):
-            discriminator = _request_discriminator(request, config)
+            trace_options = None
+            if request.kind in (
+                ExperimentKind.REG_TRACE,
+                ExperimentKind.MEM_VALUE_TRACE,
+            ):
+                try:
+                    trace_options = _resolve_trace_options(
+                        session,
+                        request,
+                        self.default_trace_size_limit_mb,
+                    )
+                except ValueError as exc:
+                    rejections.append(str(exc))
+                    continue
+                discriminator = _trace_options_discriminator(
+                    trace_options,
+                    session.unit,
+                )
+            else:
+                discriminator = _request_discriminator(request, config)
             fingerprint = _fingerprint(request.kind, discriminator)
             if (
                 fingerprint in session.experiment_fingerprints
@@ -286,6 +375,7 @@ class ExperimentGuardPolicy:
                 config,
                 index=index,
                 discriminator=discriminator,
+                trace_options=trace_options,
             )
             if spec is None:
                 if rejection is not None:

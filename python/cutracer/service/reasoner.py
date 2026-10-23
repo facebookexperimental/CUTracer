@@ -58,6 +58,55 @@ _DECISION_SCHEMA = json.dumps(
                             ],
                         },
                         "rationale": {"type": "string"},
+                        "trace_selector": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kernel": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "cubin_hash": {"type": "string"},
+                                    },
+                                    "required": ["name", "cubin_hash"],
+                                },
+                                "launch_id": {"type": "integer", "minimum": 0},
+                                "warp_id": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 31,
+                                },
+                                "warpgroup_id": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 7,
+                                },
+                                "pc_offsets": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "pattern": "^0[xX][0-9a-fA-F]+$",
+                                    },
+                                    "maxItems": 32,
+                                    "uniqueItems": True,
+                                },
+                                "instruction_categories": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["mma", "tma", "sync"],
+                                    },
+                                    "maxItems": 3,
+                                    "uniqueItems": True,
+                                },
+                                "config_source": {
+                                    "type": "string",
+                                    "enum": ["triggering", "minimized"],
+                                },
+                            },
+                            "not": {"required": ["warp_id", "warpgroup_id"]},
+                        },
                     },
                     "required": ["kind", "rationale"],
                 },
@@ -257,7 +306,10 @@ def _prompt(session: AnalysisSession, artifact_context: str) -> str:
         "bounded follow-up experiment is required. Request only the experiment kinds "
         "allowed by the schema. Do not emit shell commands. Prefer reg_trace for "
         "control/register provenance and mem_value_trace only when memory values are "
-        "needed. Do not request reduce_delay_config unless the session already contains "
+        "needed. Trace selectors are optional, data-only, and allowlisted: use only the "
+        "pinned kernel identity, non-negative launch IDs, CTA-local warp or warpgroup, "
+        "hex PC offsets, mma/tma/sync categories, or an existing triggering/minimized "
+        "config. Do not request reduce_delay_config unless the session already contains "
         "a triggering random-delay config; reduction never discovers or synthesizes "
         "one. When that config exists, the service will automatically add "
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "

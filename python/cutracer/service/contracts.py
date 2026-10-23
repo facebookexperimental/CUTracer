@@ -724,26 +724,135 @@ class StressOptions:
         )
 
 
+class TraceInstructionCategory(str, Enum):
+    MMA = "mma"
+    TMA = "tma"
+    SYNC = "sync"
+
+
+class TraceConfigSource(str, Enum):
+    TRIGGERING = "triggering"
+    MINIMIZED = "minimized"
+
+
+def _pc_offset(value: Any) -> str:
+    try:
+        parsed = int(str(value), 0)
+    except ValueError as exc:
+        raise ValueError(f"invalid PC offset: {value!r}") from exc
+    if not 0 <= parsed <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("PC offset must fit an unsigned 64-bit integer")
+    return hex(parsed)
+
+
+@dataclasses.dataclass
+class TraceSelector:
+    """Allowlisted, data-only targeting requested for a follow-up trace."""
+
+    kernel: Optional[KernelId] = None
+    launch_id: Optional[int] = None
+    warp_id: Optional[int] = None
+    warpgroup_id: Optional[int] = None
+    pc_offsets: List[str] = dataclasses.field(default_factory=list)
+    instruction_categories: List[TraceInstructionCategory] = dataclasses.field(
+        default_factory=list
+    )
+    config_source: Optional[TraceConfigSource] = None
+
+    def __post_init__(self) -> None:
+        if self.launch_id is not None and not 0 <= self.launch_id <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("trace launch_id must fit an unsigned 64-bit integer")
+        if self.warp_id is not None and not 0 <= self.warp_id < 32:
+            raise ValueError("trace warp_id must be a CTA-local warp in [0, 31]")
+        if self.warpgroup_id is not None and not 0 <= self.warpgroup_id < 8:
+            raise ValueError("trace warpgroup_id must be in [0, 7]")
+        if self.warp_id is not None and self.warpgroup_id is not None:
+            raise ValueError("trace selector cannot combine warp_id and warpgroup_id")
+        self.pc_offsets = list(dict.fromkeys(_pc_offset(pc) for pc in self.pc_offsets))
+        if len(self.pc_offsets) > 32:
+            raise ValueError("trace selector accepts at most 32 PC offsets")
+        self.instruction_categories = list(dict.fromkeys(self.instruction_categories))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kernel": None if self.kernel is None else self.kernel.to_dict(),
+            "launch_id": self.launch_id,
+            "warp_id": self.warp_id,
+            "warpgroup_id": self.warpgroup_id,
+            "pc_offsets": list(self.pc_offsets),
+            "instruction_categories": [
+                category.value for category in self.instruction_categories
+            ],
+            "config_source": (
+                None if self.config_source is None else self.config_source.value
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TraceSelector":
+        kernel = d.get("kernel")
+        config_source = d.get("config_source")
+        launch_id = d.get("launch_id")
+        warp_id = d.get("warp_id")
+        warpgroup_id = d.get("warpgroup_id")
+        return cls(
+            kernel=None if kernel is None else KernelId.from_dict(kernel),
+            launch_id=None if launch_id is None else int(launch_id),
+            warp_id=None if warp_id is None else int(warp_id),
+            warpgroup_id=None if warpgroup_id is None else int(warpgroup_id),
+            pc_offsets=[str(pc) for pc in d.get("pc_offsets", [])],
+            instruction_categories=[
+                TraceInstructionCategory(category)
+                for category in d.get("instruction_categories", [])
+            ],
+            config_source=(
+                None if config_source is None else TraceConfigSource(config_source)
+            ),
+        )
+
+
 @dataclasses.dataclass
 class TraceOptions:
     mode: ExperimentKind
     trace_size_limit_mb: int = 1024
+    selector: TraceSelector = dataclasses.field(default_factory=TraceSelector)
+    config_artifact: Optional[ArtifactRef] = None
 
     def __post_init__(self) -> None:
         if self.mode not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
             raise ValueError(f"invalid trace mode: {self.mode}")
+        if (self.selector.config_source is None) != (self.config_artifact is None):
+            raise ValueError(
+                "trace config_source and resolved config_artifact must be set together"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode.value,
             "trace_size_limit_mb": self.trace_size_limit_mb,
+            "selector": self.selector.to_dict(),
+            "config_artifact": (
+                None if self.config_artifact is None else self.config_artifact.to_dict()
+            ),
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceOptions":
+        selector = d.get("selector")
+        config_artifact = d.get("config_artifact")
         return cls(
             mode=ExperimentKind(d["mode"]),
             trace_size_limit_mb=int(d.get("trace_size_limit_mb", 1024)),
+            selector=(
+                TraceSelector()
+                if selector is None
+                else TraceSelector.from_dict(selector)
+            ),
+            config_artifact=(
+                None
+                if config_artifact is None
+                else ArtifactRef.from_dict(config_artifact)
+            ),
         )
 
 
@@ -1584,24 +1693,42 @@ class EvidenceBundle:
 class ExperimentRequest:
     kind: ExperimentKind
     rationale: str
+    trace_selector: Optional[TraceSelector] = None
 
     def __post_init__(self) -> None:
-        if self.kind == ExperimentKind.COMPUTE_SANITIZER:
-            return
         if self.kind not in (
+            ExperimentKind.COMPUTE_SANITIZER,
             ExperimentKind.RANDOM_DELAY_STRESS,
             ExperimentKind.REG_TRACE,
             ExperimentKind.MEM_VALUE_TRACE,
             ExperimentKind.REDUCE_DELAY_CONFIG,
         ):
             raise ValueError(f"unsupported experiment request: {self.kind}")
+        if self.trace_selector is not None and self.kind not in (
+            ExperimentKind.REG_TRACE,
+            ExperimentKind.MEM_VALUE_TRACE,
+        ):
+            raise ValueError("trace_selector is only valid for trace requests")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"kind": self.kind.value, "rationale": self.rationale}
+        return {
+            "kind": self.kind.value,
+            "rationale": self.rationale,
+            "trace_selector": (
+                None if self.trace_selector is None else self.trace_selector.to_dict()
+            ),
+        }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExperimentRequest":
-        return cls(kind=ExperimentKind(d["kind"]), rationale=d.get("rationale", ""))
+        selector = d.get("trace_selector")
+        return cls(
+            kind=ExperimentKind(d["kind"]),
+            rationale=d.get("rationale", ""),
+            trace_selector=(
+                None if selector is None else TraceSelector.from_dict(selector)
+            ),
+        )
 
 
 @dataclasses.dataclass
