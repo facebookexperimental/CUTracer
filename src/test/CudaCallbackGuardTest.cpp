@@ -182,8 +182,8 @@ TEST_F(CudaLaunchCallbackTest, OutOfOrderExitPreservesBothOuterAndInnerFrames) {
 }
 
 TEST_F(CudaLaunchCallbackTest, SameApiInDifferentContextsMatchesTheCorrectEntry) {
-  int first_context;
-  int second_context;
+  const int first_context = 0;
+  const int second_context = 0;
   enter(1, 17, true, &first_context);
   enter(1, 23, true, &second_context);
   const auto first = exit(1, &first_context);
@@ -199,7 +199,7 @@ TEST_F(CudaLaunchCallbackTest, SameApiInDifferentContextsMatchesTheCorrectEntry)
 }
 
 TEST_F(CudaLaunchCallbackTest, MissingContextDoesNotConsumeTheSameApiInAnotherContext) {
-  int context;
+  const int context = 0;
   enter(1, 17, true, &context);
   EXPECT_FALSE(exit(1).launch);
   EXPECT_EQ(other_thread_lock_result(), EBUSY);
