@@ -9,6 +9,7 @@ wrong rule is visible in the report instead of silently shrinking the evidence.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -165,3 +166,21 @@ class SuppressionPolicy:
             else:
                 suppressed.append(SuppressedFinding(finding=finding, decision=decision))
         return SuppressionOutcome(kept=tuple(kept), suppressed=tuple(suppressed))
+
+
+def load_suppression_policy(path: str) -> SuppressionPolicy:
+    """Load an ordered rule set from a JSON ``{"rules": [...]}`` document."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid suppression policy JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise ValueError("suppression policy must be a JSON object")
+    rules = document.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("suppression policy rules must be a JSON array")
+    try:
+        return SuppressionPolicy([SuppressionRule.from_dict(rule) for rule in rules])
+    except (KeyError, TypeError, ValueError, re.error) as error:
+        raise ValueError(f"invalid suppression rule: {error}") from error
