@@ -459,7 +459,11 @@ class ClaudeReasoner:
             return fallback_decision(session, "Claude is unavailable")
         run = self._runner or _subprocess_runner
         try:
-            triage = correlate_evidence(session.unit.unit_id, session.evidence)
+            triage = correlate_evidence(
+                session.unit.unit_id,
+                session.evidence,
+                test_id=session.unit.test_id,
+            )
             prompt = _prompt(
                 project_session_context(
                     session,
