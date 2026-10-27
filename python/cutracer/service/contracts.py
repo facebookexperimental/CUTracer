@@ -78,6 +78,11 @@ class SanitizerOutcome(str, Enum):
     UNKNOWN = "unknown"
 
 
+_SUPPORTED_SANITIZER_TOOLS = frozenset(
+    {"initcheck", "memcheck", "racecheck", "synccheck"}
+)
+
+
 class ResultCompleteness(str, Enum):
     """How completely an experiment covered its declared verdict scope."""
 
@@ -667,12 +672,24 @@ class ExecutionProvenance:
 
 @dataclasses.dataclass
 class FindingRecord:
+    """One finding, normalized across sanitizer tools.
+
+    ``error_type`` is the stable vendor-neutral class used for correlation and
+    suppression; ``error_detail`` keeps the tool's own wording, which encodes
+    per-finding specifics such as access width that must not fragment grouping.
+    ``kernel_name`` is the legacy wire name for the sanitizer's primary
+    faulting symbol; it may identify an inlined or device function rather than
+    the kernel entry point. The pinned entry-kernel identity lives in the
+    enclosing result's ``provenance.kernel``.
+    """
+
     source_tool: str
     error_type: str
     kernel_name: Optional[str] = None
     source: Optional[SourceLoc] = None
     count: int = 1
     raw: str = ""
+    error_detail: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -682,6 +699,7 @@ class FindingRecord:
             "source": None if self.source is None else self.source.to_dict(),
             "count": self.count,
             "raw": self.raw,
+            "error_detail": self.error_detail,
         }
 
     @classmethod
@@ -694,6 +712,7 @@ class FindingRecord:
             source=None if source is None else SourceLoc.from_dict(source),
             count=int(d.get("count", 1)),
             raw=d.get("raw", ""),
+            error_detail=d.get("error_detail", ""),
         )
 
 
@@ -705,6 +724,7 @@ class SanitizerSummary:
     errors: int
     warnings: int
     raw: str = ""
+    not_printed: Optional[int] = None
 
     @property
     def is_positive(self) -> bool:
@@ -720,6 +740,7 @@ class SanitizerSummary:
             "errors": self.errors,
             "warnings": self.warnings,
             "raw": self.raw,
+            "not_printed": self.not_printed,
         }
 
     @classmethod
@@ -729,6 +750,9 @@ class SanitizerSummary:
             errors=int(d["errors"]),
             warnings=int(d["warnings"]),
             raw=d.get("raw", ""),
+            not_printed=(
+                None if d.get("not_printed") is None else int(d["not_printed"])
+            ),
         )
 
 
@@ -1077,6 +1101,7 @@ class SanitizerSweepResult:
     summary: Optional[SanitizerSummary] = None
     completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
     summary_issues: List[str] = dataclasses.field(default_factory=list)
+    output_truncated: bool = False
 
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.COMPUTE_SANITIZER, init=False
@@ -1091,10 +1116,27 @@ class SanitizerSweepResult:
         )
 
     @property
+    def has_usable_positive_signal(self) -> bool:
+        """Retain parsed findings, but do not promote a broken tool's footer."""
+        return bool(self.findings) or (
+            self.execution_status in (ExecutionStatus.SUCCEEDED, ExecutionStatus.FAILED)
+            and self.completeness == ResultCompleteness.COMPLETE
+            and not self.summary_issues
+            and self.has_positive_signal
+        )
+
+    @property
     def has_trustworthy_clean(self) -> bool:
+        """Whether this run proves its tool found nothing.
+
+        Every tool that reports a parseable summary can prove a clean run; the
+        check is deliberately not restricted to one tool, because gating on
+        racecheck alone would leave a complete clean initcheck, memcheck, or
+        synccheck run indistinguishable from one that was never parsed.
+        """
         return (
             self.execution_status == ExecutionStatus.SUCCEEDED
-            and self.tool == "racecheck"
+            and self.tool in _SUPPORTED_SANITIZER_TOOLS
             and self.outcome == SanitizerOutcome.CLEAN
             and self.completeness == ResultCompleteness.COMPLETE
             and self.summary is not None
@@ -1118,6 +1160,7 @@ class SanitizerSweepResult:
             "summary": None if self.summary is None else self.summary.to_dict(),
             "completeness": self.completeness.value,
             "summary_issues": list(self.summary_issues),
+            "output_truncated": self.output_truncated,
         }
 
     @classmethod
@@ -1139,6 +1182,7 @@ class SanitizerSweepResult:
                 d.get("completeness", ResultCompleteness.UNKNOWN.value)
             ),
             summary_issues=list(d.get("summary_issues", [])),
+            output_truncated=bool(d.get("output_truncated", False)),
         )
 
 
