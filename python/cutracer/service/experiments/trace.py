@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -250,12 +251,17 @@ def _matches_pinned_capture(
 def _validate_effective_targeting(
     metadata: Mapping[str, object],
     expected_targeting: Mapping[str, object],
-    mode: ExperimentKind,
+    instrument_modes: Sequence[str],
 ) -> None:
     for field, expected in expected_targeting.items():
         if metadata.get(field) != expected:
             raise ValueError(f"captured trace targeting metadata differs for {field}")
-    if metadata.get("instrument_modes") != [mode.value]:
+    actual_modes = metadata.get("instrument_modes")
+    if (
+        not isinstance(actual_modes, list)
+        or any(not isinstance(mode, str) for mode in actual_modes)
+        or sorted(actual_modes) != sorted(instrument_modes)
+    ):
         raise ValueError(
             "captured trace instrumentation mode differs from the trace job"
         )
@@ -293,7 +299,9 @@ def _selected_capture_metadata(
         raise ValueError("captured trace is missing a valid grid_launch_id")
     if not launch_matches:
         return None
-    _validate_effective_targeting(metadata, expected_targeting, spec.kind)
+    _validate_effective_targeting(
+        metadata, expected_targeting, spec.trace.effective_instrument_modes
+    )
     return launch_id, _portable_cubin_name(metadata)
 
 
@@ -458,32 +466,6 @@ def _promote_paths(
     return artifacts
 
 
-def _run_trace_analyzer(
-    trace_path: str,
-    *,
-    arch: str,
-    out_dir: str,
-    trace_analyzer: Optional[TraceAnalysisRunner],
-) -> TraceAnalysisEvidence:
-    analysis_runner = trace_analyzer or run_trace_analysis
-    try:
-        return analysis_runner(trace_path, arch=arch, out_dir=out_dir)
-    except Exception as exc:
-        logger.exception("deterministic trace analysis runner failed")
-        candidate = getattr(analysis_runner, "__name__", "")
-        name = candidate.strip() if isinstance(candidate, str) else ""
-        if not name:
-            name = type(analysis_runner).__name__.strip() or "trace_analyzer"
-        return TraceAnalysisEvidence(
-            analyzer=name,
-            execution_status=ExecutionStatus.INFRA_ERROR,
-            detector_summaries=[],
-            findings=[],
-            total_findings=0,
-            error=f"deterministic trace analysis failed: {exc}",
-        )
-
-
 def _selected_kernel(spec: ExperimentSpec) -> Optional[KernelId]:
     assert spec.trace is not None
     requested = spec.trace.selector.kernel
@@ -623,8 +605,6 @@ def _trace_pc_offsets(
 def _trace_warp_mask(spec: ExperimentSpec) -> Optional[str]:
     assert spec.trace is not None
     selector = spec.trace.selector
-    if selector.warp_id is not None and selector.warpgroup_id is not None:
-        raise ValueError("trace selector cannot set both warp_id and warpgroup_id")
     if selector.warp_id is not None:
         if not 0 <= selector.warp_id < 32:
             raise ValueError("trace warp_id must be in [0, 31]")
@@ -698,6 +678,432 @@ def _stage_resume_artifacts(
     return paths
 
 
+def _run_trace_capture(
+    spec: ExperimentSpec,
+    *,
+    attempt_dir: str,
+    runner: Optional[RunTarget],
+    cutracer_so: Optional[str],
+    timeout: int,
+    resolved_argv: Optional[Sequence[str]],
+    resolved_cwd: Optional[str],
+    resolved_base_env: Optional[Mapping[str, str]],
+    resolved_config_path: Optional[str],
+    use_bundled_cuda_tools: bool,
+) -> subprocess.CompletedProcess[str]:
+    assert spec.trace is not None
+    selected_kernel = _selected_kernel(spec)
+    kernel_filter = (
+        selected_kernel.name
+        if selected_kernel is not None and selected_kernel.name
+        else None
+    )
+    pc_offsets = _trace_pc_offsets(
+        spec,
+        resolved_config_path=resolved_config_path,
+    )
+    categories = ",".join(
+        category.value for category in spec.trace.selector.instruction_categories
+    )
+    if resolved_base_env is None:
+        base_env = os.environ.copy()
+        base_env.update(spec.unit.env)
+    else:
+        base_env = dict(resolved_base_env)
+    argv = list(spec.unit.argv if resolved_argv is None else resolved_argv)
+    cwd = resolved_cwd if resolved_cwd is not None else (spec.unit.cwd or None)
+    return run_instrumented_target(
+        argv,
+        InstrumentationConfig(
+            cutracer_so=cutracer_so,
+            instrument=",".join(spec.trace.effective_instrument_modes),
+            kernel_filters=kernel_filter,
+            trace_instr_categories=categories or None,
+            trace_launch_id=spec.trace.selector.launch_id,
+            trace_warp_mask=_trace_warp_mask(spec),
+            trace_pc_offsets=",".join(pc_offsets) or None,
+            trace_format="ndjson",
+            output_dir=attempt_dir,
+            dump_cubin=True,
+            trace_size_limit_mb=spec.trace.trace_size_limit_mb,
+            cwd=cwd,
+            timeout=timeout,
+            base_env=base_env,
+            use_bundled_cuda_tools=use_bundled_cuda_tools,
+        ),
+        runner=runner,
+    )
+
+
+def _seal_capture_artifacts(
+    *,
+    attempt_dir: str,
+    out_dir: str,
+    trace_locator: TraceLocator,
+    spec: ExperimentSpec,
+    resolved_config_path: Optional[str],
+    traces: list[ArtifactRef],
+    supporting: list[ArtifactRef],
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+) -> tuple[ArtifactRef, bool]:
+    attempt_log = os.path.join(attempt_dir, "trace.log")
+    _capture_to_log(attempt_log, stdout, stderr)
+    log = _promote_artifact(
+        attempt_log,
+        os.path.join(out_dir, "trace.log"),
+        media_type="text/plain",
+    )
+    selected, supporting_paths, all_have_records = _selected_capture_outputs(
+        _located_trace_paths(attempt_dir, trace_locator),
+        attempt_dir=attempt_dir,
+        spec=spec,
+        resolved_config_path=resolved_config_path,
+    )
+    _promote_paths(
+        selected,
+        out_dir=out_dir,
+        media_type="application/x-ndjson",
+        promoted=traces,
+    )
+    _promote_paths(
+        supporting_paths,
+        out_dir=out_dir,
+        media_type="application/x-cubin",
+        promoted=supporting,
+    )
+    return log, all_have_records
+
+
+def _capture_error(
+    proc: subprocess.CompletedProcess[str],
+    traces: Sequence[ArtifactRef],
+    supporting: Sequence[ArtifactRef],
+    all_have_records: bool,
+) -> Optional[tuple[ExecutionStatus, str]]:
+    if proc.returncode != 0:
+        return ExecutionStatus.FAILED, _target_failure_detail(proc)
+    if not traces:
+        return (
+            ExecutionStatus.INFRA_ERROR,
+            "CUTracer completed without producing a trace",
+        )
+    if not supporting:
+        return (
+            ExecutionStatus.INFRA_ERROR,
+            "CUTracer completed without producing a cubin artifact",
+        )
+    output = f"{_text(proc.stdout)}\n{_text(proc.stderr)}"
+    if "Trace size limit exceeded" in output:
+        return (
+            ExecutionStatus.INFRA_ERROR,
+            "CUTracer stopped capture after the trace size limit was exceeded",
+        )
+    if not all_have_records:
+        return (
+            ExecutionStatus.INFRA_ERROR,
+            "one or more targeted traces contain metadata but no selected trace records",
+        )
+    return None
+
+
+def _target_failure_detail(proc: subprocess.CompletedProcess[str]) -> str:
+    return _text(proc.stderr) or _text(proc.stdout) or "instrumented target failed"
+
+
+def _run_trace_analyzer(
+    analysis_paths: Sequence[str],
+    *,
+    arch: str,
+    out_dir: str,
+    trace_analyzer: Optional[TraceAnalysisRunner],
+) -> tuple[Optional[TraceAnalysisEvidence], Optional[str]]:
+    analysis_runner = trace_analyzer or run_trace_analysis
+    try:
+        analysis = analysis_runner(
+            analysis_paths,
+            arch=arch,
+            out_dir=out_dir,
+        )
+    except Exception as exc:
+        logger.exception("deterministic trace analysis runner failed")
+        candidate = getattr(analysis_runner, "__name__", "")
+        analyzer_name = candidate.strip() if isinstance(candidate, str) else ""
+        if not analyzer_name:
+            analyzer_name = type(analysis_runner).__name__.strip() or "trace_analyzer"
+        error = f"deterministic trace analysis failed: {exc}"
+        return (
+            TraceAnalysisEvidence(
+                analyzer=analyzer_name,
+                execution_status=ExecutionStatus.INFRA_ERROR,
+                detector_summaries=[],
+                findings=[],
+                total_findings=0,
+                error=error,
+            ),
+            error,
+        )
+    artifact = analysis.artifact
+    artifact_is_hashed = (
+        artifact is not None
+        and artifact.sha256 is not None
+        and artifact.size_bytes is not None
+    )
+    if analysis.execution_status != ExecutionStatus.SUCCEEDED or not artifact_is_hashed:
+        error = (
+            analysis.error
+            or "deterministic trace analysis did not produce a hashed report"
+        )
+        # Keep partial findings, but normalize the nested evidence so the
+        # outer INFRA_ERROR/PARTIAL result remains valid at the service
+        # boundary. An unhashed artifact is not portable evidence.
+        analysis = dataclasses.replace(
+            analysis,
+            execution_status=ExecutionStatus.INFRA_ERROR,
+            artifact=artifact if artifact_is_hashed else None,
+            error=error,
+        )
+        return (
+            analysis,
+            error,
+        )
+    return analysis, None
+
+
+def _seal_timed_out_capture(
+    *,
+    attempt_dir: str,
+    out_dir: str,
+    trace_locator: TraceLocator,
+    spec: ExperimentSpec,
+    resolved_config_path: Optional[str],
+    exc: subprocess.TimeoutExpired,
+) -> tuple[
+    list[ArtifactRef],
+    list[ArtifactRef],
+    Optional[ArtifactRef],
+    Optional[str],
+]:
+    traces: list[ArtifactRef] = []
+    supporting: list[ArtifactRef] = []
+    try:
+        log, _all_have_records = _seal_capture_artifacts(
+            attempt_dir=attempt_dir,
+            out_dir=out_dir,
+            trace_locator=trace_locator,
+            spec=spec,
+            resolved_config_path=resolved_config_path,
+            traces=traces,
+            supporting=supporting,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+        )
+        return traces, supporting, log, None
+    except Exception as promotion_error:
+        logger.exception("failed to seal timed-out trace capture")
+        return (
+            traces,
+            supporting,
+            _sealed_log_if_available(out_dir),
+            "trace timed out and partial evidence could not be sealed: "
+            f"{promotion_error}",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _TraceRunOptions:
+    runner: Optional[RunTarget]
+    trace_locator: TraceLocator
+    trace_analyzer: Optional[TraceAnalysisRunner]
+    cutracer_so: Optional[str]
+    timeout: int
+    resolved_argv: Optional[Sequence[str]]
+    resolved_cwd: Optional[str]
+    resolved_base_env: Optional[Mapping[str, str]]
+    resolved_config_path: Optional[str]
+    use_bundled_cuda_tools: bool
+
+
+@dataclasses.dataclass
+class _TraceRunState:
+    spec: ExperimentSpec
+    out_dir: str
+    provenance: ExecutionProvenance
+    started: float
+    capture_duration_s: Optional[float] = None
+    analysis_duration_s: float = 0.0
+    traces: list[ArtifactRef] = dataclasses.field(default_factory=list)
+    supporting: list[ArtifactRef] = dataclasses.field(default_factory=list)
+    log: Optional[ArtifactRef] = None
+    analysis: Optional[TraceAnalysisEvidence] = None
+
+    def result(
+        self,
+        status: ExecutionStatus,
+        *,
+        error: Optional[str],
+        completeness: ResultCompleteness,
+    ) -> TraceExperimentResult:
+        return TraceExperimentResult(
+            experiment_id=self.spec.experiment_id,
+            execution_status=status,
+            mode=self.spec.kind,
+            provenance=self.provenance,
+            trace=self.traces[0] if self.traces else None,
+            traces=list(self.traces),
+            supporting_artifacts=list(self.supporting),
+            log=self.log,
+            analysis=self.analysis,
+            duration_s=(
+                self.capture_duration_s
+                if self.capture_duration_s is not None
+                else time.monotonic() - self.started
+            ),
+            error=error,
+            completeness=completeness,
+            analysis_duration_s=self.analysis_duration_s,
+        )
+
+
+def _new_trace_run_state(
+    spec: ExperimentSpec,
+    out_dir: str,
+    *,
+    cutracer_version: str,
+    toolchain_version: str,
+) -> _TraceRunState:
+    return _TraceRunState(
+        spec=spec,
+        out_dir=out_dir,
+        provenance=ExecutionProvenance(
+            source_revision=spec.unit.source_revision,
+            arch=spec.unit.arch,
+            kernel=spec.unit.kernel,
+            tool_version=cutracer_version,
+            toolchain_version=toolchain_version,
+        ),
+        started=time.monotonic(),
+    )
+
+
+def _seal_fresh_capture(
+    state: _TraceRunState,
+    attempt_dir: str,
+    options: _TraceRunOptions,
+    proc: subprocess.CompletedProcess[str],
+) -> Optional[TraceExperimentResult]:
+    try:
+        state.log, all_have_records = _seal_capture_artifacts(
+            attempt_dir=attempt_dir,
+            out_dir=state.out_dir,
+            trace_locator=options.trace_locator,
+            spec=state.spec,
+            resolved_config_path=options.resolved_config_path,
+            traces=state.traces,
+            supporting=state.supporting,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
+    except (OSError, ValueError) as seal_error:
+        state.log = _sealed_log_if_available(state.out_dir)
+        if proc.returncode != 0:
+            return state.result(
+                ExecutionStatus.FAILED,
+                error=(
+                    f"{_target_failure_detail(proc)}; "
+                    f"partial evidence could not be sealed: {seal_error}"
+                ),
+                completeness=ResultCompleteness.PARTIAL,
+            )
+        raise
+    state.capture_duration_s = time.monotonic() - state.started
+    capture_error = _capture_error(
+        proc,
+        state.traces,
+        state.supporting,
+        all_have_records,
+    )
+    if capture_error is None:
+        return None
+    status, error = capture_error
+    return state.result(
+        status,
+        error=error,
+        completeness=ResultCompleteness.PARTIAL,
+    )
+
+
+def _fresh_analysis_paths(
+    state: _TraceRunState,
+    attempt_dir: str,
+    options: _TraceRunOptions,
+) -> tuple[list[str], Optional[TraceExperimentResult]]:
+    proc = _run_trace_capture(
+        state.spec,
+        attempt_dir=attempt_dir,
+        runner=options.runner,
+        cutracer_so=options.cutracer_so,
+        timeout=options.timeout,
+        resolved_argv=options.resolved_argv,
+        resolved_cwd=options.resolved_cwd,
+        resolved_base_env=options.resolved_base_env,
+        resolved_config_path=options.resolved_config_path,
+        use_bundled_cuda_tools=options.use_bundled_cuda_tools,
+    )
+    early_result = _seal_fresh_capture(state, attempt_dir, options, proc)
+    return [local_path(trace) for trace in state.traces], early_result
+
+
+def _analyze_trace_paths(
+    state: _TraceRunState,
+    analysis_paths: Sequence[str],
+    options: _TraceRunOptions,
+) -> TraceExperimentResult:
+    analysis_started = time.monotonic()
+    try:
+        state.analysis, error = _run_trace_analyzer(
+            analysis_paths,
+            arch=state.spec.unit.arch,
+            out_dir=state.out_dir,
+            trace_analyzer=options.trace_analyzer,
+        )
+    finally:
+        state.analysis_duration_s += time.monotonic() - analysis_started
+    if error is not None:
+        return state.result(
+            ExecutionStatus.INFRA_ERROR,
+            error=error,
+            completeness=ResultCompleteness.PARTIAL,
+        )
+    return state.result(
+        ExecutionStatus.SUCCEEDED,
+        error=None,
+        completeness=ResultCompleteness.COMPLETE,
+    )
+
+
+def _timeout_trace_result(
+    state: _TraceRunState,
+    attempt_dir: str,
+    options: _TraceRunOptions,
+    exc: subprocess.TimeoutExpired,
+) -> TraceExperimentResult:
+    state.traces, state.supporting, state.log, seal_error = _seal_timed_out_capture(
+        attempt_dir=attempt_dir,
+        out_dir=state.out_dir,
+        trace_locator=options.trace_locator,
+        spec=state.spec,
+        resolved_config_path=options.resolved_config_path,
+        exc=exc,
+    )
+    error = str(exc) if seal_error is None else f"{exc}; {seal_error}"
+    return state.result(
+        ExecutionStatus.TIMED_OUT,
+        error=error,
+        completeness=ResultCompleteness.PARTIAL,
+    )
+
+
 def run_trace_experiment(
     spec: ExperimentSpec,
     *,
@@ -709,115 +1115,49 @@ def run_trace_experiment(
     timeout: int = 1800,
     cutracer_version: str = "",
     toolchain_version: str = "",
+    resolved_argv: Optional[Sequence[str]] = None,
+    resolved_cwd: Optional[str] = None,
+    resolved_base_env: Optional[Mapping[str, str]] = None,
+    resolved_config_path: Optional[str] = None,
+    use_bundled_cuda_tools: bool = True,
 ) -> TraceExperimentResult:
-    """Capture a targeted trace with this package's CUTracer runtime."""
-    if spec.kind not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
-        raise ValueError(f"not a trace experiment: {spec.kind}")
-    if spec.trace is None:
-        raise ValueError("trace options are required")
-
+    """Capture, seal, and analyze every targeted trace from one attempt."""
+    _validate_trace_spec(spec)
     os.makedirs(out_dir, exist_ok=True)
-    locate = trace_locator or _default_trace_locator
-    base_env = os.environ.copy()
-    base_env.update(spec.unit.env)
-    started = time.monotonic()
-    capture_finished: Optional[float] = None
-    analysis_duration_s = 0.0
-    log_path = os.path.join(out_dir, "trace.log")
-    try:
-        selected_kernel = _selected_kernel(spec)
-        kernel_filter = (
-            selected_kernel.name
-            if selected_kernel is not None and selected_kernel.name
-            else None
-        )
-        pc_offsets = _trace_pc_offsets(spec, resolved_config_path=None)
-        categories = ",".join(
-            category.value for category in spec.trace.selector.instruction_categories
-        )
-        proc = run_instrumented_target(
-            spec.unit.argv,
-            InstrumentationConfig(
-                cutracer_so=cutracer_so,
-                instrument=spec.kind.value,
-                kernel_filters=kernel_filter,
-                trace_instr_categories=categories or None,
-                trace_launch_id=spec.trace.selector.launch_id,
-                trace_warp_mask=_trace_warp_mask(spec),
-                trace_pc_offsets=",".join(pc_offsets) or None,
-                output_dir=out_dir,
-                trace_size_limit_mb=spec.trace.trace_size_limit_mb,
-                cwd=spec.unit.cwd or None,
-                timeout=timeout,
-                base_env=base_env,
-            ),
-            runner=runner,
-        )
-        log = _capture_to_log(log_path, proc.stdout, proc.stderr)
-
-        trace_paths = _located_trace_paths(out_dir, locate)
-        trace_path = max(trace_paths, key=os.path.getmtime) if trace_paths else None
-        if proc.returncode == 0 and trace_path is not None:
-            status = ExecutionStatus.SUCCEEDED
-            error = None
-            media_type = (
-                "application/zstd"
-                if trace_path.endswith(".zst")
-                else "application/x-ndjson"
-            )
-            trace = local_artifact(trace_path, media_type=media_type)
-            capture_finished = time.monotonic()
-            analysis_started = capture_finished
-            analysis = _run_trace_analyzer(
-                trace_path,
-                arch=spec.unit.arch,
-                out_dir=out_dir,
-                trace_analyzer=trace_analyzer,
-            )
-            analysis_duration_s = time.monotonic() - analysis_started
-        elif proc.returncode == 0:
-            status = ExecutionStatus.INFRA_ERROR
-            error = "CUTracer completed without producing a trace"
-            trace = None
-            analysis = None
-        else:
-            status = ExecutionStatus.FAILED
-            error = proc.stderr or "instrumented target failed"
-            trace = None
-            analysis = None
-    except subprocess.TimeoutExpired as exc:
-        status = ExecutionStatus.TIMED_OUT
-        error = str(exc)
-        trace = None
-        analysis = None
-        # The child is killed at the deadline, but subprocess still captured
-        # whatever it emitted beforehand; persist it instead of dropping it.
-        log = _capture_to_log(log_path, exc.stdout, exc.stderr)
-    except (ClickException, OSError, ValueError) as exc:
-        status = ExecutionStatus.INFRA_ERROR
-        error = str(exc)
-        trace = None
-        analysis = None
-        log = None
-
-    return TraceExperimentResult(
-        experiment_id=spec.experiment_id,
-        execution_status=status,
-        mode=spec.kind,
-        provenance=ExecutionProvenance(
-            source_revision=spec.unit.source_revision,
-            arch=spec.unit.arch,
-            kernel=spec.unit.kernel,
-            tool_version=cutracer_version,
-            toolchain_version=toolchain_version,
-        ),
-        trace=trace,
-        log=log,
-        analysis=analysis,
-        duration_s=(
-            (capture_finished if capture_finished is not None else time.monotonic())
-            - started
-        ),
-        analysis_duration_s=analysis_duration_s,
-        error=error,
+    attempt_dir = tempfile.mkdtemp(prefix=".trace_attempt_", dir=out_dir)
+    state = _new_trace_run_state(
+        spec,
+        out_dir,
+        cutracer_version=cutracer_version,
+        toolchain_version=toolchain_version,
     )
+    options = _TraceRunOptions(
+        runner=runner,
+        trace_locator=trace_locator or _default_trace_locator,
+        trace_analyzer=trace_analyzer,
+        cutracer_so=cutracer_so,
+        timeout=timeout,
+        resolved_argv=resolved_argv,
+        resolved_cwd=resolved_cwd,
+        resolved_base_env=resolved_base_env,
+        resolved_config_path=resolved_config_path,
+        use_bundled_cuda_tools=use_bundled_cuda_tools,
+    )
+    try:
+        _validate_trace_runtime_spec(spec)
+        analysis_paths, early_result = _fresh_analysis_paths(
+            state, attempt_dir, options
+        )
+        if early_result is not None:
+            return early_result
+        return _analyze_trace_paths(state, analysis_paths, options)
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_trace_result(state, attempt_dir, options, exc)
+    except (ClickException, OSError, ValueError) as exc:
+        return state.result(
+            ExecutionStatus.INFRA_ERROR,
+            error=str(exc),
+            completeness=ResultCompleteness.PARTIAL,
+        )
+    finally:
+        shutil.rmtree(attempt_dir, ignore_errors=True)
