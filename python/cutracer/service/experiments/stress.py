@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Mapping, Optional, Sequence
 
 from click import ClickException
 from cutracer.runner import RunTarget
@@ -22,7 +24,16 @@ from cutracer.service.contracts import (
     StressTestResult,
     TriggeringDelayConfig,
 )
-from cutracer.stress.stress import run_stress, StressConfig, StressResult
+from cutracer.stress.stress import (
+    run_stress,
+    StressConfig,
+    StressResult,
+    TriggeringConfig,
+)
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+StressProgressCallback = Callable[[StressTestResult], None]
 
 
 def _campaign_completed(result: StressResult, planned_trials: int) -> bool:
@@ -33,19 +44,14 @@ def _campaign_completed(result: StressResult, planned_trials: int) -> bool:
     )
 
 
-def _classify_result(
+def _classify_stress_result(
     result: StressResult,
     *,
     planned_trials: int,
     stop_on_first: bool,
-    triggering_config: Optional[TriggeringDelayConfig],
-) -> tuple[
-    StressOutcome,
-    ExecutionStatus,
-    Optional[str],
-    ResultCompleteness,
-]:
-    if triggering_config is not None:
+    reproduced: bool,
+) -> tuple[StressOutcome, ExecutionStatus, Optional[str], ResultCompleteness]:
+    if reproduced:
         attempted_trials = (
             result.completed_trials + result.infra_errors + result.timed_out
         )
@@ -60,12 +66,7 @@ def _classify_result(
             completeness = ResultCompleteness.COMPLETE_EARLY
         else:
             completeness = ResultCompleteness.PARTIAL
-        return (
-            StressOutcome.REPRODUCED,
-            ExecutionStatus.SUCCEEDED,
-            None,
-            completeness,
-        )
+        return StressOutcome.REPRODUCED, ExecutionStatus.SUCCEEDED, None, completeness
     if result.unattributed_reproductions > 0:
         return (
             StressOutcome.UNATTRIBUTED_REPRODUCTION,
@@ -106,18 +107,21 @@ def _classify_result(
     )
 
 
-def _publish_triggering_config(source: str, out_dir: str) -> ArtifactRef:
-    return publish_local_artifact(
-        source,
-        os.path.join(out_dir, "triggering_config.json"),
-        media_type="application/json",
-        content_addressed=True,
-    )
-
-
-def _provenance(
-    spec: ExperimentSpec,
+def _partial_stress_outcome(
+    triggering_config: Optional[TriggeringDelayConfig],
     *,
+    reproductions: int,
+    unattributed_reproductions: int,
+) -> StressOutcome:
+    if triggering_config is not None:
+        return StressOutcome.REPRODUCED
+    if reproductions == 0 and unattributed_reproductions > 0:
+        return StressOutcome.UNATTRIBUTED_REPRODUCTION
+    return StressOutcome.INCOMPLETE
+
+
+def _stress_provenance(
+    spec: ExperimentSpec,
     cutracer_version: str,
     toolchain_version: str,
 ) -> ExecutionProvenance:
@@ -130,139 +134,379 @@ def _provenance(
     )
 
 
-def _terminal_result(
+def _resume_core_result(
     spec: ExperimentSpec,
-    *,
-    status: ExecutionStatus,
-    outcome: StressOutcome,
-    error: str,
-    started: float,
-    cutracer_version: str,
-    toolchain_version: str,
-) -> StressTestResult:
-    if spec.stress is None:
-        raise ValueError("stress experiment requires stress options")
-    return StressTestResult(
-        experiment_id=spec.experiment_id,
-        execution_status=status,
-        outcome=outcome,
-        completed_trials=0,
-        reproductions=0,
-        infra_errors=1,
-        provenance=_provenance(
-            spec,
-            cutracer_version=cutracer_version,
-            toolchain_version=toolchain_version,
+    out_dir: str,
+    planned_trials: int,
+    provenance: ExecutionProvenance,
+    resume_from: Optional[StressTestResult],
+) -> Optional[StressResult]:
+    if resume_from is None:
+        return None
+    if (
+        resume_from.experiment_id != spec.experiment_id
+        or resume_from.planned_trials != planned_trials
+        or resume_from.provenance != provenance
+        or resume_from.completeness != ResultCompleteness.PARTIAL
+    ):
+        raise ValueError("resumed stress progress does not match the experiment")
+    resume_log_path = (
+        None
+        if resume_from.log is None
+        else os.path.join(out_dir, resume_from.log.relative_path)
+    )
+    resume_triggering: Optional[TriggeringConfig] = None
+    if resume_from.triggering_config is not None:
+        config = resume_from.triggering_config
+        resume_triggering = TriggeringConfig(
+            config_path=os.path.join(out_dir, config.artifact.relative_path),
+            delay_ns=config.delay_ns,
+            warpgroup_id=config.warpgroup_id,
+            enable_prob=config.enable_prob,
+            attempt_index=config.attempt_index,
+            enabled_point_count=config.enabled_point_count,
+        )
+    return StressResult(
+        reproduced=resume_triggering is not None,
+        completed_trials=resume_from.completed_trials,
+        reproductions=resume_from.reproductions,
+        infra_errors=resume_from.infra_errors,
+        reproduction_rate=resume_from.reproduction_rate,
+        triggering=resume_triggering,
+        log_path=resume_log_path,
+        timed_out=resume_from.timed_out_trials,
+        unattributed_reproductions=resume_from.unattributed_reproductions,
+        log_size_bytes=(
+            None
+            if resume_from.log is None or resume_from.log.size_bytes is None
+            else resume_from.log.size_bytes
         ),
-        duration_s=time.monotonic() - started,
-        error=error,
-        planned_trials=spec.stress.planned_trials,
-        completeness=ResultCompleteness.PARTIAL,
     )
 
 
-def _triggering_config(
+def _triggering_delay_config(
     spec: ExperimentSpec,
-    *,
-    result: StressResult,
+    core_result: StressResult,
     artifact: ArtifactRef,
+    *,
     cutracer_version: str,
     toolchain_version: str,
 ) -> TriggeringDelayConfig:
-    if spec.unit.oracle is None or result.triggering is None:
-        raise ValueError("triggering config requires an oracle and reproduction")
+    if core_result.triggering is None:
+        raise ValueError("stress result requires a triggering config")
+    oracle = spec.unit.oracle
+    if oracle is None:
+        raise ValueError("stress result requires a pinned oracle")
     return TriggeringDelayConfig(
         artifact=artifact,
         work_unit_id=spec.unit.unit_id,
         target_argv=list(spec.unit.argv),
-        oracle=spec.unit.oracle,
+        oracle=oracle,
         source_revision=spec.unit.source_revision,
         arch=spec.unit.arch,
         kernel=spec.unit.kernel,
-        delay_ns=result.triggering.delay_ns,
-        enable_prob=result.triggering.enable_prob,
-        warpgroup_id=result.triggering.warpgroup_id,
-        attempt_index=result.triggering.attempt_index,
-        completed_trials=result.completed_trials,
-        reproductions=result.reproductions,
-        reproduction_rate=result.reproduction_rate,
+        delay_ns=core_result.triggering.delay_ns,
+        enable_prob=core_result.triggering.enable_prob,
+        warpgroup_id=core_result.triggering.warpgroup_id,
+        attempt_index=core_result.triggering.attempt_index,
+        completed_trials=core_result.completed_trials,
+        reproductions=core_result.reproductions,
+        reproduction_rate=(
+            core_result.reproductions / core_result.completed_trials
+            if core_result.completed_trials
+            else 0.0
+        ),
+        enabled_point_count=core_result.triggering.enabled_point_count,
         cutracer_version=cutracer_version,
         toolchain_version=toolchain_version,
     )
 
 
-def _publish_result_artifacts(
+def _republish_stress_log(
+    out_dir: str,
+    log: Optional[ArtifactRef],
+) -> Optional[ArtifactRef]:
+    if log is None or log.relative_path == "stress.log":
+        return log
+    source = os.path.join(out_dir, log.relative_path)
+    try:
+        return publish_local_artifact(
+            source,
+            os.path.join(out_dir, "stress.log"),
+            media_type="text/plain",
+        )
+    except OSError as error:
+        logger.warning(
+            "could not republish stress progress log %s as stress.log: %s",
+            log.relative_path,
+            error,
+        )
+    return log if os.path.isfile(source) else None
+
+
+def _recover_stress_progress(
+    out_dir: str,
+    latest_core: Optional[StressResult],
+    latest: Optional[StressTestResult],
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    Optional[ArtifactRef],
+    Optional[TriggeringDelayConfig],
+]:
+    counts: tuple[int, int, int, int, int]
+    if latest_core is not None:
+        counts = (
+            latest_core.completed_trials,
+            latest_core.reproductions,
+            latest_core.infra_errors + 1,
+            latest_core.timed_out,
+            latest_core.unattributed_reproductions,
+        )
+    elif latest is not None:
+        counts = (
+            latest.completed_trials,
+            latest.reproductions,
+            latest.infra_errors + 1,
+            latest.timed_out_trials,
+            latest.unattributed_reproductions,
+        )
+    else:
+        counts = (0, 0, 1, 0, 0)
+    terminal_log = _republish_stress_log(
+        out_dir,
+        None if latest is None else latest.log,
+    )
+    triggering = None if latest is None else latest.triggering_config
+    return (
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        terminal_log,
+        triggering,
+    )
+
+
+def _publish_stress_artifacts(
     spec: ExperimentSpec,
-    *,
     result: StressResult,
     out_dir: str,
+    *,
     cutracer_version: str,
     toolchain_version: str,
-) -> tuple[ArtifactRef | None, TriggeringDelayConfig | None, list[str]]:
-    log = None
-    errors = []
-    if result.log_path is not None and os.path.isfile(result.log_path):
+) -> tuple[Optional[ArtifactRef], Optional[TriggeringDelayConfig], list[str]]:
+    log: Optional[ArtifactRef] = None
+    triggering: Optional[TriggeringDelayConfig] = None
+    errors: list[str] = []
+    if result.log_path is None:
+        errors.append("stress campaign did not persist stress.log")
+    else:
         try:
             log = publish_local_artifact(
                 result.log_path,
                 os.path.join(out_dir, "stress.log"),
+                media_type="text/plain",
             )
         except OSError as exc:
             errors.append(f"could not publish stress log: {exc}")
-
-    triggering_config = None
     if result.triggering is not None:
         try:
-            artifact = _publish_triggering_config(
+            artifact = publish_local_artifact(
                 result.triggering.config_path,
-                out_dir,
+                os.path.join(out_dir, "triggering_config.json"),
+                media_type="application/json",
+                content_addressed=True,
             )
-            triggering_config = _triggering_config(
+            triggering = _triggering_delay_config(
                 spec,
-                result=result,
-                artifact=artifact,
+                result,
+                artifact,
                 cutracer_version=cutracer_version,
                 toolchain_version=toolchain_version,
             )
         except OSError as exc:
             errors.append(f"could not publish triggering config: {exc}")
-    return log, triggering_config, errors
+    return log, triggering, errors
 
 
-def _artifact_failure_result(
+def _fallback_stress_artifacts(
+    out_dir: str,
+    log: Optional[ArtifactRef],
+    triggering: Optional[TriggeringDelayConfig],
+    latest: Optional[StressTestResult],
+) -> tuple[Optional[ArtifactRef], Optional[TriggeringDelayConfig]]:
+    if latest is not None:
+        log = log or latest.log
+        triggering = triggering or latest.triggering_config
+    return _republish_stress_log(out_dir, log), triggering
+
+
+def _terminal_stress_result(
     spec: ExperimentSpec,
-    *,
-    result: StressResult,
-    log: ArtifactRef | None,
-    triggering_config: TriggeringDelayConfig | None,
-    errors: list[str],
+    provenance: ExecutionProvenance,
+    planned_trials: int,
     started: float,
+    status: ExecutionStatus,
+    error: str,
+    *,
+    outcome: StressOutcome = StressOutcome.INCOMPLETE,
+    completed_trials: int = 0,
+    reproductions: int = 0,
+    infra_errors: int = 1,
+    timed_out_trials: int = 0,
+    unattributed_reproductions: int = 0,
+    log: Optional[ArtifactRef] = None,
+    triggering_config: Optional[TriggeringDelayConfig] = None,
+) -> StressTestResult:
+    return StressTestResult(
+        experiment_id=spec.experiment_id,
+        execution_status=status,
+        outcome=outcome,
+        completed_trials=completed_trials,
+        reproductions=reproductions,
+        infra_errors=infra_errors,
+        provenance=provenance,
+        triggering_config=triggering_config,
+        log=log,
+        duration_s=time.monotonic() - started,
+        error=error,
+        planned_trials=planned_trials,
+        timed_out_trials=timed_out_trials,
+        completeness=ResultCompleteness.PARTIAL,
+        unattributed_reproductions=unattributed_reproductions,
+    )
+
+
+def _publish_progress_artifacts(
+    spec: ExperimentSpec,
+    core_result: StressResult,
+    out_dir: str,
+    *,
     cutracer_version: str,
     toolchain_version: str,
-) -> StressTestResult:
-    if triggering_config is not None:
-        outcome = StressOutcome.REPRODUCED
-    elif result.unattributed_reproductions > 0:
-        outcome = StressOutcome.UNATTRIBUTED_REPRODUCTION
+) -> tuple[Optional[ArtifactRef], Optional[TriggeringDelayConfig], Optional[OSError]]:
+    error: Optional[OSError] = None
+    log: Optional[ArtifactRef] = None
+    if core_result.log_path is None:
+        error = OSError("stress campaign did not persist stress.log")
     else:
-        outcome = StressOutcome.INCOMPLETE
-    terminal = _terminal_result(
+        try:
+            log = publish_local_artifact(
+                core_result.log_path,
+                os.path.join(out_dir, "stress.log"),
+                media_type="text/plain",
+            )
+        except OSError as exc:
+            error = exc
+    triggering: Optional[TriggeringDelayConfig] = None
+    if core_result.triggering is not None:
+        try:
+            triggering = _triggering_delay_config(
+                spec,
+                core_result,
+                publish_local_artifact(
+                    core_result.triggering.config_path,
+                    os.path.join(out_dir, "triggering_config.json"),
+                    media_type="application/json",
+                    content_addressed=True,
+                ),
+                cutracer_version=cutracer_version,
+                toolchain_version=toolchain_version,
+            )
+        except OSError as exc:
+            if error is None:
+                error = exc
+    return log, triggering, error
+
+
+def _adapt_core_progress(
+    spec: ExperimentSpec,
+    core_result: StressResult,
+    previous: Optional[StressTestResult],
+    out_dir: str,
+    planned_trials: int,
+    provenance: ExecutionProvenance,
+    started: float,
+    *,
+    cutracer_version: str,
+    toolchain_version: str,
+) -> tuple[StressTestResult, Optional[OSError]]:
+    log, triggering, error = _publish_progress_artifacts(
         spec,
-        status=ExecutionStatus.INFRA_ERROR,
-        outcome=outcome,
-        error="; ".join(errors),
-        started=started,
+        core_result,
+        out_dir,
         cutracer_version=cutracer_version,
         toolchain_version=toolchain_version,
     )
-    terminal.completed_trials = result.completed_trials
-    terminal.reproductions = result.reproductions
-    terminal.infra_errors = result.infra_errors + 1
-    terminal.timed_out_trials = result.timed_out
-    terminal.unattributed_reproductions = result.unattributed_reproductions
-    terminal.log = log
-    terminal.triggering_config = triggering_config
-    return terminal
+    durable_log = log
+    if durable_log is None and previous is not None:
+        durable_log = previous.log
+    durable_trigger = (
+        triggering
+        if triggering is not None
+        else None
+        if previous is None
+        else previous.triggering_config
+    )
+    progress = StressTestResult(
+        experiment_id=spec.experiment_id,
+        execution_status=ExecutionStatus.SUCCEEDED,
+        outcome=_partial_stress_outcome(
+            durable_trigger,
+            reproductions=core_result.reproductions,
+            unattributed_reproductions=core_result.unattributed_reproductions,
+        ),
+        completed_trials=core_result.completed_trials,
+        reproductions=core_result.reproductions,
+        infra_errors=core_result.infra_errors,
+        provenance=provenance,
+        triggering_config=durable_trigger,
+        log=durable_log,
+        duration_s=time.monotonic() - started,
+        planned_trials=planned_trials,
+        timed_out_trials=core_result.timed_out,
+        completeness=ResultCompleteness.PARTIAL,
+        unattributed_reproductions=core_result.unattributed_reproductions,
+    )
+    return progress, error
+
+
+@dataclass
+class _StressProgressAdapter:
+    spec: ExperimentSpec
+    out_dir: str
+    planned_trials: int
+    provenance: ExecutionProvenance
+    started: float
+    cutracer_version: str
+    toolchain_version: str
+    callback: Optional[StressProgressCallback]
+    latest: Optional[StressTestResult]
+    latest_core: Optional[StressResult] = None
+
+    def __call__(self, core_result: StressResult) -> None:
+        previous = self.latest
+        self.latest_core = core_result
+        self.latest, error = _adapt_core_progress(
+            self.spec,
+            core_result,
+            previous,
+            self.out_dir,
+            self.planned_trials,
+            self.provenance,
+            self.started,
+            cutracer_version=self.cutracer_version,
+            toolchain_version=self.toolchain_version,
+        )
+        if error is not None:
+            raise error
+        if self.callback is not None:
+            self.callback(self.latest)
 
 
 def _run_stress_attempt(
@@ -275,25 +519,57 @@ def _run_stress_attempt(
     timeout: int = 1800,
     cutracer_version: str = "",
     toolchain_version: str = "",
+    resolved_oracle_argv: Optional[Sequence[str]] = None,
+    resolved_cwd: Optional[str] = None,
+    resolved_base_env: Optional[Mapping[str, str]] = None,
+    resume_from: Optional[StressTestResult] = None,
+    progress_callback: Optional[StressProgressCallback] = None,
+    use_bundled_cuda_tools: bool = True,
 ) -> StressTestResult:
-    if spec.stress is None:
-        raise ValueError("stress experiment requires stress options")
-    if spec.unit.oracle is None:
-        raise ValueError("random-delay stress requires a correctness oracle")
+    assert spec.stress is not None
+    assert spec.unit.oracle is not None
     started = time.monotonic()
     planned_trials = spec.stress.planned_trials
+    provenance = _stress_provenance(spec, cutracer_version, toolchain_version)
 
-    base_env = os.environ.copy()
-    base_env.update(spec.unit.env)
+    if resolved_base_env is None:
+        base_env = os.environ.copy()
+        base_env.update(spec.unit.env)
+    else:
+        base_env = dict(resolved_base_env)
+    oracle_argv = list(
+        spec.unit.oracle.argv if resolved_oracle_argv is None else resolved_oracle_argv
+    )
+    cwd = resolved_cwd if resolved_cwd is not None else (spec.unit.cwd or None)
     kernel_filter = (
         spec.unit.kernel.name
         if spec.unit.kernel is not None and spec.unit.kernel.name
         else None
     )
+
+    core_resume = _resume_core_result(
+        spec,
+        out_dir,
+        planned_trials,
+        provenance,
+        resume_from,
+    )
+    progress_adapter = _StressProgressAdapter(
+        spec=spec,
+        out_dir=out_dir,
+        planned_trials=planned_trials,
+        provenance=provenance,
+        started=started,
+        cutracer_version=cutracer_version,
+        toolchain_version=toolchain_version,
+        callback=progress_callback,
+        latest=resume_from,
+    )
+
     try:
         result = run_stress(
             StressConfig(
-                oracle_argv=list(spec.unit.oracle.argv),
+                oracle_argv=oracle_argv,
                 delay_ladder_ns=list(spec.stress.delay_ladder_ns),
                 enable_prob=spec.stress.enable_prob,
                 warpgroup_ids=list(spec.stress.warpgroup_ids),
@@ -305,8 +581,17 @@ def _run_stress_attempt(
                 kernel_filters=kernel_filter,
                 output_dir=attempt_dir,
                 timeout=timeout,
-                cwd=spec.unit.cwd or None,
+                cwd=cwd,
                 base_env=base_env,
+                resume_result=core_resume,
+                progress_callback=progress_adapter,
+                use_bundled_cuda_tools=use_bundled_cuda_tools,
+                expected_kernel_name=(
+                    None if spec.unit.kernel is None else spec.unit.kernel.name
+                ),
+                expected_kernel_checksum=(
+                    None if spec.unit.kernel is None else spec.unit.kernel.cubin_hash
+                ),
             ),
             cutracer_so=cutracer_so,
             runner=runner,
@@ -315,55 +600,94 @@ def _run_stress_attempt(
         # ``run_stress`` catches per-attempt ``TimeoutExpired`` internally and
         # reports it via ``StressResult.timed_out``; a timeout never propagates
         # here, so it is classified below rather than in this except clause.
-        return _terminal_result(
+        (
+            completed_trials,
+            reproductions,
+            infra_errors,
+            timed_out_trials,
+            unattributed_reproductions,
+            terminal_log,
+            terminal_trigger,
+        ) = _recover_stress_progress(
+            out_dir,
+            progress_adapter.latest_core,
+            progress_adapter.latest,
+        )
+        return _terminal_stress_result(
             spec,
-            status=ExecutionStatus.INFRA_ERROR,
-            outcome=StressOutcome.INCOMPLETE,
-            error=str(exc),
-            started=started,
-            cutracer_version=cutracer_version,
-            toolchain_version=toolchain_version,
+            provenance,
+            planned_trials,
+            started,
+            ExecutionStatus.INFRA_ERROR,
+            str(exc),
+            outcome=_partial_stress_outcome(
+                terminal_trigger,
+                reproductions=reproductions,
+                unattributed_reproductions=unattributed_reproductions,
+            ),
+            completed_trials=completed_trials,
+            reproductions=reproductions,
+            infra_errors=infra_errors,
+            timed_out_trials=timed_out_trials,
+            unattributed_reproductions=unattributed_reproductions,
+            log=terminal_log,
+            triggering_config=terminal_trigger,
         )
 
-    log, triggering_config, artifact_errors = _publish_result_artifacts(
+    log, triggering_config, artifact_errors = _publish_stress_artifacts(
         spec,
-        result=result,
-        out_dir=out_dir,
+        result,
+        out_dir,
         cutracer_version=cutracer_version,
         toolchain_version=toolchain_version,
     )
 
     if artifact_errors:
-        return _artifact_failure_result(
+        # Preserve independently published evidence from this attempt, then
+        # fall back to the last durable checkpoint for anything still missing.
+        fallback_log, fallback_trigger = _fallback_stress_artifacts(
+            out_dir,
+            log,
+            triggering_config,
+            progress_adapter.latest,
+        )
+        preserved_outcome = _partial_stress_outcome(
+            fallback_trigger,
+            reproductions=result.reproductions,
+            unattributed_reproductions=result.unattributed_reproductions,
+        )
+        return _terminal_stress_result(
             spec,
-            result=result,
-            log=log,
-            triggering_config=triggering_config,
-            errors=artifact_errors,
-            started=started,
-            cutracer_version=cutracer_version,
-            toolchain_version=toolchain_version,
+            provenance,
+            planned_trials,
+            started,
+            ExecutionStatus.INFRA_ERROR,
+            "; ".join(artifact_errors),
+            outcome=preserved_outcome,
+            completed_trials=result.completed_trials,
+            reproductions=result.reproductions,
+            infra_errors=result.infra_errors + 1,
+            timed_out_trials=result.timed_out,
+            unattributed_reproductions=result.unattributed_reproductions,
+            log=fallback_log,
+            triggering_config=fallback_trigger,
         )
 
-    outcome, status, error, completeness = _classify_result(
+    outcome, status, error, completeness = _classify_stress_result(
         result,
         planned_trials=planned_trials,
         stop_on_first=spec.stress.stop_on_first_reproduction,
-        triggering_config=triggering_config,
+        reproduced=triggering_config is not None,
     )
 
-    return StressTestResult(
+    terminal_result = StressTestResult(
         experiment_id=spec.experiment_id,
         execution_status=status,
         outcome=outcome,
         completed_trials=result.completed_trials,
         reproductions=result.reproductions,
         infra_errors=result.infra_errors,
-        provenance=_provenance(
-            spec,
-            cutracer_version=cutracer_version,
-            toolchain_version=toolchain_version,
-        ),
+        provenance=provenance,
         triggering_config=triggering_config,
         log=log,
         duration_s=time.monotonic() - started,
@@ -373,6 +697,7 @@ def _run_stress_attempt(
         completeness=completeness,
         unattributed_reproductions=result.unattributed_reproductions,
     )
+    return terminal_result
 
 
 def run_stress_experiment(
@@ -384,8 +709,19 @@ def run_stress_experiment(
     timeout: int = 1800,
     cutracer_version: str = "",
     toolchain_version: str = "",
+    resolved_oracle_argv: Optional[Sequence[str]] = None,
+    resolved_cwd: Optional[str] = None,
+    resolved_base_env: Optional[Mapping[str, str]] = None,
+    resume_from: Optional[StressTestResult] = None,
+    progress_callback: Optional[StressProgressCallback] = None,
+    use_bundled_cuda_tools: bool = True,
 ) -> StressTestResult:
-    """Run CUTracer's in-process discovery loop and map its typed result."""
+    """Run CUTracer's in-process discovery loop and map its typed result.
+
+    Resolved execution inputs may point into a materialized sandbox. They are
+    deliberately not copied into the result: replay identity remains the
+    portable argv/oracle/revision recorded in ``spec``.
+    """
     if spec.kind != ExperimentKind.RANDOM_DELAY_STRESS or spec.stress is None:
         raise ValueError(f"not a stress experiment: {spec.kind}")
     if spec.unit.oracle is None:
@@ -404,6 +740,12 @@ def run_stress_experiment(
             timeout=timeout,
             cutracer_version=cutracer_version,
             toolchain_version=toolchain_version,
+            resolved_oracle_argv=resolved_oracle_argv,
+            resolved_cwd=resolved_cwd,
+            resolved_base_env=resolved_base_env,
+            resume_from=resume_from,
+            progress_callback=progress_callback,
+            use_bundled_cuda_tools=use_bundled_cuda_tools,
         )
         return terminal_result
     finally:
