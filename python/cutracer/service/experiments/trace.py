@@ -193,6 +193,8 @@ def run_trace_experiment(
     trace_analyzer: Optional[TraceAnalysisRunner] = None,
     cutracer_so: Optional[str] = None,
     timeout: int = 1800,
+    cutracer_version: str = "",
+    toolchain_version: str = "",
 ) -> TraceExperimentResult:
     """Capture a targeted trace with this package's CUTracer runtime."""
     if spec.kind not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
@@ -291,6 +293,8 @@ def run_trace_experiment(
             source_revision=spec.unit.source_revision,
             arch=spec.unit.arch,
             kernel=spec.unit.kernel,
+            tool_version=cutracer_version,
+            toolchain_version=toolchain_version,
         ),
         trace=trace,
         log=log,

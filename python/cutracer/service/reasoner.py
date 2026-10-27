@@ -256,29 +256,57 @@ def _local_artifact_loader(ref: ArtifactRef, max_bytes: int) -> Optional[str]:
     return text + ("\n[truncated]" if truncated else "")
 
 
-def _artifact_refs(session: AnalysisSession) -> List[ArtifactRef]:
-    refs: List[ArtifactRef] = []
-    for result in session.evidence.sanitizer:
-        refs.extend(_present_artifacts(result.log))
-    for result in session.evidence.stress:
-        triggering = result.triggering_config
-        refs.extend(
-            _present_artifacts(
-                None if triggering is None else triggering.artifact,
-                result.log,
-            )
-        )
-    for result in session.evidence.traces:
-        refs.extend(_present_artifacts(result.trace, result.log))
-    for result in session.evidence.reductions:
-        refs.extend(_present_artifacts(result.minimized_config, result.report))
-    return refs
-
-
 def _present_artifacts(
     *artifacts: Optional[ArtifactRef],
 ) -> List[ArtifactRef]:
     return [artifact for artifact in artifacts if artifact is not None]
+
+
+def _artifact_refs(session: AnalysisSession) -> List[ArtifactRef]:
+    # Deterministic structured output is the primary interpretation of every
+    # trace. Newest evidence comes first so a tight global metadata budget
+    # cannot be exhausted by old logs before the latest diagnosis is included.
+    trace_analysis: List[ArtifactRef] = []
+    trace_raw: List[ArtifactRef] = []
+    trace_logs: List[ArtifactRef] = []
+    for result in reversed(session.evidence.traces):
+        analysis = result.analysis
+        trace_analysis.extend(
+            _present_artifacts(None if analysis is None else analysis.artifact)
+        )
+        trace_raw.extend(result.traces)
+        trace_logs.extend(_present_artifacts(result.log))
+
+    reduction_refs: List[ArtifactRef] = []
+    for result in reversed(session.evidence.reductions):
+        reduction_refs.extend(
+            _present_artifacts(result.report, result.minimized_config)
+        )
+
+    stress_configs: List[ArtifactRef] = []
+    stress_logs: List[ArtifactRef] = []
+    for result in reversed(session.evidence.stress):
+        triggering = result.triggering_config
+        stress_configs.extend(
+            _present_artifacts(
+                None if triggering is None else triggering.artifact,
+            )
+        )
+        stress_logs.extend(_present_artifacts(result.log))
+
+    sanitizer_logs: List[ArtifactRef] = []
+    for result in reversed(session.evidence.sanitizer):
+        sanitizer_logs.extend(_present_artifacts(result.log))
+
+    return [
+        *trace_analysis,
+        *reduction_refs,
+        *stress_configs,
+        *trace_raw,
+        *trace_logs,
+        *stress_logs,
+        *sanitizer_logs,
+    ]
 
 
 def _artifact_context(
@@ -329,8 +357,9 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
     for result in session.evidence.traces:
         if result.analysis is not None and result.analysis.artifact is not None:
             refs.append(result.analysis.artifact.uri)
-        if result.trace is not None:
-            refs.append(result.trace.uri)
+    for result in session.evidence.traces:
+        refs.extend(trace.uri for trace in result.traces)
+        refs.extend(artifact.uri for artifact in result.supporting_artifacts)
     for result in session.evidence.reductions:
         if result.report is not None:
             refs.append(result.report.uri)

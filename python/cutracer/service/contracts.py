@@ -252,6 +252,15 @@ class ArtifactRef:
         )
 
 
+def _deduplicate_artifact_refs(refs: List[ArtifactRef]) -> List[ArtifactRef]:
+    """Return exact artifact references once, preserving producer order."""
+    unique: List[ArtifactRef] = []
+    for ref in refs:
+        if ref not in unique:
+            unique.append(ref)
+    return unique
+
+
 # ---------------------------------------------------------------------------
 # Top-level contracts
 # ---------------------------------------------------------------------------
@@ -801,6 +810,20 @@ class TraceConfigSource(str, Enum):
     MINIMIZED = "minimized"
 
 
+def _trace_instrument_modes(primary: ExperimentKind, modes: List[str]) -> List[str]:
+    allowed = ("reg_trace", "mem_value_trace", "tma_trace")
+    if not isinstance(modes, list) or any(
+        not isinstance(mode, str) or mode not in allowed for mode in modes
+    ):
+        raise ValueError("trace instrument_modes must be an allowlisted list")
+    if not modes:
+        return []
+    if primary.value not in modes:
+        raise ValueError("trace instrument_modes must include the primary mode")
+    normalized = [mode for mode in allowed if mode in modes]
+    return [] if normalized == [primary.value] else normalized
+
+
 def _pc_offset(value: Any) -> str:
     try:
         parsed = int(str(value), 0)
@@ -883,17 +906,29 @@ class TraceOptions:
     trace_size_limit_mb: int = 1024
     selector: TraceSelector = dataclasses.field(default_factory=TraceSelector)
     config_artifact: Optional[ArtifactRef] = None
+    instrument_modes: List[str] = dataclasses.field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.mode not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
             raise ValueError(f"invalid trace mode: {self.mode}")
+        self.instrument_modes = _trace_instrument_modes(
+            self.mode, self.instrument_modes
+        )
+        if not 1 <= self.trace_size_limit_mb <= 0xFFFFFFFF:
+            raise ValueError("trace_size_limit_mb must be in [1, UINT32_MAX]")
         if (self.selector.config_source is None) != (self.config_artifact is None):
             raise ValueError(
                 "trace config_source and resolved config_artifact must be set together"
             )
 
+    @property
+    def effective_instrument_modes(self) -> List[str]:
+        return _trace_instrument_modes(self.mode, self.instrument_modes) or [
+            self.mode.value
+        ]
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "mode": self.mode.value,
             "trace_size_limit_mb": self.trace_size_limit_mb,
             "selector": self.selector.to_dict(),
@@ -901,6 +936,9 @@ class TraceOptions:
                 None if self.config_artifact is None else self.config_artifact.to_dict()
             ),
         }
+        if self.instrument_modes:
+            payload["instrument_modes"] = list(self.instrument_modes)
+        return payload
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceOptions":
@@ -919,6 +957,7 @@ class TraceOptions:
                 if config_artifact is None
                 else ArtifactRef.from_dict(config_artifact)
             ),
+            instrument_modes=d.get("instrument_modes", []),
         )
 
 
@@ -1241,12 +1280,15 @@ class TraceDetectorSummary:
     severity: TraceAnalysisSeverity
     finding_count: int
     description: str = ""
+    trace_file: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.source_tool.strip() or not self.sub_component.strip():
             raise ValueError("detector summary requires structured source identity")
         if self.finding_count < 0:
             raise ValueError("detector finding_count must be non-negative")
+        if self.trace_file is not None and not self.trace_file.strip():
+            raise ValueError("detector trace_file cannot be empty")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1256,10 +1298,12 @@ class TraceDetectorSummary:
             "severity": self.severity.value,
             "finding_count": self.finding_count,
             "description": self.description,
+            "trace_file": self.trace_file,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceDetectorSummary":
+        trace_file = d.get("trace_file")
         return cls(
             source_tool=d["source_tool"],
             sub_component=d["sub_component"],
@@ -1267,6 +1311,7 @@ class TraceDetectorSummary:
             severity=TraceAnalysisSeverity(d["severity"]),
             finding_count=int(d.get("finding_count", 0)),
             description=d.get("description", ""),
+            trace_file=None if trace_file is None else str(trace_file),
         )
 
 
@@ -1291,6 +1336,7 @@ class TraceAnalysisFinding:
     source_locations: List[Optional[SourceLoc]] = dataclasses.field(
         default_factory=list
     )
+    trace_file: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.source_tool.strip() or not self.sub_component.strip():
@@ -1299,6 +1345,8 @@ class TraceAnalysisFinding:
             raise ValueError("source_locations must be empty or parallel to pcs")
         if any(len(cta) != 3 for cta in self.ctas):
             raise ValueError("each CTA coordinate must have exactly three dimensions")
+        if self.trace_file is not None and not self.trace_file.strip():
+            raise ValueError("analysis finding trace_file cannot be empty")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1315,10 +1363,12 @@ class TraceAnalysisFinding:
                 None if location is None else location.to_dict()
                 for location in self.source_locations
             ],
+            "trace_file": self.trace_file,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceAnalysisFinding":
+        trace_file = d.get("trace_file")
         return cls(
             source_tool=d["source_tool"],
             sub_component=d["sub_component"],
@@ -1333,6 +1383,7 @@ class TraceAnalysisFinding:
                 None if location is None else SourceLoc.from_dict(location)
                 for location in d.get("source_locations", [])
             ],
+            trace_file=None if trace_file is None else str(trace_file),
         )
 
 
@@ -1413,6 +1464,15 @@ class TraceAnalysisEvidence:
 
 @dataclasses.dataclass
 class TraceExperimentResult:
+    """Trace capture result with a legacy primary-trace compatibility alias.
+
+    ``traces`` is the authoritative ordered set of raw trace artifacts. ``trace``
+    remains on the wire as an alias for its first entry so older consumers can
+    keep reading a singleton result. Exact duplicates are removed without
+    changing producer order. Supporting artifacts are preserved as metadata but
+    are not raw trace inputs to the reasoner.
+    """
+
     experiment_id: str
     execution_status: ExecutionStatus
     mode: ExperimentKind
@@ -1422,11 +1482,31 @@ class TraceExperimentResult:
     analysis: Optional[TraceAnalysisEvidence] = None
     duration_s: float = 0.0
     error: Optional[str] = None
+    traces: List[ArtifactRef] = dataclasses.field(default_factory=list)
+    supporting_artifacts: List[ArtifactRef] = dataclasses.field(default_factory=list)
+    completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
     analysis_duration_s: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in (ExperimentKind.REG_TRACE, ExperimentKind.MEM_VALUE_TRACE):
             raise ValueError(f"invalid trace result mode: {self.mode}")
+        if self.trace is not None and self.traces and self.trace != self.traces[0]:
+            raise ValueError("primary trace must equal traces[0]")
+
+        ordered_traces = ([self.trace] if self.trace is not None else []) + self.traces
+        self.traces = _deduplicate_artifact_refs(ordered_traces)
+        # Trace identity in analysis is the relative_path, so distinct refs
+        # sharing one name are ambiguous and must fail closed at construction
+        # (matching session validation), not survive dedup to fail later.
+        trace_names = [artifact.relative_path for artifact in self.traces]
+        if len(set(trace_names)) != len(trace_names):
+            raise ValueError("trace result contains duplicate trace artifact names")
+        self.trace = self.traces[0] if self.traces else None
+
+        supporting_artifacts = _deduplicate_artifact_refs(self.supporting_artifacts)
+        if any(artifact in self.traces for artifact in supporting_artifacts):
+            raise ValueError("raw traces and supporting artifacts cannot overlap")
+        self.supporting_artifacts = supporting_artifacts
 
     @property
     def kind(self) -> ExperimentKind:
@@ -1440,16 +1520,22 @@ class TraceExperimentResult:
             "mode": self.mode.value,
             "provenance": self.provenance.to_dict(),
             "trace": None if self.trace is None else self.trace.to_dict(),
+            "traces": [trace.to_dict() for trace in self.traces],
+            "supporting_artifacts": [
+                artifact.to_dict() for artifact in self.supporting_artifacts
+            ],
             "log": None if self.log is None else self.log.to_dict(),
             "analysis": None if self.analysis is None else self.analysis.to_dict(),
             "duration_s": self.duration_s,
             "analysis_duration_s": self.analysis_duration_s,
             "error": self.error,
+            "completeness": self.completeness.value,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceExperimentResult":
         trace = d.get("trace")
+        traces = d.get("traces") or []
         log = d.get("log")
         analysis = d.get("analysis")
         return cls(
@@ -1465,6 +1551,14 @@ class TraceExperimentResult:
             duration_s=float(d.get("duration_s", 0.0)),
             analysis_duration_s=float(d.get("analysis_duration_s", 0.0)),
             error=d.get("error"),
+            traces=[ArtifactRef.from_dict(item) for item in traces],
+            supporting_artifacts=[
+                ArtifactRef.from_dict(item)
+                for item in (d.get("supporting_artifacts") or [])
+            ],
+            completeness=ResultCompleteness(
+                d.get("completeness", ResultCompleteness.UNKNOWN.value)
+            ),
         )
 
 
@@ -1798,6 +1892,7 @@ class ExperimentRequest:
     kind: ExperimentKind
     rationale: str
     trace_selector: Optional[TraceSelector] = None
+    instrument_modes: List[str] = dataclasses.field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.kind not in (
@@ -1813,15 +1908,26 @@ class ExperimentRequest:
             ExperimentKind.MEM_VALUE_TRACE,
         ):
             raise ValueError("trace_selector is only valid for trace requests")
+        if self.instrument_modes and self.kind not in (
+            ExperimentKind.REG_TRACE,
+            ExperimentKind.MEM_VALUE_TRACE,
+        ):
+            raise ValueError("instrument_modes is only valid for trace requests")
+        self.instrument_modes = _trace_instrument_modes(
+            self.kind, self.instrument_modes
+        )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "kind": self.kind.value,
             "rationale": self.rationale,
             "trace_selector": (
                 None if self.trace_selector is None else self.trace_selector.to_dict()
             ),
         }
+        if self.instrument_modes:
+            payload["instrument_modes"] = list(self.instrument_modes)
+        return payload
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExperimentRequest":
@@ -1832,6 +1938,7 @@ class ExperimentRequest:
             trace_selector=(
                 None if selector is None else TraceSelector.from_dict(selector)
             ),
+            instrument_modes=d.get("instrument_modes", []),
         )
 
 
@@ -1894,15 +2001,21 @@ class SessionBudget:
 class AnalysisTurn:
     turn_index: int
     decision: AnalysisDecision
+    guard_notes: List[str] = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"turn_index": self.turn_index, "decision": self.decision.to_dict()}
+        return {
+            "turn_index": self.turn_index,
+            "decision": self.decision.to_dict(),
+            "guard_notes": list(self.guard_notes),
+        }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AnalysisTurn":
         return cls(
             turn_index=int(d["turn_index"]),
             decision=AnalysisDecision.from_dict(d["decision"]),
+            guard_notes=list(d.get("guard_notes", [])),
         )
 
 

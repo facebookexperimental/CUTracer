@@ -74,6 +74,17 @@ def _clone(session: AnalysisSession) -> AnalysisSession:
     return AnalysisSession.from_dict(session.to_dict())
 
 
+def _trace_artifact_refs(result: TraceExperimentResult) -> List[str]:
+    refs: List[str] = []
+    if result.analysis is not None and result.analysis.artifact is not None:
+        refs.append(result.analysis.artifact.uri)
+    refs.extend(trace.uri for trace in result.traces)
+    refs.extend(artifact.uri for artifact in result.supporting_artifacts)
+    if result.log is not None:
+        refs.append(result.log.uri)
+    return refs
+
+
 def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
     refs: List[str] = []
     for result in evidence.sanitizer:
@@ -85,10 +96,7 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
         if result.log is not None:
             refs.append(result.log.uri)
     for result in evidence.traces:
-        if result.analysis is not None and result.analysis.artifact is not None:
-            refs.append(result.analysis.artifact.uri)
-        if result.trace is not None:
-            refs.append(result.trace.uri)
+        refs.extend(_trace_artifact_refs(result))
     for result in evidence.reductions:
         if result.minimized_config is not None:
             refs.append(result.minimized_config.uri)
@@ -444,29 +452,143 @@ def _validate_stress_result(
     _validate_stress_completeness(spec, result)
 
 
-def _validate_trace_result(result: TraceExperimentResult) -> None:
-    if result.execution_status == ExecutionStatus.SUCCEEDED:
-        if result.trace is None or result.error is not None:
+def _validate_trace_success_shape(result: TraceExperimentResult) -> None:
+    if not result.traces or result.error is not None:
+        _reject_result(
+            "trace_result_inconsistent",
+            "successful trace result requires one or more traces and no error",
+        )
+    if result.completeness not in (
+        ResultCompleteness.COMPLETE,
+        ResultCompleteness.UNKNOWN,
+    ):
+        _reject_result(
+            "trace_result_inconsistent",
+            "successful trace result must be complete",
+        )
+    if result.completeness == ResultCompleteness.UNKNOWN and (
+        len(result.traces) != 1 or result.supporting_artifacts
+    ):
+        _reject_result(
+            "trace_result_inconsistent",
+            "legacy unknown completeness supports one primary trace only",
+        )
+    if result.completeness != ResultCompleteness.COMPLETE:
+        return
+    if not any(
+        artifact.relative_path.endswith(".cubin")
+        for artifact in result.supporting_artifacts
+    ):
+        _reject_result(
+            "trace_result_inconsistent",
+            "complete trace result requires a supporting cubin",
+        )
+    if result.log is None:
+        _reject_result(
+            "trace_result_inconsistent",
+            "complete trace result requires a capture log",
+        )
+
+
+def _validate_trace_failure_shape(result: TraceExperimentResult) -> None:
+    if result.error is None or not result.error.strip():
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace result requires an error",
+        )
+    has_partial_artifacts = bool(result.traces or result.supporting_artifacts)
+    if has_partial_artifacts and result.completeness != ResultCompleteness.PARTIAL:
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace artifacts require partial completeness",
+        )
+    if result.completeness in (
+        ResultCompleteness.COMPLETE,
+        ResultCompleteness.COMPLETE_EARLY,
+        ResultCompleteness.SKIPPED,
+    ):
+        _reject_result(
+            "trace_result_inconsistent",
+            "unsuccessful trace result cannot be complete",
+        )
+
+
+def _validate_trace_artifact_identity(result: TraceExperimentResult) -> List[str]:
+    if result.completeness in (
+        ResultCompleteness.COMPLETE,
+        ResultCompleteness.PARTIAL,
+    ):
+        artifacts = [*result.traces, *result.supporting_artifacts]
+        if result.log is not None:
+            artifacts.append(result.log)
+        if result.analysis is not None and result.analysis.artifact is not None:
+            artifacts.append(result.analysis.artifact)
+        if any(
+            artifact.sha256 is None
+            or len(artifact.sha256) != 64
+            or artifact.size_bytes is None
+            or artifact.size_bytes < 0
+            for artifact in artifacts
+        ):
             _reject_result(
                 "trace_result_inconsistent",
-                "successful trace result requires a trace and no error",
+                "N15 trace artifacts require immutable digest and size identity",
             )
-    elif result.trace is not None:
+    trace_names = [artifact.relative_path for artifact in result.traces]
+    if len(set(trace_names)) != len(trace_names):
         _reject_result(
             "trace_result_inconsistent",
-            "unsuccessful trace result cannot publish a completed trace",
+            "trace result contains duplicate trace artifact names",
         )
-    elif not result.error:
+    return trace_names
+
+
+def _validate_trace_analysis_references(
+    result: TraceExperimentResult,
+    trace_names: List[str],
+) -> None:
+    assert result.analysis is not None
+    require_trace_file = len(trace_names) > 1
+    evidence_entries = (
+        *result.analysis.detector_summaries,
+        *result.analysis.findings,
+    )
+    for evidence in evidence_entries:
+        trace_file = evidence.trace_file
+        if trace_file is None and require_trace_file:
+            _reject_result(
+                "trace_result_inconsistent",
+                "multi-file trace analysis requires trace_file identity",
+            )
+        if trace_file is not None and trace_file not in trace_names:
+            _reject_result(
+                "trace_result_inconsistent",
+                "trace analysis references an unknown trace_file",
+            )
+
+
+def _validate_trace_analysis_status(result: TraceExperimentResult) -> None:
+    assert result.analysis is not None
+    if result.execution_status == ExecutionStatus.SUCCEEDED:
+        # UNKNOWN is the pre-N15 singleton contract. It historically allowed
+        # best-effort failed analysis alongside a successful capture, so keep
+        # that wire behavior while requiring N15 COMPLETE results to succeed.
+        if (
+            result.completeness == ResultCompleteness.COMPLETE
+            and result.analysis.execution_status != ExecutionStatus.SUCCEEDED
+        ):
+            _reject_result(
+                "trace_result_inconsistent",
+                "successful trace result requires successful deterministic analysis",
+            )
+    elif (
+        result.execution_status != ExecutionStatus.INFRA_ERROR
+        or result.completeness != ResultCompleteness.PARTIAL
+        or not result.traces
+    ):
         _reject_result(
             "trace_result_inconsistent",
-            "unsuccessful trace result requires a non-empty error",
-        )
-    if result.analysis is None:
-        return
-    if result.execution_status != ExecutionStatus.SUCCEEDED:
-        _reject_result(
-            "trace_result_inconsistent",
-            "unsuccessful trace result cannot publish deterministic analysis",
+            "only partial trace infrastructure failure may publish analysis",
         )
     if result.analysis.execution_status == ExecutionStatus.SUCCEEDED:
         if result.analysis.artifact is None or result.analysis.error is not None:
@@ -479,6 +601,26 @@ def _validate_trace_result(result: TraceExperimentResult) -> None:
             "trace_result_inconsistent",
             "unsuccessful deterministic analysis requires an error",
         )
+
+
+def _validate_trace_result(result: TraceExperimentResult) -> None:
+    if result.execution_status == ExecutionStatus.SUCCEEDED:
+        _validate_trace_success_shape(result)
+    else:
+        _validate_trace_failure_shape(result)
+    trace_names = _validate_trace_artifact_identity(result)
+    if result.analysis is None:
+        if (
+            result.execution_status == ExecutionStatus.SUCCEEDED
+            and result.completeness == ResultCompleteness.COMPLETE
+        ):
+            _reject_result(
+                "trace_result_inconsistent",
+                "complete trace result requires deterministic analysis",
+            )
+        return
+    _validate_trace_analysis_references(result, trace_names)
+    _validate_trace_analysis_status(result)
 
 
 def _validate_reduce_result(
@@ -725,7 +867,8 @@ def record_analysis_decision(
     if session.status != SessionStatus.WAITING_REASONER:
         raise ValueError(f"reasoner result in invalid state: {session.status}")
     updated = _clone(session)
-    updated.turns.append(AnalysisTurn(turn_index=len(updated.turns), decision=decision))
+    turn = AnalysisTurn(turn_index=len(updated.turns), decision=decision)
+    updated.turns.append(turn)
     if session.round_index == 0 and initial_evidence_requires_inconclusive(
         session.evidence
     ):
@@ -758,6 +901,7 @@ def record_analysis_decision(
 
     guard = guard_policy or ExperimentGuardPolicy()
     guarded = guard.expand(updated, decision.requests)
+    turn.guard_notes.extend((*guarded.notes, *guarded.rejections))
     if not guarded.experiments:
         reason = "no new valid follow-up experiment"
         if guarded.rejections:

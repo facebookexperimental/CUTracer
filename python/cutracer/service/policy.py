@@ -28,6 +28,8 @@ from cutracer.service.contracts import (
     WorkUnit,
 )
 
+_MAX_TRACE_PC_OFFSETS = 32
+
 
 def _experiment_id(
     session_id: str,
@@ -90,9 +92,15 @@ def _trace_options_discriminator(options: TraceOptions, unit: WorkUnit) -> str:
     if (
         all(value is None or value == [] for value in selector.values())
         and artifact_identity is None
+        and not options.instrument_modes
     ):
         return ""
-    payload = {"selector": selector, "config_artifact": artifact_identity}
+    payload: dict[str, object] = {
+        "selector": selector,
+        "config_artifact": artifact_identity,
+    }
+    if options.instrument_modes:
+        payload["instrument_modes"] = options.effective_instrument_modes
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -113,14 +121,42 @@ def _selected_config_artifact(
     return None
 
 
+def _selected_config_point_count(
+    session: AnalysisSession,
+    source: TraceConfigSource,
+) -> int | None:
+    if source == TraceConfigSource.TRIGGERING:
+        config = session.evidence.triggering_config()
+        return None if config is None else config.enabled_point_count
+    for result in reversed(session.evidence.reductions):
+        if (
+            result.execution_status == ExecutionStatus.SUCCEEDED
+            and result.minimized_config is not None
+        ):
+            return len({point.pc_offset for point in result.essential_points})
+    return None
+
+
 def _resolve_trace_options(
     session: AnalysisSession,
     request: ExperimentRequest,
     trace_size_limit_mb: int,
-) -> TraceOptions:
+) -> tuple[TraceOptions, str | None]:
+    kernel = session.unit.kernel
+    if kernel is None or not kernel.name.strip() or not kernel.cubin_hash.strip():
+        raise ValueError(
+            "targeted trace requires pinned kernel name and cubin identity"
+        )
     selector = request.trace_selector or TraceSelector()
     if selector.kernel is not None and selector.kernel != session.unit.kernel:
         raise ValueError("trace selector kernel does not match the pinned WorkUnit")
+    note = None
+    if selector.pc_offsets and selector.config_source is not None:
+        note = (
+            "trace selector supplied both explicit PC offsets and a config source; "
+            "explicit PC offsets take precedence"
+        )
+        selector = dataclasses.replace(selector, config_source=None)
     artifact = None
     if selector.config_source is not None:
         artifact = _selected_config_artifact(session, selector.config_source)
@@ -128,11 +164,30 @@ def _resolve_trace_options(
             raise ValueError(
                 f"trace selector requires available {selector.config_source.value} config"
             )
-    return TraceOptions(
-        mode=request.kind,
-        trace_size_limit_mb=trace_size_limit_mb,
-        selector=selector,
-        config_artifact=artifact,
+        point_count = _selected_config_point_count(session, selector.config_source)
+        if point_count is None:
+            raise ValueError(
+                f"trace from {selector.config_source.value} config is deferred: "
+                "enabled PC count is unknown"
+            )
+        if point_count == 0:
+            raise ValueError(
+                f"trace from {selector.config_source.value} config has no enabled PCs"
+            )
+        if point_count > _MAX_TRACE_PC_OFFSETS:
+            raise ValueError(
+                f"trace from {selector.config_source.value} config is deferred: "
+                f"{point_count} enabled PCs exceed the {_MAX_TRACE_PC_OFFSETS}-PC limit"
+            )
+    return (
+        TraceOptions(
+            mode=request.kind,
+            trace_size_limit_mb=trace_size_limit_mb,
+            selector=selector,
+            config_artifact=artifact,
+            instrument_modes=request.instrument_modes,
+        ),
+        note,
     )
 
 
@@ -214,6 +269,7 @@ class GuardedExperiments:
     experiments: tuple[ExperimentSpec, ...]
     fingerprints: tuple[str, ...]
     rejections: tuple[str, ...]
+    notes: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,6 +396,7 @@ class ExperimentGuardPolicy:
         specs: List[ExperimentSpec] = []
         fingerprints: List[str] = []
         rejections: List[str] = []
+        notes: List[str] = []
         for index, request in enumerate(requested):
             trace_options = None
             if request.kind in (
@@ -347,11 +404,13 @@ class ExperimentGuardPolicy:
                 ExperimentKind.MEM_VALUE_TRACE,
             ):
                 try:
-                    trace_options = _resolve_trace_options(
+                    trace_options, note = _resolve_trace_options(
                         session,
                         request,
                         self.default_trace_size_limit_mb,
                     )
+                    if note is not None:
+                        notes.append(note)
                 except ValueError as exc:
                     rejections.append(str(exc))
                     continue
@@ -388,4 +447,5 @@ class ExperimentGuardPolicy:
             experiments=tuple(specs),
             fingerprints=tuple(fingerprints),
             rejections=tuple(rejections),
+            notes=tuple(notes),
         )

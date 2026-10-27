@@ -108,6 +108,8 @@ class LocalExperimentExecutor:
                 trace_analyzer=self._trace_analyzer,
                 cutracer_so=self._runtime.cutracer_so,
                 timeout=self._runtime.timeout,
+                cutracer_version=self._runtime.cutracer_version,
+                toolchain_version=self._runtime.toolchain_version,
             )
         if spec.kind == ExperimentKind.REDUCE_DELAY_CONFIG:
             return run_reduce_experiment(
