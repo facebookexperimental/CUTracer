@@ -40,11 +40,57 @@
 #define SIZE_CHECK_INTERVAL 10000
 
 extern pthread_mutex_t mutex;
+extern std::mutex kernel_launch_state_mutex;
 extern std::unordered_map<CUcontext, CTXstate*> ctx_state_map;
 extern std::map<uint64_t, std::pair<CUcontext, CUfunction>> kernel_launch_to_func_map;
 extern std::map<uint64_t, uint32_t> kernel_launch_to_iter_map;
 extern std::map<uint64_t, KernelDimensions> kernel_launch_to_dimensions_map;
 extern std::unordered_map<CUfunction, KernelFuncMetadata> kernel_metadata_by_func;
+
+struct KernelLaunchStateSnapshot {
+  CUcontext ctx = nullptr;
+  CUfunction func = nullptr;
+  uint32_t iteration = 0;
+  KernelDimensions dimensions{};
+  bool has_dimensions = false;
+};
+
+static bool copy_kernel_launch_state(uint64_t kernel_launch_id, KernelLaunchStateSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+  auto func_it = kernel_launch_to_func_map.find(kernel_launch_id);
+  if (func_it == kernel_launch_to_func_map.end()) return false;
+
+  snapshot.ctx = func_it->second.first;
+  snapshot.func = func_it->second.second;
+  auto iter_it = kernel_launch_to_iter_map.find(kernel_launch_id);
+  if (iter_it != kernel_launch_to_iter_map.end()) snapshot.iteration = iter_it->second;
+  auto dimensions_it = kernel_launch_to_dimensions_map.find(kernel_launch_id);
+  if (dimensions_it != kernel_launch_to_dimensions_map.end()) {
+    snapshot.dimensions = dimensions_it->second;
+    snapshot.has_dimensions = true;
+  }
+  return true;
+}
+
+static bool take_kernel_launch_state(uint64_t kernel_launch_id, KernelLaunchStateSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+  auto func_it = kernel_launch_to_func_map.find(kernel_launch_id);
+  if (func_it == kernel_launch_to_func_map.end()) return false;
+
+  snapshot.ctx = func_it->second.first;
+  snapshot.func = func_it->second.second;
+  auto iter_it = kernel_launch_to_iter_map.find(kernel_launch_id);
+  if (iter_it != kernel_launch_to_iter_map.end()) snapshot.iteration = iter_it->second;
+  auto dimensions_it = kernel_launch_to_dimensions_map.find(kernel_launch_id);
+  if (dimensions_it != kernel_launch_to_dimensions_map.end()) {
+    snapshot.dimensions = dimensions_it->second;
+    snapshot.has_dimensions = true;
+  }
+  kernel_launch_to_func_map.erase(func_it);
+  kernel_launch_to_iter_map.erase(kernel_launch_id);
+  kernel_launch_to_dimensions_map.erase(kernel_launch_id);
+  return true;
+}
 
 // Forward declaration for helper defined below in this file
 std::string extract_instruction_name(const std::string& sass_line);
@@ -156,13 +202,12 @@ void process_instruction_histogram(const opcode_only_t* ri, CTXstate* ctx_state,
                                    std::unordered_map<int, WarpState>& warp_states,
                                    std::vector<RegionHistogram>& completed_histograms) {
   // Get current function from kernel launch ID to find the correct SASS maps.
-  std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-      kernel_launch_to_func_map.find(ri->kernel_launch_id);
-  if (func_iter == kernel_launch_to_func_map.end()) {
+  KernelLaunchStateSnapshot launch_state;
+  if (!copy_kernel_launch_state(ri->kernel_launch_id, launch_state)) {
     return;  // Unknown kernel, skip histogram processing
   }
 
-  CUfunction current_func = func_iter->second.second;
+  CUfunction current_func = launch_state.func;
 
   // Get clock opcode IDs for this function, which mark region boundaries.
   const std::unordered_set<int>* clock_opcode_ids = nullptr;
@@ -227,19 +272,10 @@ void dump_previous_kernel_data(uint64_t kernel_launch_id, const std::vector<Regi
     return;  // Nothing to dump.
   }
 
-  // Find kernel info from global mapping
-  if (kernel_launch_to_func_map.find(kernel_launch_id) != kernel_launch_to_func_map.end()) {
-    auto [ctx, func] = kernel_launch_to_func_map[kernel_launch_id];
-    uint32_t iteration = kernel_launch_to_iter_map[kernel_launch_id];
+  KernelLaunchStateSnapshot launch_state;
+  if (!take_kernel_launch_state(kernel_launch_id, launch_state)) return;
 
-    // Use existing CSV generation logic.
-    dump_histograms_to_csv(ctx, func, iteration, histograms);
-
-    // Clean up mapping tables to free memory for subsequent kernels.
-    kernel_launch_to_func_map.erase(kernel_launch_id);
-    kernel_launch_to_iter_map.erase(kernel_launch_id);
-    kernel_launch_to_dimensions_map.erase(kernel_launch_id);
-  }
+  dump_histograms_to_csv(launch_state.ctx, launch_state.func, launch_state.iteration, histograms);
 }
 
 /**
@@ -538,17 +574,13 @@ static void print_warp_status_summary(CTXstate* ctx_state, uint64_t current_kern
   if (trace_format == 0) {
     print_warp_status_text(summary);
   } else {
-    auto func_iter = kernel_launch_to_func_map.find(current_kernel_launch_id);
-    if (func_iter != kernel_launch_to_func_map.end()) {
-      CUcontext ctx = func_iter->second.first;
-      CUfunction func = func_iter->second.second;
-      uint32_t iteration = 0;
-      auto iter_it = kernel_launch_to_iter_map.find(current_kernel_launch_id);
-      if (iter_it != kernel_launch_to_iter_map.end()) iteration = iter_it->second;
+    KernelLaunchStateSnapshot launch_state;
+    if (copy_kernel_launch_state(current_kernel_launch_id, launch_state)) {
       std::string checksum;
-      auto meta_it = kernel_metadata_by_func.find(func);
+      auto meta_it = kernel_metadata_by_func.find(launch_state.func);
       if (meta_it != kernel_metadata_by_func.end()) checksum = meta_it->second.kernel_checksum;
-      std::string basename = generate_kernel_log_basename(ctx, func, iteration, checksum);
+      std::string basename =
+          generate_kernel_log_basename(launch_state.ctx, launch_state.func, launch_state.iteration, checksum);
       write_warp_status_json(summary, basename);
     } else {
       loprintf(
@@ -959,12 +991,12 @@ void* recv_thread_fun(void* args) {
 
           // Initialize kernel warp tracking for the new kernel
           if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
-            if (kernel_launch_to_dimensions_map.count(current_launch_id)) {
-              KernelDimensions& dims = kernel_launch_to_dimensions_map[current_launch_id];
+            KernelLaunchStateSnapshot launch_state;
+            if (copy_kernel_launch_state(current_launch_id, launch_state) && launch_state.has_dimensions) {
               KernelWarpStats& stats = ctx_state->kernel_warp_tracking[current_launch_id];
-              stats.dimensions = dims;
+              stats.dimensions = launch_state.dimensions;
 
-              stats.total_warps = calculate_total_warps(dims);
+              stats.total_warps = calculate_total_warps(launch_state.dimensions);
             }
           }
         }
@@ -1000,18 +1032,16 @@ void* recv_thread_fun(void* args) {
 
             // Determine if current instruction is BAR.SYNC.DEFER_BLOCKING
             bool is_barrier_defer = false;
-            CUfunction f_func2 = nullptr;
-            auto func_iter2 = kernel_launch_to_func_map.find(ri->kernel_launch_id);
-            if (func_iter2 != kernel_launch_to_func_map.end()) {
-              f_func2 = func_iter2->second.second;
-              is_barrier_defer = is_barrier_defer_blocking_for_opcode(ctx_state, f_func2, ri->opcode_id);
+            KernelLaunchStateSnapshot launch_state;
+            if (copy_kernel_launch_state(ri->kernel_launch_id, launch_state)) {
+              is_barrier_defer = is_barrier_defer_blocking_for_opcode(ctx_state, launch_state.func, ri->opcode_id);
             }
             ctx_state->last_is_defer_blocking_by_warp[key] = is_barrier_defer;
 
             // Mark EXIT candidate if this opcode_id is an EXIT for the current function
-            if (func_iter2 != kernel_launch_to_func_map.end()) {
-              if (ctx_state->exit_opcode_ids.count(f_func2) &&
-                  ctx_state->exit_opcode_ids[f_func2].count(ri->opcode_id)) {
+            if (launch_state.func != nullptr) {
+              if (ctx_state->exit_opcode_ids.count(launch_state.func) &&
+                  ctx_state->exit_opcode_ids[launch_state.func].count(ri->opcode_id)) {
                 if (!ctx_state->exit_candidate_since_by_warp.count(key)) {
                   ctx_state->exit_candidate_since_by_warp[key] = time(nullptr);
                 }
@@ -1021,16 +1051,16 @@ void* recv_thread_fun(void* args) {
           // Get SASS string and register indices for trace output
           std::string sass_str_cpp;
           const RegIndices* reg_indices_ptr = nullptr;
-          auto func_iter = kernel_launch_to_func_map.find(ri->kernel_launch_id);
-          if (func_iter != kernel_launch_to_func_map.end()) {
-            auto [f_ctx, f_func] = func_iter->second;
-            if (ctx_state->id_to_sass_map.count(f_func) && ctx_state->id_to_sass_map[f_func].count(ri->opcode_id)) {
-              sass_str_cpp = ctx_state->id_to_sass_map[f_func][ri->opcode_id];
+          KernelLaunchStateSnapshot launch_state;
+          if (copy_kernel_launch_state(ri->kernel_launch_id, launch_state)) {
+            if (ctx_state->id_to_sass_map.count(launch_state.func) &&
+                ctx_state->id_to_sass_map[launch_state.func].count(ri->opcode_id)) {
+              sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][ri->opcode_id];
             }
             // Lookup register indices (static data from instrumentation time)
-            if (ctx_state->id_to_reg_indices_map.count(f_func) &&
-                ctx_state->id_to_reg_indices_map[f_func].count(ri->opcode_id)) {
-              reg_indices_ptr = &ctx_state->id_to_reg_indices_map[f_func][ri->opcode_id];
+            if (ctx_state->id_to_reg_indices_map.count(launch_state.func) &&
+                ctx_state->id_to_reg_indices_map[launch_state.func].count(ri->opcode_id)) {
+              reg_indices_ptr = &ctx_state->id_to_reg_indices_map[launch_state.func][ri->opcode_id];
             }
           }
 
@@ -1064,13 +1094,11 @@ void* recv_thread_fun(void* args) {
 
           // Get SASS string for trace output
           std::string sass_str_cpp;
-          std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-              kernel_launch_to_func_map.find(oi->kernel_launch_id);
-          if (func_iter != kernel_launch_to_func_map.end()) {
-            std::pair<CUcontext, CUfunction> kernel_info = func_iter->second;
-            CUfunction f_func = kernel_info.second;
-            if (ctx_state->id_to_sass_map.count(f_func) && ctx_state->id_to_sass_map[f_func].count(oi->opcode_id)) {
-              sass_str_cpp = ctx_state->id_to_sass_map[f_func][oi->opcode_id];
+          KernelLaunchStateSnapshot launch_state;
+          if (copy_kernel_launch_state(oi->kernel_launch_id, launch_state)) {
+            if (ctx_state->id_to_sass_map.count(launch_state.func) &&
+                ctx_state->id_to_sass_map[launch_state.func].count(oi->opcode_id)) {
+              sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][oi->opcode_id];
             }
           }
 
@@ -1095,13 +1123,11 @@ void* recv_thread_fun(void* args) {
 
           // Get SASS string for trace output
           std::string sass_str_cpp;
-          std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-              kernel_launch_to_func_map.find(mem->kernel_launch_id);
-          if (func_iter != kernel_launch_to_func_map.end()) {
-            std::pair<CUcontext, CUfunction> kernel_info = func_iter->second;
-            CUfunction f_func = kernel_info.second;
-            if (ctx_state->id_to_sass_map.count(f_func) && ctx_state->id_to_sass_map[f_func].count(mem->opcode_id)) {
-              sass_str_cpp = ctx_state->id_to_sass_map[f_func][mem->opcode_id];
+          KernelLaunchStateSnapshot launch_state;
+          if (copy_kernel_launch_state(mem->kernel_launch_id, launch_state)) {
+            if (ctx_state->id_to_sass_map.count(launch_state.func) &&
+                ctx_state->id_to_sass_map[launch_state.func].count(mem->opcode_id)) {
+              sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][mem->opcode_id];
             }
           }
 
@@ -1126,14 +1152,11 @@ void* recv_thread_fun(void* args) {
 
           // Get SASS string for trace output
           std::string sass_str_cpp;
-          std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-              kernel_launch_to_func_map.find(mem_value->kernel_launch_id);
-          if (func_iter != kernel_launch_to_func_map.end()) {
-            std::pair<CUcontext, CUfunction> kernel_info = func_iter->second;
-            CUfunction f_func = kernel_info.second;
-            if (ctx_state->id_to_sass_map.count(f_func) &&
-                ctx_state->id_to_sass_map[f_func].count(mem_value->opcode_id)) {
-              sass_str_cpp = ctx_state->id_to_sass_map[f_func][mem_value->opcode_id];
+          KernelLaunchStateSnapshot launch_state;
+          if (copy_kernel_launch_state(mem_value->kernel_launch_id, launch_state)) {
+            if (ctx_state->id_to_sass_map.count(launch_state.func) &&
+                ctx_state->id_to_sass_map[launch_state.func].count(mem_value->opcode_id)) {
+              sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][mem_value->opcode_id];
             }
           }
 
@@ -1164,13 +1187,11 @@ void* recv_thread_fun(void* args) {
 
           // Get SASS string for trace output
           std::string sass_str_cpp;
-          std::map<uint64_t, std::pair<CUcontext, CUfunction>>::iterator func_iter =
-              kernel_launch_to_func_map.find(tma->kernel_launch_id);
-          if (func_iter != kernel_launch_to_func_map.end()) {
-            std::pair<CUcontext, CUfunction> kernel_info = func_iter->second;
-            CUfunction f_func = kernel_info.second;
-            if (ctx_state->id_to_sass_map.count(f_func) && ctx_state->id_to_sass_map[f_func].count(tma->opcode_id)) {
-              sass_str_cpp = ctx_state->id_to_sass_map[f_func][tma->opcode_id];
+          KernelLaunchStateSnapshot launch_state;
+          if (copy_kernel_launch_state(tma->kernel_launch_id, launch_state)) {
+            if (ctx_state->id_to_sass_map.count(launch_state.func) &&
+                ctx_state->id_to_sass_map[launch_state.func].count(tma->opcode_id)) {
+              sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][tma->opcode_id];
             }
           }
 

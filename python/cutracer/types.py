@@ -114,6 +114,12 @@ class TraceRecord(TypedDict, total=False):
     capture_config: dict[str, Any]
     func_addr: str
     sm_family: int  # SM architecture family (e.g. 90 = Hopper, 100 = Blackwell)
+    instrument_modes: list[str]
+    trace_instr_categories: list[str] | None
+    trace_launch_id: int | None
+    trace_warp_mask: int | None
+    trace_pc_offsets: list[int] | None
+    trace_pc_filter_valid: bool | None
     instructions: dict[
         str, dict[str, Any]
     ]  # opcode_id (str) -> {sass, binary, regs, uregs, ...}

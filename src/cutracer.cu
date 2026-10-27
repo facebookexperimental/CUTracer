@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <optional>
 #include <random>
@@ -83,6 +84,7 @@ std::unordered_map<CUcontext, CTXstate*> ctx_state_map;
 
 /* The kernel launch is identified by a global id */
 std::atomic<uint64_t> global_kernel_launch_id{0};
+std::mutex kernel_launch_state_mutex;
 
 /* Kernel events writer for structured launch event recording */
 static TraceWriter* g_kernel_events_writer = nullptr;
@@ -402,6 +404,7 @@ static void write_kernel_launch_event(const KernelFuncMetadata& meta, const Kern
   event["type"] = "kernel_launch";
   event["kernel_launch_id"] = launch_id;
   event["kernel_name"] = meta.unmangled_name;
+  event["mangled_name"] = meta.mangled_name;
   event["kernel_checksum"] = meta.kernel_checksum;
   event["grid"] = {dims.gridDimX, dims.gridDimY, dims.gridDimZ};
   event["block"] = {dims.blockDimX, dims.blockDimY, dims.blockDimZ};
@@ -651,7 +654,8 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
     return;
   }
   // The SASS checksum can stay identical when embedded PTX contracts differ.
-  const std::string path = prefix + "kernel_" + meta.kernel_checksum + "_" + digest + "_" + name + ".cubin";
+  const std::string filename = "kernel_" + meta.kernel_checksum + "_" + digest + "_" + name + ".cubin";
+  const std::string path = prefix + filename;
   if (rename(temporary.c_str(), path.c_str()) != 0) {
     loprintf("ERROR: could not preserve cubin snapshot %s\n", path.c_str());
     unlink(temporary.c_str());
@@ -659,7 +663,8 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
     return;
   }
   rmdir(temporary_dir.c_str());
-  meta.cubin_path = path;
+  // Artifacts are colocated with the trace and remain portable after upload.
+  meta.cubin_path = filename;
   meta.cubin_sha256 = digest;
 }
 
@@ -1091,6 +1096,11 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
   md["cluster_dim"] = {cluster.x, cluster.y, cluster.z};
   md["cluster_size"] = cluster.size();
   md["cluster_dim_source"] = cluster_dim_source_name(cluster.source);
+  // Keep the metadata header tied to the records in this per-launch trace.
+  // opcode_id is scoped to a CUfunction, so consumers need the actual launch
+  // id (not the per-function iteration embedded in the filename) to form an
+  // unambiguous join key across captured trace files.
+  md["grid_launch_id"] = launch_id;
   if (!cpu_callstack.empty()) {
     md["cpu_callstack"] = cpu_callstack;
     if (!callstack_source.empty()) {
@@ -1275,6 +1285,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   // Declared here so they are accessible when writing kernel_metadata after TraceWriter creation.
   KernelDimensions dims{};
   unsigned int dynamic_shmem = 0;
+  uint32_t current_iter = 0;
 
   // during stream capture or manual graph build, no kernel is launched, so
   // do not set launch argument, do not print kernel info, do not increase
@@ -1319,10 +1330,6 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     // For histogram analysis, we need to map the kernel launch ID back to its
     // function and context to access the correct SASS and clock opcode maps.
     // We also track the iteration count for unique file naming.
-    uint32_t current_iter = kernel_iter_map[func];
-    kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
-    kernel_launch_to_iter_map[kernel_launch_id] = current_iter;
-
     // Store kernel dimensions and dynamic shared memory for warp statistics tracking
     // (dims and dynamic_shmem declared at function scope for metadata writing)
     if (cbid == API_CUDA_cuLaunchKernelEx_ptsz || cbid == API_CUDA_cuLaunchKernelEx) {
@@ -1335,7 +1342,14 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       dims = {p->gridDimX, p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ};
       dynamic_shmem = p->sharedMemBytes;
     }
-    kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+    {
+      std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+      current_iter = kernel_iter_map[func];
+      if (should_instrument) kernel_iter_map[func]++;
+      kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
+      kernel_launch_to_iter_map[kernel_launch_id] = current_iter;
+      kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+    }
 
     // Write structured kernel launch event (applies to ALL kernels, not just instrumented)
     if (kernel_events_mode != KernelEventsMode::DISABLED) {
@@ -1356,7 +1370,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     // where the kernel deadlocks from the very first instruction and the
     // recv thread never receives any trace data.
     // Create TraceWriter for each kernel launch (per-launch trace files)
-    std::string base_filename = generate_kernel_log_basename(ctx, func, kernel_iter_map[func]++, meta.kernel_checksum);
+    std::string base_filename = generate_kernel_log_basename(ctx, func, current_iter, meta.kernel_checksum);
     const uint64_t current_launch_id = launched_id.value();
     auto metadata = build_kernel_metadata_json(meta, dims, dynamic_shmem, cluster, cpu_callstack, callstack_source,
                                                func, ctx_state, current_launch_id, "direct");
@@ -1666,8 +1680,12 @@ void nvbit_at_ctx_term(CUcontext ctx) {
 
   // Clean up any remaining kernel mapping entries
   // (in case there were kernels launched but no data received)
-  kernel_launch_to_func_map.clear();
-  kernel_launch_to_iter_map.clear();
+  {
+    std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+    kernel_launch_to_func_map.clear();
+    kernel_launch_to_iter_map.clear();
+    kernel_launch_to_dimensions_map.clear();
+  }
 
   if (ctx_state->channel_dev != nullptr) {
     // Unregister before destroy() joins the receiver and resets its thread ID.
@@ -1746,14 +1764,20 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     log_cluster_info_once(ctx, func, func_name, dyn_cx, dyn_cy, dyn_cz);
   }
 
-  // Store kernel launch mapping for graph node launches
-  kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
-  kernel_launch_to_iter_map[kernel_launch_id] = kernel_iter_map[func];
-
   // Store kernel dimensions
   KernelDimensions dims = {config.gridDimX,  config.gridDimY,  config.gridDimZ,
                            config.blockDimX, config.blockDimY, config.blockDimZ};
-  kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+  const bool instrument_enabled =
+      has_any_instrumentation_enabled() && !ctx_state->channel_failed && matches_exact_kernel_selector(ctx, func);
+  uint32_t current_iter = 0;
+  {
+    std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+    current_iter = kernel_iter_map[func];
+    if (instrument_enabled) kernel_iter_map[func]++;
+    kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
+    kernel_launch_to_iter_map[kernel_launch_id] = current_iter;
+    kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+  }
 
   // Capture the CPU call stack for graph node launches as well
   auto [cpu_callstack, callstack_source] = capture_cpu_callstack();
@@ -1767,9 +1791,9 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
 
   // Create TraceWriter for this graph node launch only if instrumentation is enabled
   // Otherwise, trace files would be empty (no data to write)
-  if (has_any_instrumentation_enabled() && !ctx_state->channel_failed && matches_exact_kernel_selector(ctx, func)) {
+  if (instrument_enabled) {
     const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
-    std::string base_filename = generate_kernel_log_basename(ctx, func, kernel_iter_map[func]++, meta.kernel_checksum);
+    std::string base_filename = generate_kernel_log_basename(ctx, func, current_iter, meta.kernel_checksum);
     auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cluster, cpu_callstack,
                                                callstack_source, func, ctx_state, kernel_launch_id, "graph");
     {

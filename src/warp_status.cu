@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include <map>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
@@ -18,6 +19,7 @@
 #include "warp_status.h"
 
 extern std::map<uint64_t, std::pair<CUcontext, CUfunction>> kernel_launch_to_func_map;
+extern std::mutex kernel_launch_state_mutex;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -91,14 +93,16 @@ WarpStatusSummary collect_warp_status(CTXstate* ctx_state, uint64_t current_kern
 
   // Resolve SASS map
   const std::map<int, std::string>* sass_map = nullptr;
+  CUfunction f_func = nullptr;
   {
+    std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
     auto func_iter = kernel_launch_to_func_map.find(current_kernel_launch_id);
     if (func_iter != kernel_launch_to_func_map.end()) {
-      CUfunction f_func = func_iter->second.second;
-      if (ctx_state->id_to_sass_map.count(f_func)) {
-        sass_map = &ctx_state->id_to_sass_map[f_func];
-      }
+      f_func = func_iter->second.second;
     }
+  }
+  if (f_func != nullptr && ctx_state->id_to_sass_map.count(f_func)) {
+    sass_map = &ctx_state->id_to_sass_map[f_func];
   }
 
   // Warp statistics

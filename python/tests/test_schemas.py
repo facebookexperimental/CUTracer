@@ -134,6 +134,12 @@ class KernelMetadataSchemaTest(unittest.TestCase):
             "grid": [128, 1, 1],
             "block": [256, 1, 1],
             "shmem_dynamic": 0,
+            "grid_launch_id": 7,
+            "trace_instr_categories": ["sync", "tma"],
+            "trace_launch_id": 7,
+            "trace_warp_mask": 240,
+            "trace_pc_offsets": [256, 512],
+            "trace_pc_filter_valid": True,
         }
         jsonschema.validate(valid_record, KERNEL_METADATA_SCHEMA)
 
@@ -150,6 +156,7 @@ class KernelMetadataSchemaTest(unittest.TestCase):
             "grid": [128, 1, 1],
             "block": [256, 1, 1],
             "shmem_dynamic": 0,
+            "grid_launch_id": 8,
             "cpu_callstack": [
                 "cudaLaunchKernel+0x1a2",
                 "main+0x45",

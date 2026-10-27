@@ -33,7 +33,9 @@ class KernelConfig:
         shmem_dynamic_bytes: Dynamic shared memory allocation size
         shmem_static_bytes: Static shared memory allocation size
         nregs: Register usage per thread
-        cubin_path: Relative path to dumped cubin file (only when dump_cubin enabled)
+        cubin_path: Bare filename of the dumped cubin, relative to the
+            directory containing the trace/metadata file; join it with that
+            directory to resolve it (only when dump_cubin enabled)
     """
 
     kernel_name: str
@@ -47,6 +49,13 @@ class KernelConfig:
     sm_family: int = 0  # SM architecture family (e.g., 90=Hopper, 100=Blackwell)
     cluster_dims: tuple[int, int, int] = (1, 1, 1)
     cluster_dim_source: str = "unknown"
+    grid_launch_id: int | None = None
+    instrument_modes: tuple[str, ...] = ()
+    trace_instr_categories: tuple[str, ...] | None = None
+    trace_launch_id: int | None = None
+    trace_warp_mask: int | None = None
+    trace_pc_offsets: tuple[int, ...] | None = None
+    trace_pc_filter_valid: bool | None = None
 
     @property
     def threads_per_cta(self) -> int:
@@ -125,6 +134,8 @@ def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
     block = record.get("block", [0, 0, 0])
     grid = record.get("grid", [0, 0, 0])
     cluster = record.get("cluster_dim", [1, 1, 1])
+    trace_categories = record.get("trace_instr_categories")
+    trace_offsets = record.get("trace_pc_offsets")
 
     return KernelConfig(
         kernel_name=record.get("unmangled_name", record.get("mangled_name", "")),
@@ -138,4 +149,13 @@ def parse_kernel_metadata(record: TraceRecord) -> KernelConfig | None:
         sm_family=record.get("sm_family", 0),
         cluster_dims=(cluster[0], cluster[1], cluster[2]),
         cluster_dim_source=record.get("cluster_dim_source", "unknown"),
+        grid_launch_id=record.get("grid_launch_id"),
+        instrument_modes=tuple(record.get("instrument_modes", [])),
+        trace_instr_categories=(
+            None if trace_categories is None else tuple(trace_categories)
+        ),
+        trace_launch_id=record.get("trace_launch_id"),
+        trace_warp_mask=record.get("trace_warp_mask"),
+        trace_pc_offsets=(None if trace_offsets is None else tuple(trace_offsets)),
+        trace_pc_filter_valid=record.get("trace_pc_filter_valid"),
     )

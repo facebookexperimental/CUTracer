@@ -97,8 +97,13 @@ analysis, and dedup studies.
 
 | `type` value | When emitted | Key fields |
 |--------------|--------------|------------|
-| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `nregs`, `shmem`, `stream_id` |
+| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name` (demangled), `mangled_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `nregs`, `shmem`, `stream_id` |
 | `"callstack_def"` | First time a unique CPU callstack is seen (mode=`dedup`) | `callstack_id` (hex hash), `frames` (array of strings), `source` |
+
+`kernel_name` remains the human-readable demangled name. `mangled_name` is the
+exact CUDA symbol used when another tool, such as Compute Sanitizer, requires a
+vendor-facing kernel filter. Readers accept legacy events without this field,
+but such events cannot safely drive a pinned Compute Sanitizer run.
 
 Mode-specific fields on `kernel_launch`:
 
