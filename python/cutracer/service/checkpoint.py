@@ -21,6 +21,7 @@ from cutracer.service.contracts import (
 CHECKPOINT_SCHEMA_VERSION = 1
 ENVELOPE_NAME = "experiment_envelope.json"
 SUCCESS_NAME = "_SUCCESS"
+ATTEMPTS_DIRECTORY = "attempts"
 
 _ResultT = TypeVar("_ResultT", bound=ExperimentResult)
 
@@ -30,6 +31,14 @@ def _sha256(value: str) -> str:
         character not in "0123456789abcdef" for character in value
     ):
         raise ValueError("checkpoint envelope_sha256 must be lowercase SHA-256")
+    return value
+
+
+def _attempt_id(value: str) -> str:
+    if len(value) != 32 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError("checkpoint attempt_id must be 32 lowercase hex digits")
     return value
 
 
@@ -68,6 +77,55 @@ class TerminalCheckpointMarker:
         if not isinstance(envelope_sha256, str):
             raise ValueError("checkpoint envelope_sha256 must be a string")
         return cls(dispatch_key, envelope_sha256, version)
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteCheckpointMarker:
+    """First-writer-wins remote commit of one attempt's immutable envelope.
+
+    Each worker attempt uploads its envelope and every artifact it references
+    below ``<dispatch_key>/attempts/<attempt_id>/`` and only then creates
+    ``<dispatch_key>/_SUCCESS`` without overwrite. Readers locate the committed
+    envelope through this marker and verify it against ``envelope_sha256``.
+    """
+
+    dispatch_key: str
+    envelope_sha256: str
+    attempt_id: str
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        TerminalCheckpointMarker(
+            self.dispatch_key,
+            self.envelope_sha256,
+            self.schema_version,
+        )
+        _attempt_id(self.attempt_id)
+
+    @property
+    def attempt_directory(self) -> str:
+        return f"{ATTEMPTS_DIRECTORY}/{self.attempt_id}"
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> RemoteCheckpointMarker:
+        expected = {"schema_version", "dispatch_key", "envelope_sha256", "attempt_id"}
+        if set(payload) != expected:
+            raise ValueError("remote checkpoint marker has unexpected fields")
+        attempt_id = payload["attempt_id"]
+        if not isinstance(attempt_id, str):
+            raise ValueError("checkpoint attempt_id must be a string")
+        marker = TerminalCheckpointMarker.from_dict(
+            {key: value for key, value in payload.items() if key != "attempt_id"}
+        )
+        return cls(
+            marker.dispatch_key,
+            marker.envelope_sha256,
+            attempt_id,
+            marker.schema_version,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
