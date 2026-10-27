@@ -5,13 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable, cast, Mapping, Optional, Sequence, Union
 
 from click import ClickException
 from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
-from cutracer.service.artifacts import local_artifact, local_path
+from cutracer.service.artifacts import (
+    local_artifact,
+    local_file_uri,
+    local_path,
+    stage_verified_local_artifact,
+)
 from cutracer.service.contracts import (
     ArtifactRef,
     ExecutionProvenance,
@@ -19,6 +26,7 @@ from cutracer.service.contracts import (
     ExperimentKind,
     ExperimentSpec,
     KernelId,
+    ResultCompleteness,
     TraceAnalysisEvidence,
     TraceExperimentResult,
     TraceInstructionCategory,
@@ -341,24 +349,113 @@ def _selected_capture_outputs(
     return selected, supporting, all_have_records
 
 
+def _text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value or ""
+
+
 def _capture_to_log(
     log_path: str,
     stdout: str | bytes | None,
     stderr: str | bytes | None,
 ) -> Optional[ArtifactRef]:
-    """Persist captured stdout/stderr to a log artifact (None if unwritable)."""
-
-    def _text(value: str | bytes | None) -> str:
-        if isinstance(value, bytes):
-            return value.decode("utf-8", "replace")
-        return value or ""
-
+    """Persist captured stdout/stderr before the attempt directory is removed."""
     try:
         with open(log_path, "w") as fh:
             fh.write(_text(stdout) + "\n" + _text(stderr))
-        return local_artifact(log_path)
     except OSError:
+        logger.warning("failed to capture trace log to %s", log_path, exc_info=True)
         return None
+    return local_artifact(log_path)
+
+
+def _sealed_log_if_available(out_dir: str) -> Optional[ArtifactRef]:
+    path = os.path.join(out_dir, "trace.log")
+    if not os.path.isfile(path) or os.path.islink(path):
+        return None
+    return local_artifact(path, media_type="text/plain", include_sha256=True)
+
+
+def _promote_artifact(
+    source: str,
+    destination: str,
+    *,
+    media_type: str,
+) -> ArtifactRef:
+    """Atomically copy one attempt artifact to its stable, hashed path."""
+    descriptor = -1
+    temporary_path: Optional[str] = None
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}_",
+            dir=os.path.dirname(destination),
+        )
+        with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as staged:
+            descriptor = -1
+            shutil.copyfileobj(source_file, staged)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        directory = os.open(os.path.dirname(destination), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        artifact = local_artifact(
+            destination,
+            media_type=media_type,
+            include_sha256=True,
+        )
+        if artifact.sha256 is None or artifact.size_bytes is None:
+            raise OSError(f"artifact disappeared before it was hashed: {destination}")
+        return artifact
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
+def _promote_paths(
+    paths: Sequence[str],
+    *,
+    out_dir: str,
+    media_type: str,
+    promoted: Optional[list[ArtifactRef]] = None,
+) -> list[ArtifactRef]:
+    artifacts = [] if promoted is None else promoted
+    seen = set()
+    for path in paths:
+        basename = os.path.basename(path)
+        if not basename or basename in seen:
+            raise ValueError(
+                f"capture emitted duplicate artifact basename: {basename!r}"
+            )
+        if basename in _RESERVED_CAPTURE_BASENAMES:
+            raise ValueError(f"capture emitted reserved artifact basename: {basename}")
+        seen.add(basename)
+    for path in paths:
+        basename = os.path.basename(path)
+        artifacts.append(
+            _promote_artifact(
+                path,
+                os.path.join(out_dir, basename),
+                media_type=(
+                    "application/zstd"
+                    if media_type == "application/x-ndjson" and path.endswith(".zst")
+                    else media_type
+                ),
+            )
+        )
+    return artifacts
 
 
 def _run_trace_analyzer(
@@ -430,6 +527,9 @@ def _resolved_trace_config_path(
 
 
 def _enabled_point_offset(key: object, point: object) -> Optional[str]:
+    # Match the delay-config schema/loader exactly: only an explicit boolean
+    # true enables a point. Missing, false, or merely truthy values must not
+    # silently widen a targeted trace.
     if not isinstance(point, dict) or not point.get("on", True):
         return None
     raw_offset = point["pc"] if "pc" in point else key
@@ -447,6 +547,8 @@ def _matching_config_offsets(
             continue
         if raw_kernel.get("kernel_checksum") != pinned.cubin_hash:
             continue
+        # A delay config may store a mangled CUDA name while the WorkUnit uses
+        # the demangled launch name; the cubin checksum is shared by both.
         matched_kernel = True
         points = raw_kernel.get("instrumentation_points")
         if not isinstance(points, dict):
@@ -464,6 +566,12 @@ def _config_pc_offsets(
     *,
     resolved_config_path: Optional[str],
 ) -> list[str]:
+    """Resolve enabled PCs from the caller's verified config snapshot.
+
+    MAST verifies/materializes the input artifact before entering this adapter
+    and passes that immutable snapshot via ``resolved_config_path``.  Local
+    callers retain the legacy direct-local-artifact fallback.
+    """
     config_path = _resolved_trace_config_path(
         spec,
         resolved_config_path=resolved_config_path,
@@ -526,6 +634,68 @@ def _trace_warp_mask(spec: ExperimentSpec) -> Optional[str]:
             raise ValueError("trace warpgroup_id must be in [0, 7]")
         return hex(0xF << (selector.warpgroup_id * 4))
     return None
+
+
+def _validate_resume(
+    resume_from: TraceExperimentResult,
+    *,
+    spec: ExperimentSpec,
+    provenance: ExecutionProvenance,
+) -> None:
+    if (
+        resume_from.experiment_id != spec.experiment_id
+        or resume_from.mode != spec.kind
+        or resume_from.provenance != provenance
+        or resume_from.execution_status != ExecutionStatus.SUCCEEDED
+        or resume_from.completeness != ResultCompleteness.PARTIAL
+        or resume_from.analysis is not None
+        or not resume_from.traces
+        or not resume_from.supporting_artifacts
+        or resume_from.log is None
+    ):
+        raise ValueError("resumed trace progress does not match captured experiment")
+
+
+def _stage_resume_artifacts(
+    artifacts: Sequence[ArtifactRef],
+    *,
+    source_dir: str,
+    destination_dir: str,
+) -> list[str]:
+    os.makedirs(destination_dir, exist_ok=True)
+    paths = []
+    seen = set()
+    for artifact in artifacts:
+        basename = os.path.basename(artifact.relative_path)
+        if not basename or artifact.relative_path != basename:
+            raise ValueError(
+                "resumed trace artifact must use a portable basename: "
+                f"{artifact.relative_path!r}"
+            )
+        if basename in seen:
+            raise ValueError(f"resumed trace has duplicate artifact: {basename!r}")
+        seen.add(basename)
+        # A sealed MAST checkpoint intentionally rewrites ``uri`` to its
+        # Manifold location.  Restore has already materialized each declared
+        # basename under ``out_dir``; reconstruct a local reference while
+        # retaining the sealed hash/size, then verify and snapshot those bytes
+        # before analysis.
+        source_path = os.path.abspath(os.path.join(source_dir, basename))
+        if os.path.islink(source_path):
+            raise ValueError(f"resumed trace artifact is a symlink: {basename}")
+        local_ref = ArtifactRef(
+            uri=local_file_uri(source_path),
+            relative_path=basename,
+            sha256=artifact.sha256,
+            size_bytes=artifact.size_bytes,
+            media_type=artifact.media_type,
+        )
+        staged = stage_verified_local_artifact(
+            local_ref,
+            destination=os.path.join(destination_dir, basename),
+        )
+        paths.append(staged.path)
+    return paths
 
 
 def run_trace_experiment(
