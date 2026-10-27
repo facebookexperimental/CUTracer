@@ -857,13 +857,23 @@ class TriageDecision:
 
     outcome: TriageOutcome
     reason: str
+    snapshot: Optional["TriageSnapshot"] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"outcome": self.outcome.value, "reason": self.reason}
+        return {
+            "outcome": self.outcome.value,
+            "reason": self.reason,
+            "snapshot": None if self.snapshot is None else self.snapshot.to_dict(),
+        }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TriageDecision":
-        return cls(outcome=TriageOutcome(d["outcome"]), reason=d["reason"])
+        snapshot = d.get("snapshot")
+        return cls(
+            outcome=TriageOutcome(d["outcome"]),
+            reason=d["reason"],
+            snapshot=(None if snapshot is None else TriageSnapshot.from_dict(snapshot)),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -913,6 +923,7 @@ class TriageSnapshot:
 
     scopes: Tuple[ScopeTriageSnapshot, ...] = ()
     stress_completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
+    suppression_audit: Tuple["SuppressionAuditEntry", ...] = ()
 
     def __post_init__(self) -> None:
         keys = [scope.scope.key for scope in self.scopes]
@@ -934,6 +945,7 @@ class TriageSnapshot:
         return {
             "scopes": [scope.to_dict() for scope in self.scopes],
             "stress_completeness": self.stress_completeness.value,
+            "suppression_audit": [entry.to_dict() for entry in self.suppression_audit],
         }
 
     @classmethod
@@ -944,6 +956,10 @@ class TriageSnapshot:
             ),
             stress_completeness=ResultCompleteness(
                 d.get("stress_completeness", ResultCompleteness.UNKNOWN.value)
+            ),
+            suppression_audit=tuple(
+                SuppressionAuditEntry.from_dict(entry)
+                for entry in d.get("suppression_audit", ())
             ),
         )
 
@@ -969,6 +985,40 @@ class SuppressionDecision:
             rule_id=d["rule_id"],
             rule_version=int(d["rule_version"]),
             reason=d["reason"],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SuppressionAuditEntry:
+    """The exact finding and policy revision hidden during triage."""
+
+    finding_key: str
+    source_tool: str
+    error_type: str
+    kernel_name: Optional[str]
+    source: Optional[SourceLoc]
+    decision: SuppressionDecision
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "finding_key": self.finding_key,
+            "source_tool": self.source_tool,
+            "error_type": self.error_type,
+            "kernel_name": self.kernel_name,
+            "source": None if self.source is None else self.source.to_dict(),
+            "decision": self.decision.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SuppressionAuditEntry":
+        source = d.get("source")
+        return cls(
+            finding_key=d["finding_key"],
+            source_tool=d["source_tool"],
+            error_type=d["error_type"],
+            kernel_name=d.get("kernel_name"),
+            source=None if source is None else SourceLoc.from_dict(source),
+            decision=SuppressionDecision.from_dict(d["decision"]),
         )
 
 

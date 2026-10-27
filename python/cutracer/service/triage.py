@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from cutracer.service.baseline import (
     baseline_from_scope,
@@ -20,8 +20,11 @@ from cutracer.service.contracts import (
     ResultCompleteness,
     SanitizerSweepResult,
     ScopeId,
+    ScopeTriageSnapshot,
+    SuppressionAuditEntry,
     TriageDecision,
     TriageOutcome,
+    TriageSnapshot,
 )
 from cutracer.service.suppression import SuppressionOutcome, SuppressionPolicy
 
@@ -177,83 +180,123 @@ class TriagePolicy:
         self._today = today
         self._record_baselines = record_baselines
 
-    def _scope_completeness(self, session: AnalysisSession) -> Dict[str, bool]:
+    def _scope_completeness(
+        self, session: AnalysisSession
+    ) -> Dict[str, ResultCompleteness]:
         """Whether each tool proved it covered its declared scope."""
-        complete: Dict[str, bool] = {}
+        complete: Dict[str, ResultCompleteness] = {}
         for result in session.evidence.sanitizer:
+            observed = result.completeness
             # A complete parse proves only that the log is whole; a target that
             # did not succeed may have stopped before covering its scope.
-            proven = (
-                result.execution_status == ExecutionStatus.SUCCEEDED
-                and result.completeness == ResultCompleteness.COMPLETE
-            )
+            if (
+                observed == ResultCompleteness.COMPLETE
+                and result.execution_status != ExecutionStatus.SUCCEEDED
+            ):
+                observed = ResultCompleteness.UNKNOWN
             conflicting_tools = {
                 finding.source_tool.split("/")[-1]
                 for finding in result.findings
                 if finding.source_tool.split("/")[-1] != result.tool
             }
             if conflicting_tools:
-                proven = False
+                observed = ResultCompleteness.UNKNOWN
                 for tool in conflicting_tools:
-                    complete[tool] = False
-            complete[result.tool] = complete.get(result.tool, True) and proven
+                    complete[tool] = ResultCompleteness.UNKNOWN
+            previous = complete.get(result.tool)
+            if previous is None:
+                complete[result.tool] = observed
+            elif previous != ResultCompleteness.COMPLETE:
+                complete[result.tool] = previous
+            elif observed != ResultCompleteness.COMPLETE:
+                complete[result.tool] = observed
         return complete
 
-    def _compare_to_baselines(
+    def _triage_snapshot(
         self,
         session: AnalysisSession,
-        correlated: List[CorrelatedFinding],
-    ) -> Tuple[List[str], List[str], List[str]]:
-        """Diff each scope against its baseline, recording complete ones.
-
-        Returns the newly introduced keys, the keys with nothing to compare
-        against, and the scopes that could not prove they covered themselves.
-        """
-        store = self._baselines
-        assert store is not None
+        triage: TriageResult,
+        *,
+        record_baselines: bool = True,
+    ) -> TriageSnapshot:
         family = test_family(session.unit.test_id)
         completeness = self._scope_completeness(session)
         by_scope: Dict[str, List[str]] = {}
-        for entry in correlated:
+        for entry in triage.correlated_findings:
             for tool in entry.tools:
                 by_scope.setdefault(tool.split("/")[-1], []).append(
                     entry.correlation_key
                 )
 
-        introduced: List[str] = []
-        unbaselined: List[str] = []
-        unproven: List[str] = []
+        scopes: List[ScopeTriageSnapshot] = []
         for tool in sorted(completeness.keys() | by_scope.keys()):
-            proven = completeness.get(tool, False)
+            scope_completeness = completeness.get(tool, ResultCompleteness.UNKNOWN)
             scope = ScopeId(test_family=family, tool=tool)
             keys = by_scope.get(tool, [])
-            diff = diff_against_baseline(scope, keys, store.load(scope))
-            introduced.extend(diff.new_keys)
-            if diff.verdict == BaselineVerdict.NO_BASELINE and diff.observed_keys:
-                unbaselined.extend(diff.observed_keys)
-            if not proven:
-                unproven.append(scope.key)
-            if self._record_baselines and self._today is not None:
-                # Only a scope that proved it covered itself may be recorded;
-                # baseline_from_scope refuses anything else.
+            baseline_recorded = False
+            if self._baselines is None:
+                verdict = BaselineVerdict.NOT_EVALUATED
+                observed = tuple(sorted(set(keys)))
+                new = resolved = unchanged = ()
+            else:
+                diff = diff_against_baseline(
+                    scope,
+                    keys,
+                    self._baselines.load(scope),
+                )
+                verdict = diff.verdict
+                observed = diff.observed_keys
+                new = diff.new_keys
+                resolved = diff.resolved_keys
+                unchanged = diff.unchanged_keys
+            if (
+                record_baselines
+                and self._baselines is not None
+                and self._record_baselines
+                and self._today is not None
+            ):
                 recorded = baseline_from_scope(
                     scope,
                     keys,
-                    is_complete=proven,
+                    is_complete=scope_completeness == ResultCompleteness.COMPLETE,
                     source_revision=session.unit.source_revision,
                     recorded_on=self._today,
                 )
                 if recorded is not None:
-                    store.record(recorded)
-        return introduced, unbaselined, unproven
-
-    def decide(self, session: AnalysisSession) -> TriageDecision:
-        if initial_evidence_requires_inconclusive(session.evidence):
-            return TriageDecision(
-                outcome=TriageOutcome.INCONCLUSIVE,
-                reason="initial evidence is incomplete",
+                    self._baselines.record(recorded)
+                    baseline_recorded = True
+            scopes.append(
+                ScopeTriageSnapshot(
+                    scope=scope,
+                    completeness=scope_completeness,
+                    baseline_verdict=verdict,
+                    observed_keys=observed,
+                    new_keys=new,
+                    resolved_keys=resolved,
+                    unchanged_keys=unchanged,
+                    baseline_recorded=baseline_recorded,
+                )
             )
 
+        return TriageSnapshot(
+            scopes=tuple(scopes),
+            stress_completeness=_aggregate_completeness(
+                [result.completeness for result in session.evidence.stress]
+            ),
+            suppression_audit=tuple(
+                SuppressionAuditEntry(
+                    finding_key=correlation_key(entry.finding),
+                    source_tool=entry.finding.source_tool,
+                    error_type=entry.finding.error_type,
+                    kernel_name=entry.finding.kernel_name,
+                    source=entry.finding.source,
+                    decision=entry.decision,
+                )
+                for entry in triage.suppressed.suppressed
+            ),
+        )
+
+    def decide(self, session: AnalysisSession) -> TriageDecision:
         triage = correlate_evidence(
             session.unit.unit_id,
             session.evidence,
@@ -261,6 +304,14 @@ class TriagePolicy:
             suppression=self._suppression,
             today=self._today,
         )
+        if initial_evidence_requires_inconclusive(session.evidence):
+            return TriageDecision(
+                outcome=TriageOutcome.INCONCLUSIVE,
+                reason="initial evidence is incomplete",
+                snapshot=self._triage_snapshot(session, triage, record_baselines=False),
+            )
+        snapshot = self._triage_snapshot(session, triage)
+
         if not triage.should_analyze:
             suppressed = len(triage.suppressed.suppressed)
             reason = (
@@ -268,7 +319,11 @@ class TriagePolicy:
                 if suppressed
                 else "both initial sources are complete and clean"
             )
-            return TriageDecision(outcome=TriageOutcome.FINISH, reason=reason)
+            return TriageDecision(
+                outcome=TriageOutcome.FINISH,
+                reason=reason,
+                snapshot=snapshot,
+            )
 
         if any(entry.stress_reproduced for entry in triage.correlated_findings):
             # Stress reproduces a real correctness failure and has no baseline
@@ -276,27 +331,40 @@ class TriagePolicy:
             return TriageDecision(
                 outcome=TriageOutcome.ANALYZE,
                 reason="random-delay stress reproduced a correctness failure",
+                snapshot=snapshot,
             )
 
         if self._baselines is None:
             return TriageDecision(
                 outcome=TriageOutcome.ANALYZE,
                 reason=f"{len(triage.correlated_findings)} findings, no baseline store",
+                snapshot=snapshot,
             )
 
-        introduced, unbaselined, unproven = self._compare_to_baselines(
-            session, triage.correlated_findings
-        )
+        introduced = [key for scope in snapshot.scopes for key in scope.new_keys]
+        unbaselined = [
+            key
+            for scope in snapshot.scopes
+            if scope.baseline_verdict == BaselineVerdict.NO_BASELINE
+            for key in scope.observed_keys
+        ]
+        unproven = [
+            scope.scope.key
+            for scope in snapshot.scopes
+            if scope.completeness != ResultCompleteness.COMPLETE
+        ]
 
         if introduced:
             return TriageDecision(
                 outcome=TriageOutcome.ANALYZE,
                 reason=f"{len(set(introduced))} newly introduced findings",
+                snapshot=snapshot,
             )
         if unbaselined:
             return TriageDecision(
                 outcome=TriageOutcome.ANALYZE,
                 reason=f"{len(set(unbaselined))} findings with no baseline to compare",
+                snapshot=snapshot,
             )
         if unproven:
             # Not re-observing a baseline finding under partial coverage is not
@@ -305,11 +373,30 @@ class TriagePolicy:
             return TriageDecision(
                 outcome=TriageOutcome.INCONCLUSIVE,
                 reason=f"scope coverage unproven: {', '.join(sorted(set(unproven)))}",
+                snapshot=snapshot,
             )
         return TriageDecision(
             outcome=TriageOutcome.FINISH,
             reason="all findings are unchanged since the last complete baseline",
+            snapshot=snapshot,
         )
+
+
+def _aggregate_completeness(
+    values: List[ResultCompleteness],
+) -> ResultCompleteness:
+    if not values:
+        return ResultCompleteness.UNKNOWN
+    if all(value == ResultCompleteness.COMPLETE for value in values):
+        return ResultCompleteness.COMPLETE
+    if all(
+        value in (ResultCompleteness.COMPLETE, ResultCompleteness.COMPLETE_EARLY)
+        for value in values
+    ):
+        return ResultCompleteness.COMPLETE_EARLY
+    if all(value == ResultCompleteness.SKIPPED for value in values):
+        return ResultCompleteness.SKIPPED
+    return ResultCompleteness.PARTIAL
 
 
 def _active_sanitizer_signals(
