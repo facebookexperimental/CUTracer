@@ -22,9 +22,11 @@ from cutracer.service.session import (
     EffectKind,
     record_analysis_decision,
     record_experiment_result,
+    record_triage_decision,
     SessionEffect,
     Transition,
 )
+from cutracer.service.triage import TriagePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +77,31 @@ class DistributedCoordinator:
         sandcastle: SandcastleDispatcher,
         reports: DistributedReportSink,
         guard_policy: ExperimentGuardPolicy | None = None,
+        triage_policy: TriagePolicy | None = None,
     ) -> None:
         self._store = store
         self._mast = mast
         self._sandcastle = sandcastle
         self._reports = reports
         self._guard = guard_policy or ExperimentGuardPolicy()
+        self._triage = triage_policy or TriagePolicy()
 
     def _dispatch(self, transition: Transition) -> AnalysisSession:
         session = transition.session
+        # Validated before anything is dispatched: a violation discovered
+        # mid-loop would leave a submitted MAST job behind an error.
+        pending_triage = any(
+            effect.kind == EffectKind.RUN_TRIAGE for effect in transition.effects
+        )
+        if pending_triage and len(transition.effects) != 1:
+            raise ValueError("RUN_TRIAGE must be the only effect in a transition")
         for effect in transition.effects:
             if effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
                 self._mast.submit(session.session_id, effect.experiments)
+            elif effect.kind == EffectKind.RUN_TRIAGE:
+                # Pure computation with no remote effect: resolved after the
+                # loop and committed through its own CAS round.
+                continue
             elif effect.kind == EffectKind.RUN_REASONER:
                 self._sandcastle.submit_reasoning_turn(
                     session.session_id, session.state_revision
@@ -95,7 +110,17 @@ class DistributedCoordinator:
                 self._reports.publish(build_session_report(session))
             else:
                 raise ValueError(f"unknown effect kind: {effect.kind}")
+        if pending_triage:
+            return self._apply(
+                session.session_id,
+                self._record_triage_if_pending,
+            )
         return session
+
+    def _record_triage_if_pending(self, current: AnalysisSession) -> Transition:
+        if current.status != SessionStatus.WAITING_TRIAGE:
+            return Transition(session=current, effects=())
+        return record_triage_decision(current, self._triage.decide(current))
 
     def _apply(
         self,
@@ -150,6 +175,8 @@ class DistributedCoordinator:
                 EffectKind.SUBMIT_EXPERIMENTS,
                 tuple(session.pending_experiments),
             )
+        elif session.status == SessionStatus.WAITING_TRIAGE:
+            effect = SessionEffect(EffectKind.RUN_TRIAGE)
         elif session.status == SessionStatus.WAITING_REASONER:
             effect = SessionEffect(EffectKind.RUN_REASONER)
         elif session.status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):

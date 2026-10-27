@@ -33,6 +33,8 @@ from cutracer.service.contracts import (
     StressOutcome,
     StressTestResult,
     TraceExperimentResult,
+    TriageDecision,
+    TriageOutcome,
     TriggeringDelayConfig,
     WorkUnit,
 )
@@ -46,6 +48,7 @@ from cutracer.service.triage import initial_evidence_requires_inconclusive
 
 class EffectKind(str, Enum):
     SUBMIT_EXPERIMENTS = "submit_experiments"
+    RUN_TRIAGE = "run_triage"
     RUN_REASONER = "run_reasoner"
     PUBLISH_REPORT = "publish_report"
 
@@ -732,6 +735,28 @@ def _inconclusive_report(session: AnalysisSession, reason: str) -> ExplainReport
     )
 
 
+def _triage_report(session: AnalysisSession, decision: TriageDecision) -> ExplainReport:
+    """Terminal report for a session that finished without an AI turn.
+
+    Finishing at triage means the findings were already known, suppressed, or
+    absent -- not that the evidence says nothing happened. The report therefore
+    reports the evidence as it stands and makes no root-cause claim, rather
+    than asserting a clean run the evidence may contradict.
+    """
+    reproduced = any(result.has_positive_signal for result in session.evidence.stress)
+    return ExplainReport(
+        root_cause="",
+        race_class="unknown",
+        confidence=Confidence.L,
+        is_reproduced=reproduced,
+        cross_validation=CrossValidation(agrees=True, notes=decision.reason),
+        evidence_sufficiency=EvidenceSufficiency.SUFFICIENT,
+        evidence_refs=_artifact_refs(session.evidence),
+        recommended_action=f"No new action required: {decision.reason}",
+        raw_ai_output="",
+    )
+
+
 def create_session(
     session_id: str,
     unit: WorkUnit,
@@ -754,7 +779,10 @@ def create_session(
         session = AnalysisSession(
             session_id=session_id,
             unit=unit,
-            status=SessionStatus.WAITING_REASONER,
+            # Transient: _terminate_inconclusive replaces it immediately. The
+            # pre-reasoner state is the honest placeholder now that entering
+            # the reasoner is a decision triage has to make.
+            status=SessionStatus.WAITING_TRIAGE,
             evidence=evidence,
             budget=active_budget,
         )
@@ -765,7 +793,7 @@ def create_session(
         session_id=session_id,
         unit=unit,
         status=(
-            SessionStatus.WAITING_INITIAL if pending else SessionStatus.WAITING_REASONER
+            SessionStatus.WAITING_INITIAL if pending else SessionStatus.WAITING_TRIAGE
         ),
         evidence=evidence,
         budget=active_budget,
@@ -783,7 +811,7 @@ def create_session(
             ),
         )
     else:
-        effects = (SessionEffect(kind=EffectKind.RUN_REASONER),)
+        effects = (SessionEffect(kind=EffectKind.RUN_TRIAGE),)
     return Transition(session=session, effects=effects)
 
 
@@ -836,10 +864,15 @@ def record_experiment_result(
     updated.completed_experiment_ids.append(result.experiment_id)
     if updated.pending_experiments:
         return Transition(session=updated, effects=())
-    if spec.phase == ExperimentPhase.INITIAL and initial_evidence_requires_inconclusive(
-        updated.evidence
-    ):
-        return _terminate_inconclusive(updated, "initial evidence is incomplete")
+    if spec.phase == ExperimentPhase.INITIAL:
+        # Completeness, correlation, suppression, and baseline all run before
+        # the reasoner is ever entered; the reasoner is for evidence that
+        # survived triage, not for deciding whether there is any.
+        updated.status = SessionStatus.WAITING_TRIAGE
+        return Transition(
+            session=updated,
+            effects=(SessionEffect(kind=EffectKind.RUN_TRIAGE),),
+        )
     updated.status = SessionStatus.WAITING_REASONER
     return Transition(
         session=updated,
@@ -847,8 +880,58 @@ def record_experiment_result(
     )
 
 
-def _terminate_inconclusive(session: AnalysisSession, reason: str) -> Transition:
+def record_triage_decision(
+    session: AnalysisSession,
+    decision: TriageDecision,
+) -> Transition:
+    """Apply the deterministic pre-reasoning verdict.
+
+    Only ``ANALYZE`` costs an AI turn. A campaign that is clean, unchanged, or
+    entirely suppressed finishes here, and an incomplete one becomes
+    inconclusive rather than being handed to the reasoner as if it were clean.
+    """
+    if session.status != SessionStatus.WAITING_TRIAGE:
+        raise ValueError(f"cannot triage session in state: {session.status}")
+
+    if decision.outcome == TriageOutcome.INCONCLUSIVE:
+        return _terminate_inconclusive(
+            session,
+            decision.reason,
+            triage=decision,
+        )
+
     updated = _clone(session)
+    updated.triage = decision
+    if decision.outcome == TriageOutcome.FINISH:
+        updated.status = SessionStatus.COMPLETED
+        updated.termination_reason = decision.reason
+        updated.report = _triage_report(updated, decision)
+        return Transition(
+            session=updated,
+            effects=(SessionEffect(kind=EffectKind.PUBLISH_REPORT),),
+        )
+
+    if decision.outcome != TriageOutcome.ANALYZE:
+        # Falling through to the reasoner would turn an unhandled outcome into
+        # a silent AI turn, which is the cost triage exists to control.
+        raise ValueError(f"unsupported triage outcome: {decision.outcome}")
+
+    updated.status = SessionStatus.WAITING_REASONER
+    return Transition(
+        session=updated,
+        effects=(SessionEffect(kind=EffectKind.RUN_REASONER),),
+    )
+
+
+def _terminate_inconclusive(
+    session: AnalysisSession,
+    reason: str,
+    *,
+    triage: Optional[TriageDecision] = None,
+) -> Transition:
+    updated = _clone(session)
+    if triage is not None:
+        updated.triage = triage
     updated.status = SessionStatus.INCONCLUSIVE
     updated.termination_reason = reason
     updated.report = _inconclusive_report(updated, reason)

@@ -29,8 +29,10 @@ from cutracer.service.session import (
     EffectKind,
     record_analysis_decision,
     record_experiment_result,
+    record_triage_decision,
     SessionEffect,
 )
+from cutracer.service.triage import TriagePolicy
 
 
 class ExperimentExecutor(Protocol):
@@ -165,11 +167,16 @@ def _run_effect(
     executor: ExperimentExecutor,
     reasoner: ReasonerBackend,
     guard_policy: ExperimentGuardPolicy,
+    triage_policy: TriagePolicy,
     sink: Optional[ReportSink],
 ) -> tuple[AnalysisSession, list[SessionEffect]]:
     effects: list[SessionEffect] = []
     current = session
-    if effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
+    if effect.kind == EffectKind.RUN_TRIAGE:
+        transition = record_triage_decision(current, triage_policy.decide(current))
+        current = transition.session
+        effects.extend(transition.effects)
+    elif effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
         # Local may serialize these on one GPU, but they remain peer experiments:
         # no result is consulted before all specs in this effect have been run.
         results = [executor.execute(spec) for spec in effect.experiments]
@@ -202,6 +209,7 @@ def run_local_session(
     budget: Optional[SessionBudget] = None,
     campaign_policy: Optional[InitialCampaignPolicy] = None,
     guard_policy: Optional[ExperimentGuardPolicy] = None,
+    triage_policy: Optional[TriagePolicy] = None,
     store: Optional[SessionStore] = None,
     sink: Optional[ReportSink] = None,
 ) -> SessionReport:
@@ -215,6 +223,7 @@ def run_local_session(
     effects = list(transition.effects)
     active_reasoner = reasoner or ClaudeReasoner()
     active_guard = guard_policy or ExperimentGuardPolicy()
+    active_triage = triage_policy or TriagePolicy()
     steps = 0
     while effects:
         steps += 1
@@ -227,6 +236,7 @@ def run_local_session(
             executor=executor,
             reasoner=active_reasoner,
             guard_policy=active_guard,
+            triage_policy=active_triage,
             sink=sink,
         )
         effects.extend(generated)

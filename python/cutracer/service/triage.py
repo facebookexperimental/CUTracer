@@ -5,7 +5,13 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List
 
-from cutracer.service.contracts import EvidenceBundle, FindingRecord
+from cutracer.service.contracts import (
+    AnalysisSession,
+    EvidenceBundle,
+    FindingRecord,
+    TriageDecision,
+    TriageOutcome,
+)
 
 
 def has_correctness_signal(evidence: EvidenceBundle) -> bool:
@@ -72,6 +78,21 @@ class TriageResult:
             "correlated_findings": [x.to_dict() for x in self.correlated_findings],
             "should_analyze": self.should_analyze,
         }
+
+
+class TriagePolicy:
+    """Decides, without any AI, what a completed initial campaign warrants."""
+
+    def decide(self, session: AnalysisSession) -> TriageDecision:
+        if initial_evidence_requires_inconclusive(session.evidence):
+            return TriageDecision(
+                outcome=TriageOutcome.INCONCLUSIVE,
+                reason="initial evidence is incomplete",
+            )
+        return TriageDecision(
+            outcome=TriageOutcome.ANALYZE,
+            reason="initial evidence warrants analysis",
+        )
 
 
 def correlate_evidence(unit_id: str, evidence: EvidenceBundle) -> TriageResult:

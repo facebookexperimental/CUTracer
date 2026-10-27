@@ -431,8 +431,17 @@ class DecisionKind(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class TriageOutcome(str, Enum):
+    """What triage decided to do with a completed initial campaign."""
+
+    ANALYZE = "analyze"
+    FINISH = "finish"
+    INCONCLUSIVE = "inconclusive"
+
+
 class SessionStatus(str, Enum):
     WAITING_INITIAL = "waiting_initial"
+    WAITING_TRIAGE = "waiting_triage"
     WAITING_REASONER = "waiting_reasoner"
     WAITING_FOLLOWUP = "waiting_followup"
     COMPLETED = "completed"
@@ -791,6 +800,25 @@ class SuppressionRule:
             error_types=tuple(d.get("error_types", ())),
             expires_on=d.get("expires_on"),
         )
+
+
+@dataclasses.dataclass
+class TriageDecision:
+    """The verdict of the deterministic step that runs before any reasoning.
+
+    Triage is what keeps an expensive AI turn from being spent on a campaign
+    that is incomplete, entirely suppressed, or unchanged since the last run.
+    """
+
+    outcome: TriageOutcome
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"outcome": self.outcome.value, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TriageDecision":
+        return cls(outcome=TriageOutcome(d["outcome"]), reason=d["reason"])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2188,6 +2216,7 @@ class AnalysisSession:
     submitted_experiments: int = 0
     turns: List[AnalysisTurn] = dataclasses.field(default_factory=list)
     report: Optional[ExplainReport] = None
+    triage: Optional[TriageDecision] = None
     termination_reason: str = ""
     state_revision: int = 0
     schema_version: int = 3
@@ -2211,6 +2240,7 @@ class AnalysisSession:
             "submitted_experiments": self.submitted_experiments,
             "turns": [x.to_dict() for x in self.turns],
             "report": None if self.report is None else self.report.to_dict(),
+            "triage": None if self.triage is None else self.triage.to_dict(),
             "termination_reason": self.termination_reason,
             "state_revision": self.state_revision,
         }
@@ -2224,6 +2254,7 @@ class AnalysisSession:
         if version < 3:
             raise ValueError(f"unsupported AnalysisSession schema_version: {version}")
         report = d.get("report")
+        triage = d.get("triage")
         return cls(
             session_id=d["session_id"],
             unit=WorkUnit.from_dict(d["unit"]),
@@ -2239,6 +2270,7 @@ class AnalysisSession:
             submitted_experiments=int(d.get("submitted_experiments", 0)),
             turns=[AnalysisTurn.from_dict(x) for x in d.get("turns", [])],
             report=None if report is None else ExplainReport.from_dict(report),
+            triage=None if triage is None else TriageDecision.from_dict(triage),
             termination_reason=d.get("termination_reason", ""),
             state_revision=int(d.get("state_revision", 0)),
             schema_version=version,
