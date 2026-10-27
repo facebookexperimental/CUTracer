@@ -18,11 +18,13 @@ Design notes:
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
 import math
+import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, TextIO, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional, TextIO, Tuple, Type, TypeVar, Union
 
 # ---------------------------------------------------------------------------
 # Enums (str-valued for stable JSON text)
@@ -713,6 +715,105 @@ class FindingRecord:
             count=int(d.get("count", 1)),
             raw=d.get("raw", ""),
             error_detail=d.get("error_detail", ""),
+        )
+
+
+_YMD_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_ymd_date(value: str) -> Optional[datetime.date]:
+    """Return the calendar date in ``YYYY-MM-DD`` ``value``, else ``None``.
+
+    Both halves of the check are needed: the shape test alone would accept
+    ``2026-13-45``, while ``date.fromisoformat`` alone would accept other ISO
+    spellings such as the compact ``20260815`` and the week form
+    ``2026-W33-1``. Callers store the string and rely on it denoting one exact
+    day, so anything but the plain form is rejected.
+    """
+    if not _YMD_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class SuppressionRule:
+    """A versioned reason to stop treating a class of findings as actionable.
+
+    Every field that narrows the rule is optional and empty means "any", so a
+    rule is only as broad as it is written. ``version`` is bumped whenever the
+    matcher changes so that an audit entry always names the exact rule text
+    that fired.
+    """
+
+    rule_id: str
+    version: int
+    reason: str
+    owner: str
+    kernel_pattern: Optional[str] = None
+    tools: Tuple[str, ...] = ()
+    error_types: Tuple[str, ...] = ()
+    expires_on: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # A malformed expiry would compare wrongly as a plain string and could
+        # keep hiding findings past its intended life, so reject it at the
+        # source rather than let the policy run on it.
+        if self.expires_on is not None and parse_ymd_date(self.expires_on) is None:
+            raise ValueError(
+                f"suppression rule {self.rule_id}: expires_on must be YYYY-MM-DD, "
+                f"got {self.expires_on!r}"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "version": self.version,
+            "reason": self.reason,
+            "owner": self.owner,
+            "kernel_pattern": self.kernel_pattern,
+            "tools": list(self.tools),
+            "error_types": list(self.error_types),
+            "expires_on": self.expires_on,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SuppressionRule":
+        return cls(
+            rule_id=d["rule_id"],
+            version=int(d["version"]),
+            reason=d["reason"],
+            owner=d["owner"],
+            kernel_pattern=d.get("kernel_pattern"),
+            tools=tuple(d.get("tools", ())),
+            error_types=tuple(d.get("error_types", ())),
+            expires_on=d.get("expires_on"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SuppressionDecision:
+    """Audit record naming the exact rule version that hid a finding."""
+
+    rule_id: str
+    rule_version: int
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "rule_version": self.rule_version,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SuppressionDecision":
+        return cls(
+            rule_id=d["rule_id"],
+            rule_version=int(d["rule_version"]),
+            reason=d["reason"],
         )
 
 
