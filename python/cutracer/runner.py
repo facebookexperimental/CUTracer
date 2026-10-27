@@ -68,6 +68,7 @@ class InstrumentationConfig:
     base_env: Optional[Mapping[str, str]] = None
     capture_output: bool = True
     shell: bool = False
+    use_bundled_cuda_tools: bool = True
     exact_kernel_name: Optional[str] = None
     exact_kernel_checksum: Optional[str] = None
 
@@ -300,6 +301,7 @@ def build_cutracer_env(
     kernel_timeout_s: int = 0,
     no_data_timeout_s: int = 15,
     base_env: Optional[Mapping[str, str]] = None,
+    use_bundled_cuda_tools: bool = True,
     exact_kernel_name: Optional[str] = None,
     exact_kernel_checksum: Optional[str] = None,
 ) -> dict:
@@ -387,7 +389,7 @@ def build_cutracer_env(
     # host-architecture binaries bundled in this CUTracer package. NVBit has an
     # explicit NVDISASM override but invokes cuobjdump by name, so cuobjdump is
     # intentionally provided through PATH.
-    cuda_tools = _resolve_bundled_cuda_tools()
+    cuda_tools = _resolve_bundled_cuda_tools() if use_bundled_cuda_tools else None
     if cuda_tools is not None:
         env["NVDISASM"] = str(cuda_tools.nvdisasm)
         env["PATH"] = os.pathsep.join(
@@ -452,6 +454,7 @@ def _resolve_and_build_env(
         kernel_timeout_s=config.kernel_timeout_s,
         no_data_timeout_s=config.no_data_timeout_s,
         base_env=config.base_env,
+        use_bundled_cuda_tools=config.use_bundled_cuda_tools,
     )
     return so_path, run_env
 

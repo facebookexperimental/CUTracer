@@ -271,6 +271,30 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["NVDISASM"], "/cache/aarch64/digest/bin/nvdisasm")
         self.assertEqual(env["PATH"], "/cache/aarch64/digest/bin:/usr/bin")
 
+    @patch("cutracer.runner._resolve_bundled_cuda_tools")
+    def test_preserves_explicit_pinned_cuda_tools(self, resolve_tools) -> None:
+        env = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters=None,
+            instr_categories=None,
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=1000,
+            base_env={
+                "NVDISASM": "/pinned/cuda/bin/nvdisasm",
+                "PATH": "/pinned/cuda/bin:/usr/bin",
+            },
+            use_bundled_cuda_tools=False,
+        )
+
+        resolve_tools.assert_not_called()
+        self.assertEqual(env["NVDISASM"], "/pinned/cuda/bin/nvdisasm")
+        self.assertEqual(env["PATH"], "/pinned/cuda/bin:/usr/bin")
+
 
 class PersistExtractedCudaToolsTest(unittest.TestCase):
     def _write_tools(self, directory: Path, suffix: bytes = b"v1") -> dict[str, Path]:

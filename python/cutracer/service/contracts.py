@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 from enum import Enum
 from typing import Any, Dict, List, Optional, TextIO, Type, TypeVar, Union
 
@@ -423,6 +424,19 @@ class SessionStatus(str, Enum):
     FAILED = "failed"
 
 
+_MAX_RANDOM_DELAY_NS = (1 << 32) - 2
+
+
+def _derived_reproduction_rate(completed_trials: int, reproductions: int) -> float:
+    return reproductions / completed_trials if completed_trials else 0.0
+
+
+def _reproduction_rates_match(actual: float, expected: float) -> bool:
+    # Persisted payloads may round this derived display value to three decimal
+    # places. Counts remain authoritative; reject material disagreement only.
+    return math.isclose(actual, expected, rel_tol=1e-3, abs_tol=5e-4)
+
+
 @dataclasses.dataclass
 class OracleSpec:
     """Pre-approved correctness oracle; exit 0 means the issue manifested."""
@@ -432,6 +446,20 @@ class OracleSpec:
     not_interesting_exit_codes: List[int] = dataclasses.field(
         default_factory=lambda: [1]
     )
+
+    def __post_init__(self) -> None:
+        if not self.oracle_id.strip():
+            raise ValueError("oracle_id must not be empty")
+        if not self.argv or not self.argv[0].strip():
+            raise ValueError("oracle argv must not be empty")
+        if not self.not_interesting_exit_codes:
+            raise ValueError("not_interesting_exit_codes must not be empty")
+        if any(code <= 0 or code > 255 for code in self.not_interesting_exit_codes):
+            raise ValueError("not_interesting_exit_codes must be between 1 and 255")
+        if len(set(self.not_interesting_exit_codes)) != len(
+            self.not_interesting_exit_codes
+        ):
+            raise ValueError("not_interesting_exit_codes must not contain duplicates")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -523,14 +551,24 @@ class TriggeringDelayConfig:
     completed_trials: int
     reproductions: int
     reproduction_rate: float
+    enabled_point_count: Optional[int] = None
     cutracer_version: str = ""
     toolchain_version: str = ""
 
     def __post_init__(self) -> None:
+        if self.completed_trials < 0 or self.reproductions < 0:
+            raise ValueError("trial counts must not be negative")
         if not 0.0 <= self.reproduction_rate <= 1.0:
             raise ValueError("reproduction_rate must be between 0 and 1")
         if self.reproductions > self.completed_trials:
             raise ValueError("reproductions cannot exceed completed_trials")
+        expected_rate = _derived_reproduction_rate(
+            self.completed_trials, self.reproductions
+        )
+        if not _reproduction_rates_match(self.reproduction_rate, expected_rate):
+            raise ValueError("reproduction_rate does not match trial counts")
+        if self.enabled_point_count is not None and self.enabled_point_count <= 0:
+            raise ValueError("enabled_point_count must be positive when present")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -548,6 +586,7 @@ class TriggeringDelayConfig:
             "completed_trials": self.completed_trials,
             "reproductions": self.reproductions,
             "reproduction_rate": self.reproduction_rate,
+            "enabled_point_count": self.enabled_point_count,
             "cutracer_version": self.cutracer_version,
             "toolchain_version": self.toolchain_version,
         }
@@ -556,6 +595,8 @@ class TriggeringDelayConfig:
     def from_dict(cls, d: Dict[str, Any]) -> "TriggeringDelayConfig":
         kernel = d.get("kernel")
         warpgroup_id = d.get("warpgroup_id")
+        completed_trials = int(d.get("completed_trials", 0))
+        reproductions = int(d.get("reproductions", 0))
         return cls(
             artifact=ArtifactRef.from_dict(d["artifact"]),
             work_unit_id=d["work_unit_id"],
@@ -568,9 +609,19 @@ class TriggeringDelayConfig:
             enable_prob=float(d.get("enable_prob", 1.0)),
             warpgroup_id=(None if warpgroup_id is None else int(warpgroup_id)),
             attempt_index=int(d.get("attempt_index", 0)),
-            completed_trials=int(d.get("completed_trials", 0)),
-            reproductions=int(d.get("reproductions", 0)),
-            reproduction_rate=float(d.get("reproduction_rate", 0.0)),
+            completed_trials=completed_trials,
+            reproductions=reproductions,
+            reproduction_rate=float(
+                d.get(
+                    "reproduction_rate",
+                    _derived_reproduction_rate(completed_trials, reproductions),
+                )
+            ),
+            enabled_point_count=(
+                None
+                if d.get("enabled_point_count") is None
+                else int(d["enabled_point_count"])
+            ),
             cutracer_version=d.get("cutracer_version", ""),
             toolchain_version=d.get("toolchain_version", ""),
         )
@@ -688,8 +739,23 @@ class StressOptions:
         # completeness value from an unexecutable legacy payload.
         if not self.delay_ladder_ns:
             raise ValueError("stress delay ladder must not be empty")
+        if any(
+            delay_ns < 1 or delay_ns > _MAX_RANDOM_DELAY_NS
+            for delay_ns in self.delay_ladder_ns
+        ):
+            raise ValueError("stress delays must be between 1 and UINT32_MAX - 1")
+        if len(set(self.delay_ladder_ns)) != len(self.delay_ladder_ns):
+            raise ValueError("stress delay ladder must not contain duplicates")
         if self.attempts_per_delay <= 0:
             raise ValueError("stress attempts_per_delay must be positive")
+        if not 0.0 < self.enable_prob <= 1.0:
+            raise ValueError("stress enable_prob must be greater than 0 and at most 1")
+        if any(
+            warpgroup_id < 0 or warpgroup_id > 7 for warpgroup_id in self.warpgroup_ids
+        ):
+            raise ValueError("stress warpgroup IDs must be between 0 and 7")
+        if len(set(self.warpgroup_ids)) != len(self.warpgroup_ids):
+            raise ValueError("stress warpgroup IDs must not contain duplicates")
 
     @property
     def planned_trials(self) -> int:
@@ -1059,6 +1125,23 @@ class StressTestResult:
         default=ExperimentKind.RANDOM_DELAY_STRESS, init=False
     )
 
+    def __post_init__(self) -> None:
+        counts = (
+            self.completed_trials,
+            self.reproductions,
+            self.infra_errors,
+            self.planned_trials,
+            self.timed_out_trials,
+        )
+        if any(count < 0 for count in counts):
+            raise ValueError("stress result counts must not be negative")
+        if self.reproductions > self.completed_trials:
+            raise ValueError("reproductions cannot exceed completed_trials")
+
+    @property
+    def reproduction_rate(self) -> float:
+        return _derived_reproduction_rate(self.completed_trials, self.reproductions)
+
     @property
     def has_positive_signal(self) -> bool:
         return (
@@ -1096,6 +1179,7 @@ class StressTestResult:
             "completed_trials": self.completed_trials,
             "reproductions": self.reproductions,
             "infra_errors": self.infra_errors,
+            "reproduction_rate": self.reproduction_rate,
             "provenance": self.provenance.to_dict(),
             "triggering_config": (
                 None
@@ -1115,7 +1199,7 @@ class StressTestResult:
     def from_dict(cls, d: Dict[str, Any]) -> "StressTestResult":
         config = d.get("triggering_config")
         log = d.get("log")
-        return cls(
+        result = cls(
             experiment_id=d["experiment_id"],
             execution_status=ExecutionStatus(d["execution_status"]),
             outcome=StressOutcome(d["outcome"]),
@@ -1136,6 +1220,11 @@ class StressTestResult:
             ),
             unattributed_reproductions=int(d.get("unattributed_reproductions", 0)),
         )
+        if "reproduction_rate" in d and not _reproduction_rates_match(
+            float(d["reproduction_rate"]), result.reproduction_rate
+        ):
+            raise ValueError("reproduction_rate does not match trial counts")
+        return result
 
 
 class TraceAnalysisSeverity(str, Enum):
