@@ -444,6 +444,7 @@ class TriageOutcome(str, Enum):
 class BaselineVerdict(str, Enum):
     """How a scope's findings compare with the last complete campaign."""
 
+    NOT_EVALUATED = "not_evaluated"
     NEW = "new"
     UNCHANGED = "unchanged"
     RESOLVED = "resolved"
@@ -863,6 +864,88 @@ class TriageDecision:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TriageDecision":
         return cls(outcome=TriageOutcome(d["outcome"]), reason=d["reason"])
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopeTriageSnapshot:
+    """Auditable completeness and baseline result for one declared scope."""
+
+    scope: ScopeId
+    completeness: ResultCompleteness
+    baseline_verdict: BaselineVerdict = BaselineVerdict.NOT_EVALUATED
+    observed_keys: Tuple[str, ...] = ()
+    new_keys: Tuple[str, ...] = ()
+    resolved_keys: Tuple[str, ...] = ()
+    unchanged_keys: Tuple[str, ...] = ()
+    baseline_recorded: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scope": self.scope.to_dict(),
+            "completeness": self.completeness.value,
+            "baseline_verdict": self.baseline_verdict.value,
+            "observed_keys": list(self.observed_keys),
+            "new_keys": list(self.new_keys),
+            "resolved_keys": list(self.resolved_keys),
+            "unchanged_keys": list(self.unchanged_keys),
+            "baseline_recorded": self.baseline_recorded,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ScopeTriageSnapshot":
+        return cls(
+            scope=ScopeId.from_dict(d["scope"]),
+            completeness=ResultCompleteness(d["completeness"]),
+            baseline_verdict=BaselineVerdict(
+                d.get("baseline_verdict", BaselineVerdict.NOT_EVALUATED.value)
+            ),
+            observed_keys=tuple(d.get("observed_keys", ())),
+            new_keys=tuple(d.get("new_keys", ())),
+            resolved_keys=tuple(d.get("resolved_keys", ())),
+            unchanged_keys=tuple(d.get("unchanged_keys", ())),
+            baseline_recorded=_as_bool(d.get("baseline_recorded", False)),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TriageSnapshot:
+    """Deterministic campaign facts retained independently of its decision."""
+
+    scopes: Tuple[ScopeTriageSnapshot, ...] = ()
+    stress_completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
+
+    def __post_init__(self) -> None:
+        keys = [scope.scope.key for scope in self.scopes]
+        if len(keys) != len(set(keys)):
+            raise ValueError("triage snapshot scopes must be unique")
+
+    @property
+    def initial_evidence_complete(self) -> bool:
+        scope_complete = bool(self.scopes) and all(
+            scope.completeness == ResultCompleteness.COMPLETE for scope in self.scopes
+        )
+        stress_complete = self.stress_completeness in (
+            ResultCompleteness.COMPLETE,
+            ResultCompleteness.COMPLETE_EARLY,
+        )
+        return scope_complete and stress_complete
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scopes": [scope.to_dict() for scope in self.scopes],
+            "stress_completeness": self.stress_completeness.value,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TriageSnapshot":
+        return cls(
+            scopes=tuple(
+                ScopeTriageSnapshot.from_dict(scope) for scope in d.get("scopes", ())
+            ),
+            stress_completeness=ResultCompleteness(
+                d.get("stress_completeness", ResultCompleteness.UNKNOWN.value)
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
