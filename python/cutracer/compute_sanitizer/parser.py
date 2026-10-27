@@ -1,10 +1,18 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""Parse NVIDIA Compute Sanitizer racecheck output into neutral records.
+"""Parse NVIDIA Compute Sanitizer output into neutral records.
 
 This module is part of the OSS package and deliberately has no dependency on
 CUTracer's internal analysis taxonomy.  Consumers adapt the parsed records to
 their own finding and reporting types.
+
+Two layers are provided:
+
+* the racecheck-specific layer (:func:`parse_racecheck_log`), which recovers
+  the paired accesses that only racecheck reports;
+* the tool-agnostic checker layer (:func:`parse_checker_log`), which covers all
+  four tools with one issue/site/summary shape so that downstream evidence
+  conversion does not need a per-tool branch.
 """
 
 from __future__ import annotations
@@ -32,6 +40,16 @@ class RacecheckParseDiagnostic(str, Enum):
     UNPARSED_FINDING = "unparsed_finding"
     SUMMARY_COUNT_MISMATCH = "summary_count_mismatch"
     SUMMARY_FINDING_MISMATCH = "summary_finding_mismatch"
+    INTERNAL_TOOL_ERROR = "internal_tool_error"
+
+
+class CheckerTool(str, Enum):
+    """The four Compute Sanitizer tools this parser understands."""
+
+    INITCHECK = "initcheck"
+    MEMCHECK = "memcheck"
+    RACECHECK = "racecheck"
+    SYNCCHECK = "synccheck"
 
 
 @dataclass(frozen=True)
@@ -128,9 +146,10 @@ class RacecheckParseResult:
     def is_complete(self) -> bool:
         """Whether the log has a single self-consistent summary and findings.
 
-        Truncated output stays complete: racecheck caps how many hazard blocks
-        it prints, but the summary counts remain authoritative, so the run is
-        still a proven positive rather than an unknown one.
+        Once at least one report is parsed, truncated output stays complete:
+        racecheck's summary remains authoritative for the omitted remainder.
+        A positive summary with no parsed report is still incomplete because
+        truncation alone cannot prove what kind of finding was omitted.
         """
         return self.summary is not None and not self.diagnostics
 
@@ -154,6 +173,7 @@ _SUMMARY_RE = re.compile(
     r"\((?P<errors>\d+) errors?, (?P<warnings>\d+) warnings?\)$"
 )
 _TRUNCATION_RE = re.compile(r"^Warning: Maximum number of hazards reached")
+_INTERNAL_TOOL_ERROR_PREFIX = "Internal Sanitizer Error:"
 _INVALID_ACCESS_RE = re.compile(
     r"^Potential invalid __shared__ (?P<type>\w+) of size (?P<size>\d+) bytes\s*$"
 )
@@ -376,6 +396,10 @@ class _RacecheckParser:
         body = _sanitizer_body(line)
         if body is None:
             return
+        if body.startswith(_INTERNAL_TOOL_ERROR_PREFIX):
+            self.flush()
+            self.diagnose(RacecheckParseDiagnostic.INTERNAL_TOOL_ERROR)
+            return
         if self.consume_summary(body):
             return
         if self.consume_auxiliary_block(body):
@@ -439,3 +463,361 @@ def parse_racecheck_log(text: str) -> RacecheckParseResult:
     for line in text.splitlines():
         parser.consume(line)
     return parser.finish()
+
+
+# ---------------------------------------------------------------------------
+# Tool-agnostic checker layer
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CheckerSite:
+    """One code location attributed to an issue.
+
+    ``file``/``line`` are absent whenever the sanitizer could not resolve the
+    instruction back to source, which is common for kernels compiled without
+    line info.  Consumers must treat the symbol as the only always-present
+    identity.
+    """
+
+    symbol: str
+    offset: Optional[str] = None
+    file: Optional[str] = None
+    line: Optional[int] = None
+
+    @property
+    def location(self) -> Optional[str]:
+        """``file:line`` when the sanitizer resolved one, else ``None``."""
+        if self.file is None or self.line is None:
+            return None
+        return f"{self.file}:{self.line}"
+
+
+@dataclass(frozen=True)
+class CheckerIssue:
+    """One diagnostic block, shaped identically for all four tools."""
+
+    message: str
+    sites: List[CheckerSite] = field(default_factory=list)
+    severity: RacecheckSeverity = RacecheckSeverity.ERROR
+    hazards: Optional[int] = None
+    raw_block: str = ""
+
+    @property
+    def primary_site(self) -> Optional[CheckerSite]:
+        """The site the sanitizer attributed the issue to, if it reported one."""
+        return self.sites[0] if self.sites else None
+
+
+@dataclass(frozen=True)
+class CheckerSummary:
+    """Aggregate counts from a tool's summary line.
+
+    ``total_hazards``/``warnings`` are racecheck-only; the error-summary tools
+    report a single error count.  ``not_printed`` records how many diagnostics
+    the tool suppressed, which is what makes the printed block count a lower
+    bound rather than the truth.
+    """
+
+    errors: int
+    warnings: int = 0
+    total_hazards: int = 0
+    not_printed: Optional[int] = None
+    raw: str = ""
+
+    @property
+    def is_positive(self) -> bool:
+        return self.errors > 0 or self.warnings > 0 or self.total_hazards > 0
+
+    @property
+    def is_zero(self) -> bool:
+        return not self.is_positive
+
+
+@dataclass(frozen=True)
+class CheckerParseResult:
+    """Structured output from one log of any Compute Sanitizer tool."""
+
+    tool: CheckerTool
+    issues: List[CheckerIssue] = field(default_factory=list)
+    summary: Optional[CheckerSummary] = None
+    diagnostics: List[RacecheckParseDiagnostic] = field(default_factory=list)
+    output_truncated: bool = False
+
+    @property
+    def is_complete(self) -> bool:
+        """Whether the log proves what the run did.
+
+        Output truncation does not make a run incomplete: the summary counts
+        stay authoritative even when the tool stops printing blocks.  Only a
+        missing, malformed, or self-contradictory summary does.
+        """
+        return self.summary is not None and not self.diagnostics
+
+
+_ERROR_SUMMARY_RE = re.compile(r"^ERROR SUMMARY: (?P<errors>\d+) errors?$")
+_ERROR_NOT_PRINTED_RE = re.compile(
+    r"^ERROR SUMMARY: (?P<count>\d+) errors? were not printed\b"
+)
+_SITE_RE = re.compile(r"^at (?P<site>.+)$")
+_SITE_SOURCE_RE = re.compile(r"^(?P<symbol>.*?)\s+in (?P<file>.+?):(?P<line>\d+)$")
+_HAZARD_SUFFIX_RE = re.compile(r"\s*\[(?P<hazards>\d+) hazards?\]$")
+
+_MEMCHECK_MESSAGE_RE = re.compile(
+    r"^(?:Invalid|Misaligned|Out of bounds|Program hit|Leaked) "
+)
+# CUDA API errors and leaks are raised on the host, outside any kernel, so the
+# sanitizer never attributes them to a device ``at`` site.
+_MEMCHECK_HOST_MESSAGE_RE = re.compile(r"^(?:Program hit|Leaked) ")
+_MEMCHECK_ADDRESS_SUFFIX_RE = re.compile(r"\s+at 0x[0-9a-fA-F]+$")
+
+
+def _parse_site(raw: str) -> CheckerSite:
+    """Split ``symbol+0xOFFSET [in file:line]`` into its parts.
+
+    The symbol is a demangled C++ name and can itself contain spaces, angle
+    brackets, parentheses, and ``+`` characters, so the offset is taken from
+    the right rather than by splitting on the first delimiter.
+    """
+    text = _HAZARD_SUFFIX_RE.sub("", raw.strip())
+    file: Optional[str] = None
+    line: Optional[int] = None
+    source_match = _SITE_SOURCE_RE.match(text)
+    if source_match:
+        text = source_match["symbol"].strip()
+        file = source_match["file"]
+        line = int(source_match["line"])
+
+    symbol = text
+    offset: Optional[str] = None
+    offset_match = re.search(r"\+0x[0-9a-fA-F]+$", text)
+    if offset_match is not None and offset_match.start() > 0:
+        symbol = text[: offset_match.start()]
+        offset = text[offset_match.start() + 1 :]
+    return CheckerSite(symbol=symbol, offset=offset, file=file, line=line)
+
+
+def _checker_message(tool: CheckerTool, body: str) -> Optional[str]:
+    """Return the normalized issue message in ``body``, if it starts one."""
+    if tool == CheckerTool.INITCHECK:
+        return body if body.startswith("Uninitialized ") else None
+    if tool == CheckerTool.SYNCCHECK:
+        if not body.startswith("Barrier error detected."):
+            return None
+        return body.removesuffix(".")
+    if tool == CheckerTool.MEMCHECK:
+        if not _MEMCHECK_MESSAGE_RE.match(body):
+            return None
+        # Memcheck appends the faulting address to the message; the address is
+        # per-run noise and would defeat any grouping by issue kind.
+        return _MEMCHECK_ADDRESS_SUFFIX_RE.sub("", body)
+    return None
+
+
+def _checker_issue_at(
+    tool: CheckerTool,
+    bodies: List[Optional[str]],
+    index: int,
+) -> Optional[CheckerIssue]:
+    body = bodies[index]
+    if body is None:
+        return None
+    message = _checker_message(tool, body)
+    if message is None:
+        return None
+
+    sites: List[CheckerSite] = []
+    raw_lines = [body]
+    sanitizer_lines = 0
+    for position in range(index + 1, len(bodies)):
+        following = bodies[position]
+        if following is None:
+            continue
+        sanitizer_lines += 1
+        if sanitizer_lines > _SITE_LOOKAHEAD:
+            break
+        if (
+            _checker_message(tool, following) is not None
+            or "ERROR SUMMARY:" in following
+        ):
+            break
+        site_match = _SITE_RE.match(following)
+        if site_match:
+            sites.append(_parse_site(site_match["site"]))
+        raw_lines.append(following)
+    return CheckerIssue(
+        message=message,
+        sites=sites,
+        raw_block="\n".join(raw_lines),
+    )
+
+
+@dataclass
+class _ErrorCheckerParser:
+    tool: CheckerTool
+    issues: List[CheckerIssue] = field(default_factory=list)
+    diagnostics: List[RacecheckParseDiagnostic] = field(default_factory=list)
+    summary: Optional[CheckerSummary] = None
+    summary_markers: int = 0
+    not_printed: Optional[int] = None
+    output_truncated: bool = False
+
+    def diagnose(self, issue: RacecheckParseDiagnostic) -> None:
+        if issue not in self.diagnostics:
+            self.diagnostics.append(issue)
+
+    def consume_summary(self, body: str) -> bool:
+        if "ERROR SUMMARY:" in body:
+            truncated_match = _ERROR_NOT_PRINTED_RE.match(body)
+            if truncated_match:
+                # A companion note to the real summary, not a second summary.
+                self.output_truncated = True
+                self.not_printed = int(truncated_match["count"])
+                return True
+            self.summary_markers += 1
+            summary_match = _ERROR_SUMMARY_RE.match(body)
+            if summary_match:
+                self.summary = CheckerSummary(
+                    errors=int(summary_match["errors"]), raw=body
+                )
+            else:
+                self.diagnose(RacecheckParseDiagnostic.MALFORMED_SUMMARY)
+            return True
+        return False
+
+    def consume_issue(
+        self,
+        bodies: List[Optional[str]],
+        index: int,
+    ) -> None:
+        issue = _checker_issue_at(self.tool, bodies, index)
+        if issue is None:
+            return
+        if not issue.sites and not _MEMCHECK_HOST_MESSAGE_RE.match(issue.message):
+            self.diagnose(RacecheckParseDiagnostic.INCOMPLETE_FINDING)
+        self.issues.append(issue)
+
+    def finish(self) -> CheckerParseResult:
+        if self.summary_markers == 0:
+            self.diagnose(RacecheckParseDiagnostic.MISSING_SUMMARY)
+        elif self.summary_markers > 1:
+            self.diagnose(RacecheckParseDiagnostic.MULTIPLE_SUMMARIES)
+
+        if self.summary is not None:
+            if self.not_printed is not None:
+                self.summary = CheckerSummary(
+                    errors=self.summary.errors,
+                    not_printed=self.not_printed,
+                    raw=self.summary.raw,
+                )
+            printed_nothing = (
+                self.summary.is_positive
+                and not self.issues
+                and not self.output_truncated
+            )
+            if printed_nothing or (self.summary.is_zero and self.issues):
+                self.diagnose(RacecheckParseDiagnostic.SUMMARY_FINDING_MISMATCH)
+
+        return CheckerParseResult(
+            tool=self.tool,
+            issues=self.issues,
+            summary=self.summary,
+            diagnostics=self.diagnostics,
+            output_truncated=self.output_truncated,
+        )
+
+
+def _parse_error_checker_log(tool: CheckerTool, text: str) -> CheckerParseResult:
+    """Parse the tools that report a single ``ERROR SUMMARY`` line."""
+    bodies: List[Optional[str]] = [_sanitizer_body(line) for line in text.splitlines()]
+    parser = _ErrorCheckerParser(tool)
+    for index, body in enumerate(bodies):
+        if body is None:
+            continue
+        if body.startswith(_INTERNAL_TOOL_ERROR_PREFIX):
+            parser.diagnose(RacecheckParseDiagnostic.INTERNAL_TOOL_ERROR)
+            continue
+        if parser.consume_summary(body):
+            continue
+        parser.consume_issue(bodies, index)
+    return parser.finish()
+
+
+def _racecheck_as_checker_result(text: str) -> CheckerParseResult:
+    """Project the racecheck-specific result onto the shared checker shape."""
+    parsed = parse_racecheck_log(text)
+    issues: List[CheckerIssue] = []
+    for finding in parsed.findings:
+        access_kinds = finding.access_kinds
+        sites = [
+            CheckerSite(
+                symbol=access.function,
+                offset=access.offset,
+                file=access.file,
+                line=access.line,
+            )
+            for access in finding.accesses
+        ]
+        issues.append(
+            CheckerIssue(
+                message=(
+                    f"Race reported between {access_kinds[0]} access"
+                    if access_kinds
+                    else "Race reported"
+                ),
+                sites=sites,
+                severity=finding.severity,
+                hazards=finding.max_hazards,
+                raw_block=finding.raw_block,
+            )
+        )
+    for invalid in parsed.invalid_accesses:
+        access = invalid.access
+        issues.append(
+            CheckerIssue(
+                message=invalid.message,
+                sites=(
+                    []
+                    if access is None
+                    else [
+                        CheckerSite(
+                            symbol=access.function,
+                            offset=access.offset,
+                            file=access.file or None,
+                            line=access.line or None,
+                        )
+                    ]
+                ),
+                raw_block=invalid.raw_block,
+            )
+        )
+    summary = (
+        None
+        if parsed.summary is None
+        else CheckerSummary(
+            errors=parsed.summary.errors,
+            warnings=parsed.summary.warnings,
+            total_hazards=parsed.summary.total_hazards,
+            raw=parsed.summary.raw,
+        )
+    )
+    return CheckerParseResult(
+        tool=CheckerTool.RACECHECK,
+        issues=issues,
+        summary=summary,
+        diagnostics=list(parsed.diagnostics),
+        output_truncated=parsed.output_truncated,
+    )
+
+
+def parse_checker_log(tool: CheckerTool, text: str) -> CheckerParseResult:
+    """Parse any Compute Sanitizer tool's stdout into one neutral shape.
+
+    Racecheck keeps its richer paired-access parse for consumers that need the
+    conflicting accesses; this entry point projects it onto the same
+    issue/site/summary shape the other three tools produce so that evidence
+    conversion stays tool-agnostic.
+    """
+    if tool == CheckerTool.RACECHECK:
+        return _racecheck_as_checker_result(text)
+    return _parse_error_checker_log(tool, text)
