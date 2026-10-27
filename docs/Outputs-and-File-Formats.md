@@ -48,7 +48,7 @@ Each line in an NDJSON trace file is a self-contained JSON object. The `type` fi
 | `"mem_addr_trace"` | `mem_addr_trace` | `addrs[32]`, `ipoint: "B"`, optional DSM attribution fields |
 | `"mem_value_trace"` | `mem_value_trace` | `addrs[32]`, `values[32][N]`, `mem_space`, `is_load`, `access_size`, `ipoint: "A"` |
 | `"opcode_only"` | `opcode_only` | (common fields only) |
-| `"tma_trace"` | `tma_trace` | `desc_addr`, `desc_raw[16]` |
+| `"tma_trace"` | `tma_trace` | `tma_param_size`, `tma_transfer_info`, `desc_addr` (older traces: `desc_raw[16]`) |
 
 All records share common fields: `ctx`, `grid_launch_id`, `cta`, `warp`, `opcode_id`, `pc`, `sass`, `trace_index`, `timestamp`.
 

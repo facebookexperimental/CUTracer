@@ -357,3 +357,27 @@ void instrument_memory_value_trace(Instr* instr, int opcode_id, CTXstate* ctx_st
     nvbit_add_call_arg_reg_val(instr, reg_num, true);
   }
 }
+
+/**
+ * @brief Instruments a TMA instruction to capture its TMA parameter handle.
+ *
+ * Injects an `instrument_tma` call before the TMA instruction. NVBit's
+ * nvbit_add_call_arg_tma_param_handle_and_size() pushes a (uint8_t* handle,
+ * uint32_t size) pair into the device function and handles every TMA variant
+ * (TILED, IM2COL, MULTICAST, etc.) without manual UR extraction.
+ */
+void instrument_tma_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, CUcontext ctx) {
+  nvbit_insert_call(instr, "instrument_tma", IPOINT_BEFORE);
+  nvbit_add_call_arg_guard_pred_val(instr);
+  nvbit_add_call_arg_const_val32(instr, opcode_id);
+
+  // Pushes 2 args: uint8_t* tma_param_handle and uint32_t size.
+  nvbit_add_call_arg_tma_param_handle_and_size(instr, ctx);
+
+  nvbit_add_call_arg_const_val64(instr, (uint64_t)ctx_state->channel_dev);
+  nvbit_add_call_arg_launch_val64(instr, 0);
+  nvbit_add_call_arg_const_val64(instr, instr->getOffset());
+
+  const char* sass = instr->getSass();
+  loprintf_v("TMA: pc=0x%lx sass='%s'\n", instr->getOffset(), sass ? sass : "unknown");
+}

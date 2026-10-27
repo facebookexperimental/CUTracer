@@ -20,7 +20,7 @@ CUTracer is configured entirely through environment variables. This page is the 
 | `reg_trace` | Medium 🔬 | Collects per-thread register values including uniform registers |
 | `mem_addr_trace` | Heavy 🧠 | Collects 32-lane memory access addresses |
 | `mem_value_trace` | Heaviest 💾 | Collects memory addresses + values (up to 128-bit per lane), plus memory space, load/store direction, and access width |
-| `tma_trace` | Medium 📦 | TMA descriptor tracing for UTMALDG/UTMASTG/UTMAREDG instructions on Hopper/Blackwell GPUs |
+| `tma_trace` | Medium 📦 | TMA transfer tracing (NVBit-parsed TMA parameter handle) for TMA instructions on Hopper/Blackwell GPUs |
 | `random_delay` | Low 🔀 | Injects delays before synchronization instructions for data race detection |
 
 > ⚠️ Enabling both `mem_addr_trace` and `mem_value_trace` triggers a warning. `mem_value_trace` already includes address information, so there is usually no need to enable both.

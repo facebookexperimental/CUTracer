@@ -33,11 +33,10 @@
 - ⚠️ `mem_value_trace` already includes address information; usually no need to enable both `mem_addr_trace` and `mem_value_trace`
 
 ## tma_trace (medium) 📦
-- Emits: 128-byte TMA descriptor content and descriptor address
-- Targets: `UTMALDG` (TMA load), `UTMASTG` (TMA store), `UTMAREDG` (TMA reduction)
+- Emits: `tma_param_size`, `tma_transfer_info` (the TMA parameter handle parsed on the host by NVBit's `nvbit_parse_tma_transfer_info()`: bulk/tensor kind, source and destination memory spaces, shared-memory data and mbarrier addresses, tiled tensor map) and `desc_addr` (stable per-tensor key)
+- Targets: instructions NVBit classifies as TMA (`isTMAMem()` / `isTMATensor()`): `UTMALDG`, `UTMASTG`, `UTMAREDG`, `UTMAPF`, `UBLKCP`, `UBLKRED`, `UBLKPF`
 - Use for: analyzing Tensor Memory Access patterns on Hopper (sm_90) and Blackwell (sm_100+) GPUs
 - Instrument via: `CUTRACER_INSTRUMENT=tma_trace`
-- Note: OSS build provides a stub; full implementation is internal
 
 ## random_delay (low overhead) 🔀
 - Injects a fixed delay before synchronization instructions (mbarrier try_wait, mbarrier arrive, TMA loads, warpgroup depbar)

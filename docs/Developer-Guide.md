@@ -1,6 +1,6 @@
 ## Code map 🗺️
 - `src/cutracer.cu`: NVBit callbacks, kernel filtering, SASS iteration, instrumentation dispatch, kernel-events writer wiring
-- `src/instrument.cu`: NVBit call injection helpers (opcode/reg/mem)
+- `src/instrument.cu`: NVBit call injection helpers (opcode/reg/mem/tma)
 - `src/inject_funcs.cu`: device-side `instrument_*` functions pushing packets
 - `src/analysis.cu`: `recv_thread_fun`, analysis dispatch, histogram CSV dump
 - `src/env_config.cu`: env parsing, forcing modes, filters, intervals
@@ -9,7 +9,6 @@
 - `src/trace_writer.cpp`: NDJSON / Zstd / CLP writer backend (also used by the kernel-events stream)
 - `src/delay_inject_config.cu`: parsing/serialization of the delay config JSON for the `random_delay` analysis (dump/replay)
 - `src/tool_func/flush_channel.cu`: precompiled NVBit device function used to flush the GPU→CPU channel; built into a `.fatbin` and embedded via `bin2c`
-- `src/fb/`: internal-only sources, only compiled when the directory is present (see Makefile `FB_*` variables); external builds skip it
 - `include/`: public headers for types and interfaces
 
 ## Add a new analysis 🧩

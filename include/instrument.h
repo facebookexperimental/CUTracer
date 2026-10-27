@@ -80,6 +80,20 @@ void instrument_memory_addr_trace(Instr* instr, int opcode_id, CTXstate* ctx_sta
 void instrument_memory_value_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, int mref_idx, int mem_space);
 
 /**
+ * @brief Insert TMA tracing instrumentation
+ *
+ * Pushes the TMA parameter handle and its size into the injected device
+ * function via NVBit's nvbit_add_call_arg_tma_param_handle_and_size(). The
+ * host side parses the handle with nvbit_parse_tma_transfer_info().
+ *
+ * @param instr The TMA instruction to instrument
+ * @param opcode_id The opcode identifier for this instruction
+ * @param ctx_state The context state containing channel information
+ * @param ctx The CUDA context (needed by nvbit_add_call_arg_tma_param_handle_and_size)
+ */
+void instrument_tma_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, CUcontext ctx);
+
+/**
  * @brief Instruments an instruction to inject a fixed delay.
  *
  * Inserts a call to the `instrument_delay` device function before the
@@ -183,29 +197,5 @@ static const std::vector<const char*> DELAY_INJECTION_PATTERNS = {
  * @return true if the instruction matches any delay injection pattern
  */
 bool shouldInjectDelay(Instr* instr, const std::vector<const char*>& patterns);
-
-// Include internal TMA instrumentation if available, otherwise provide stubs
-#if __has_include("fb/instrument_fb.h")
-#include "fb/instrument_fb.h"
-#else
-
-/**
- * @brief Instrument a TMA instruction for tracing.
- *
- * OSS stub - does nothing.
- *
- * @param instr The instruction to instrument
- * @param opcode_id The opcode identifier
- * @param ctx_state The context state
- * @param ctx The CUDA context
- */
-inline void instrument_tma_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, CUcontext ctx) {
-  (void)instr;
-  (void)opcode_id;
-  (void)ctx_state;
-  (void)ctx;
-}
-
-#endif  // __has_include
 
 #endif /* INSTRUMENT_H */

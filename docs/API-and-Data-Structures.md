@@ -103,7 +103,7 @@ Groups operand data for instrumentation functions:
 - `instrument_register_trace(instr, opcode_id, ctx_state, operands)`
 - `instrument_memory_addr_trace(instr, opcode_id, ctx_state, mref_idx)`
 - `instrument_memory_value_trace(instr, opcode_id, ctx_state, mref_idx, mem_space)`
-- `instrument_tma_trace(instr, opcode_id, ctx_state, operands)` — OSS build provides a stub; full implementation is internal
+- `instrument_tma_trace(instr, opcode_id, ctx_state, ctx)`
 - `instrument_delay_injection(instr, delay_ns)`
 - `shouldInjectDelay(instr, patterns)` → `bool` — checks SASS against `DELAY_INJECTION_PATTERNS`
 

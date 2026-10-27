@@ -345,6 +345,76 @@ extern "C" __device__ __noinline__ void instrument_mem_value(int pred, int opcod
 }
 
 /**
+ * @brief Device function to trace a TMA (Tensor Memory Accelerator) access.
+ *
+ * Captures the runtime-provided TMA parameter handle for UBLKCP/UBLKPF/UBLKRED/
+ * UTMALDG/UTMAPF/UTMAREDG/UTMASTG. The handle bytes are forwarded to the host
+ * via the channel; parsing happens on the CPU side using
+ * nvbit_parse_tma_transfer_info().
+ *
+ * NVBit passes the handle pointer as a 64-bit value, so we receive it as
+ * `uint64_t` and cast to `uint8_t*` inside the function.
+ *
+ * @param pred Guard predicate value
+ * @param opcode_id The opcode identifier for this instruction
+ * @param tma_param_handle TMA parameter handle pointer (uint8_t*)
+ * @param tma_param_size Size of the handle buffer in bytes
+ * @param pchannel_dev Pointer to the channel device
+ * @param kernel_launch_id Global kernel launch identifier
+ * @param pc Program counter (instruction offset)
+ */
+extern "C" __device__ __noinline__ void instrument_tma(int pred, int opcode_id, uint64_t tma_param_handle,
+                                                       uint32_t tma_param_size, uint64_t pchannel_dev,
+                                                       uint64_t kernel_launch_id, uint64_t pc) {
+  if (!pred) {
+    return;
+  }
+
+  int active_mask = __ballot_sync(__activemask(), 1);
+  const int laneid = get_laneid();
+  const int first_laneid = __ffs(active_mask) - 1;
+
+  // The TMA handle is uniform across the warp — only the first active lane
+  // needs to push the record.
+  if (first_laneid != laneid) {
+    return;
+  }
+
+  tma_access_t ta;
+  ta.header.type = MSG_TYPE_TMA_ACCESS;
+
+  int4 cta = get_ctaid();
+  ta.cta_id_x = cta.x;
+  ta.cta_id_y = cta.y;
+  ta.cta_id_z = cta.z;
+  ta.warp_id = get_global_warp_id();
+  ta.opcode_id = opcode_id;
+  ta.kernel_launch_id = kernel_launch_id;
+  ta.pc = pc;
+  ta.active_mask = static_cast<uint32_t>(active_mask);
+
+  uint32_t copy_size = tma_param_size;
+  if (copy_size > TMA_PARAM_HANDLE_MAX_BYTES) {
+    copy_size = TMA_PARAM_HANDLE_MAX_BYTES;
+  }
+  ta.tma_param_size = copy_size;
+  memset(ta.tma_param_handle_raw, 0, sizeof(ta.tma_param_handle_raw));
+  if (tma_param_handle != 0 && copy_size > 0) {
+    memcpy(ta.tma_param_handle_raw, reinterpret_cast<uint8_t*>(tma_param_handle), copy_size);
+  }
+
+  // Legacy fields (no longer populated by GPU side; left zeroed for binary
+  // compatibility with the old wire format).
+  ta.desc_addr = 0;
+  for (int i = 0; i < 16; i++) {
+    ta.desc_raw[i] = 0;
+  }
+
+  ChannelDev* channel_dev = (ChannelDev*)pchannel_dev;
+  channel_dev->push(&ta, sizeof(tma_access_t));
+}
+
+/**
  * @brief Device function to inject delay before any instrumented instruction.
  *
  * Injects a nanosleep delay before an instruction to expose potential race

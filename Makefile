@@ -105,22 +105,12 @@ INJECT_FUNCS_OBJ := $(OBJ_DIR)/inject_funcs.o
 CU_SRCS := $(filter-out $(INJECT_FUNCS_SRC),$(wildcard $(SRC_DIR)/*.cu))
 CPP_SRCS := $(wildcard $(SRC_DIR)/*.cpp)
 
-# Internal fb/ source files (only compiled if fb/ directory exists)
-FB_SRC_DIR := $(SRC_DIR)/fb
-FB_CU_SRCS := $(wildcard $(FB_SRC_DIR)/*.cu)
-# Separate inject_funcs_fb.cu from other fb/ files (needs special flags)
-FB_INJECT_FUNCS_SRC := $(FB_SRC_DIR)/inject_funcs_fb.cu
-FB_INJECT_FUNCS_OBJ := $(if $(wildcard $(FB_INJECT_FUNCS_SRC)),$(OBJ_DIR)/fb_inject_funcs_fb.o,)
-FB_REGULAR_CU_SRCS := $(filter-out $(FB_INJECT_FUNCS_SRC),$(FB_CU_SRCS))
-FB_REGULAR_OBJS := $(patsubst $(FB_SRC_DIR)/%.cu,$(OBJ_DIR)/fb_%.o,$(FB_REGULAR_CU_SRCS))
-FB_OBJS := $(FB_REGULAR_OBJS) $(FB_INJECT_FUNCS_OBJ)
-
 # Object files
 REGULAR_OBJS := $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.o,$(CU_SRCS))
 CPP_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(CPP_SRCS))
 
-# All objects (regular + inject_funcs + cpp + fb)
-OBJS := $(REGULAR_OBJS) $(INJECT_FUNCS_OBJ) $(CPP_OBJS) $(FB_OBJS)
+# All objects (regular + inject_funcs + cpp)
+OBJS := $(REGULAR_OBJS) $(INJECT_FUNCS_OBJ) $(CPP_OBJS)
 
 # Tool function sources (precompiled fatbin for flush_channel)
 TOOL_FUNC_DIR := $(SRC_DIR)/tool_func
@@ -182,14 +172,6 @@ $(OBJ_DIR)/cubin_identity.o: $(PICOSHA2_PATH)/picosha2.h
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) -std=c++17 $(INCLUDES) -Wall $(DEBUG_FLAGS) -fPIC -c $< -o $@
-
-# Compilation rule for internal fb/ CUDA files (only if fb/ directory exists)
-$(OBJ_DIR)/fb_%.o: $(FB_SRC_DIR)/%.cu
-	$(NVCC) -dc -c -std=c++17 $(INCLUDES) -Xptxas -cloning=no -Wno-deprecated-gpu-targets -Xcompiler -Wall -arch=$(ARCH) $(DEBUG_FLAGS) -Xcompiler -fPIC $< -o $@
-
-# Special rule for inject_funcs_fb.cu (same flags as inject_funcs.cu for NVBit device functions)
-$(OBJ_DIR)/fb_inject_funcs_fb.o: $(FB_INJECT_FUNCS_SRC) Makefile
-	$(NVCC) -std=c++17 -DNDEBUG $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # The channel is inlined into injected functions and the embedded flush kernel.
 # A normal prerequisite both orders parallel builds and forces recompilation.
