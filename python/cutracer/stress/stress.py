@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from cutracer.reduce.config_mutator import DelayConfigMutator
+import click
 from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
 
 
@@ -52,6 +54,13 @@ class StressConfig:
     timeout: int = 1800
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
+    resume_result: Optional["StressResult"] = None
+    progress_callback: Optional[Callable[["StressResult"], None]] = None
+    use_bundled_cuda_tools: bool = True
+    expected_kernel_name: Optional[str] = None
+    expected_kernel_checksum: Optional[str] = None
+    exact_kernel_name: Optional[str] = None
+    exact_kernel_checksum: Optional[str] = None
 
     def __post_init__(self) -> None:
         # The `cutracer stress` CLI rejects an empty ladder with a UsageError,
@@ -75,6 +84,7 @@ class TriggeringConfig:
     warpgroup_id: Optional[int]
     enable_prob: float
     attempt_index: int
+    enabled_point_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,6 +93,7 @@ class TriggeringConfig:
             "warpgroup_id": self.warpgroup_id,
             "enable_prob": self.enable_prob,
             "attempt_index": self.attempt_index,
+            "enabled_point_count": self.enabled_point_count,
         }
 
 
@@ -150,6 +161,11 @@ class StressResult:
             else 0.0
         )
 
+    # Exact durable prefix represented by ``log_path``. ``None`` supports old
+    # in-memory callers that did not record a boundary; zero is an explicit
+    # empty durable prefix. This lets resume discard an uncheckpointed tail.
+    log_size_bytes: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "reproduced": self.reproduced,
@@ -158,6 +174,7 @@ class StressResult:
             "unattributed_reproductions": self.unattributed_reproductions,
             "infra_errors": self.infra_errors,
             "timed_out": self.timed_out,
+            "log_size_bytes": self.log_size_bytes,
             "reproduction_rate": self.reproduction_rate,
             "baseline_requested": self.baseline_requested,
             "baseline_completed": self.baseline_completed,
@@ -183,7 +200,7 @@ class _AttemptResult:
     unattributed: int = 0
 
 
-def _enabled_point_count(config_path: str) -> int:
+def _enabled_point_count(config_path: str) -> Optional[int]:
     """How many injection points the dumped delay config actually turned on.
 
     A delay config records every candidate point with an ``on`` flag, and only
@@ -192,14 +209,22 @@ def _enabled_point_count(config_path: str) -> int:
     own, the oracle then reports the bug during a run that injected no delay at
     all, and attributing that to the config would be wrong.
 
-    Reuses the reduce-side config model rather than re-parsing, with validation
-    off and every error swallowed: an unreadable config means "cannot attribute",
-    which is the same conservative answer as zero points.
+    ``None`` means the config could not be inspected. That is infrastructure
+    failure rather than proof that no delay was injected.
     """
     try:
-        return len(DelayConfigMutator(config_path, validate=False).enabled_points)
-    except Exception:  # noqa: BLE001 - any parse failure means "cannot attribute"
-        return 0
+        with open(config_path) as source:
+            payload = json.load(source)
+        kernels = payload.get("kernels", {})
+        return sum(
+            raw_point.get("on") is True
+            for raw_kernel in kernels.values()
+            if isinstance(raw_kernel, dict)
+            for raw_point in raw_kernel.get("instrumentation_points", {}).values()
+            if isinstance(raw_point, dict)
+        )
+    except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
 
 
 def _unlink(path: str) -> None:
@@ -214,6 +239,7 @@ def _attempt_log(
     delay_ns: int,
     warpgroup: Optional[int],
     attempt: int,
+    returncode: Optional[int] = None,
     stdout: str = "",
     stderr: str = "",
     error: str = "",
@@ -222,6 +248,8 @@ def _attempt_log(
     sections = [
         f"=== delay_ns={delay_ns} warpgroup={target} attempt={attempt} ===",
     ]
+    if returncode is not None:
+        sections.append(f"returncode={returncode}")
     if stdout:
         sections.extend(("--- stdout ---", stdout))
     if stderr:
@@ -231,7 +259,146 @@ def _attempt_log(
     return "\n".join(sections)
 
 
-def _run_attempt(
+def _validate_delay_config(  # noqa: C901
+    path: str,
+    *,
+    delay_ns: int,
+    expected_kernel_name: Optional[str],
+    expected_kernel_checksum: Optional[str],
+) -> tuple[Optional[str], Optional[tuple[str, str]], Optional[int]]:
+    """Return validated kernel identity and enabled-PC count for a config."""
+    if not os.path.isfile(path):
+        return "CUTracer wrote no delay config", None, None
+    try:
+        with open(path) as source:
+            payload = json.load(source)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return f"delay config is unreadable: {exc}", None, None
+    if not isinstance(payload, dict) or payload.get("version") != "1.0":
+        return "delay config has an unsupported or missing version", None, None
+    configured_delay = payload.get("delay_ns")
+    if type(configured_delay) is not int or configured_delay != delay_ns:
+        return (
+            "delay config does not match the attempted delay "
+            f"({configured_delay!r} != {delay_ns})",
+            None,
+            None,
+        )
+    kernels = payload.get("kernels")
+    if not isinstance(kernels, dict) or not kernels:
+        return "delay config contains no instrumented kernels", None, None
+
+    matched_identity: Optional[tuple[str, str]] = None
+    for raw_kernel in kernels.values():
+        if not isinstance(raw_kernel, dict):
+            continue
+        kernel_name = raw_kernel.get("kernel_name")
+        kernel_checksum = raw_kernel.get("kernel_checksum")
+        if not isinstance(kernel_name, str) or not kernel_name:
+            continue
+        if not isinstance(kernel_checksum, str) or not kernel_checksum:
+            continue
+        if expected_kernel_checksum is not None:
+            if kernel_checksum != expected_kernel_checksum:
+                continue
+        elif expected_kernel_name is not None and kernel_name != expected_kernel_name:
+            continue
+        matched_identity = (kernel_name, kernel_checksum)
+        points = raw_kernel.get("instrumentation_points")
+        if not isinstance(points, dict):
+            continue
+        enabled_pcs: set[int] = set()
+        for raw_point in points.values():
+            if not isinstance(raw_point, dict) or raw_point.get("on") is not True:
+                continue
+            point_delay = raw_point.get("delay")
+            point_pc = raw_point.get("pc")
+            point_sass = raw_point.get("sass")
+            if (
+                type(point_delay) is int
+                and point_delay == delay_ns
+                and type(point_pc) is int
+                and point_pc >= 0
+                and isinstance(point_sass, str)
+                and point_sass
+            ):
+                enabled_pcs.add(point_pc)
+        if enabled_pcs:
+            return None, (kernel_name, kernel_checksum), len(enabled_pcs)
+
+    if matched_identity is None and (
+        expected_kernel_name is not None or expected_kernel_checksum is not None
+    ):
+        return (
+            "delay config does not contain the expected kernel identity",
+            None,
+            None,
+        )
+    return (
+        "delay config contains no enabled point for the expected delay",
+        None,
+        None,
+    )
+
+
+def _validate_warpgroup_launch(  # noqa: C901
+    output_dir: str,
+    *,
+    warpgroup: int,
+    kernel_identity: tuple[str, str],
+) -> Optional[str]:
+    """Verify that a targeted warpgroup has at least one live warp at launch."""
+    _kernel_name, kernel_checksum = kernel_identity
+    matched_launch = False
+    try:
+        names = os.listdir(output_dir)
+    except OSError as exc:
+        return f"kernel launch evidence is unreadable: {exc}"
+    read_errors: list[str] = []
+    for name in names:
+        if not name.startswith("cutracer_kernel_events_") or not name.endswith(
+            ".ndjson"
+        ):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            with open(path) as source:
+                for line in source:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        not isinstance(event, dict)
+                        or event.get("type") != "kernel_launch"
+                        or event.get("kernel_checksum") != kernel_checksum
+                    ):
+                        continue
+                    matched_launch = True
+                    block = event.get("block")
+                    if (
+                        not isinstance(block, list)
+                        or len(block) != 3
+                        or any(
+                            type(dimension) is not int or dimension <= 0
+                            for dimension in block
+                        )
+                    ):
+                        continue
+                    block_threads = block[0] * block[1] * block[2]
+                    block_warps = (block_threads + 31) // 32
+                    if 4 * warpgroup < block_warps:
+                        return None
+        except (OSError, UnicodeError) as exc:
+            read_errors.append(f"{name}: {exc}")
+    if read_errors:
+        return "kernel launch evidence is unreadable: " + "; ".join(read_errors)
+    if matched_launch:
+        return f"warpgroup {warpgroup} has no live warp in the matching kernel launch"
+    return "no matching kernel launch evidence was recorded for warpgroup targeting"
+
+
+def _run_attempt_in_output_dir(
     config: StressConfig,
     *,
     delay_ns: int,
@@ -239,6 +406,7 @@ def _run_attempt(
     attempt: int,
     cutracer_so: Optional[str],
     runner: Optional[RunTarget],
+    instrumentation_output_dir: str,
 ) -> _AttemptResult:
     config_path = os.path.join(
         config.output_dir,
@@ -256,7 +424,9 @@ def _run_attempt(
                 instrument="random_delay",
                 analysis="random_delay",
                 kernel_filters=config.kernel_filters,
-                output_dir=config.output_dir,
+                exact_kernel_name=config.exact_kernel_name,
+                exact_kernel_checksum=config.exact_kernel_checksum,
+                output_dir=instrumentation_output_dir,
                 delay_ns=delay_ns,
                 delay_enable_prob=config.enable_prob,
                 delay_mode="random",
@@ -265,6 +435,8 @@ def _run_attempt(
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
+                use_bundled_cuda_tools=config.use_bundled_cuda_tools,
+                kernel_events="nostack" if warpgroup is not None else None,
             ),
             runner=runner,
         )
@@ -283,39 +455,107 @@ def _run_attempt(
             ),
             timed_out=1,
         )
+    except (click.ClickException, OSError, ValueError) as exc:
+        _unlink(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            _attempt_log(
+                delay_ns=delay_ns,
+                warpgroup=warpgroup,
+                attempt=attempt,
+                error=f"launch failed: {type(exc).__name__}: {exc}",
+            ),
+        )
 
     log = _attempt_log(
         delay_ns=delay_ns,
         warpgroup=warpgroup,
         attempt=attempt,
+        returncode=proc.returncode,
         stdout=proc.stdout or "",
         stderr=proc.stderr or "",
     )
-    if proc.returncode == 0 and os.path.isfile(config_path):
-        if _enabled_point_count(config_path) == 0:
-            # Real failure, but this attempt injected nothing, so it is evidence
-            # about the target -- not about any injection point. Keep it out of
-            # the reproduction count so it can never become a triggering config.
+    is_interesting = proc.returncode == 0
+    is_clean = proc.returncode != 0 and (
+        not config.not_interesting_exit_codes
+        or proc.returncode in config.not_interesting_exit_codes
+    )
+    if not is_interesting and not is_clean:
+        _unlink(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + f"\n--- error ---\nunexpected oracle returncode {proc.returncode}",
+        )
+
+    if (
+        is_interesting
+        and os.path.isfile(config_path)
+        and _enabled_point_count(config_path) == 0
+    ):
+        # Real failure, but this attempt injected nothing (or its config cannot
+        # prove otherwise), so it is evidence about the target rather than an
+        # attributable triggering configuration.
+        _unlink(config_path)
+        return _AttemptResult(
+            1,
+            0,
+            0,
+            None,
+            _attempt_log(
+                delay_ns=delay_ns,
+                warpgroup=warpgroup,
+                attempt=attempt,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+                error=(
+                    "oracle reported the bug but the delay config enabled 0 "
+                    "verifiable injection points: the target reproduces without "
+                    "attributable injected delay"
+                ),
+            ),
+            unattributed=1,
+        )
+
+    config_error, kernel_identity, enabled_point_count = _validate_delay_config(
+        config_path,
+        delay_ns=delay_ns,
+        expected_kernel_name=config.expected_kernel_name,
+        expected_kernel_checksum=config.expected_kernel_checksum,
+    )
+    if config_error is not None:
+        _unlink(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + f"\n--- error ---\n{config_error}",
+        )
+    assert kernel_identity is not None
+    assert enabled_point_count is not None
+    if warpgroup is not None:
+        targeting_error = _validate_warpgroup_launch(
+            instrumentation_output_dir,
+            warpgroup=warpgroup,
+            kernel_identity=kernel_identity,
+        )
+        if targeting_error is not None:
             _unlink(config_path)
             return _AttemptResult(
+                0,
+                0,
                 1,
-                0,
-                0,
                 None,
-                _attempt_log(
-                    delay_ns=delay_ns,
-                    warpgroup=warpgroup,
-                    attempt=attempt,
-                    stdout=proc.stdout or "",
-                    stderr=proc.stderr or "",
-                    error=(
-                        "oracle reported the bug but the delay config enabled 0 "
-                        "injection points: the target reproduces without injected "
-                        "delay, so this attempt is not attributable"
-                    ),
-                ),
-                unattributed=1,
+                log + f"\n--- error ---\n{targeting_error}",
             )
+
+    if is_interesting:
         return _AttemptResult(
             1,
             1,
@@ -326,21 +566,147 @@ def _run_attempt(
                 warpgroup_id=warpgroup,
                 enable_prob=config.enable_prob,
                 attempt_index=attempt,
+                enabled_point_count=enabled_point_count,
             ),
             log,
         )
-    if proc.returncode == 0:
-        # The oracle flagged the run interesting but CUTracer wrote no config,
-        # so there is nothing deterministic to replay or reduce.
-        return _AttemptResult(0, 0, 1, None, log)
-
     _unlink(config_path)
-    if (
-        not config.not_interesting_exit_codes
-        or proc.returncode in config.not_interesting_exit_codes
-    ):
-        return _AttemptResult(1, 0, 0, None, log)
-    return _AttemptResult(0, 0, 1, None, log)
+    return _AttemptResult(1, 0, 0, None, log)
+
+
+def _run_attempt(
+    config: StressConfig,
+    *,
+    delay_ns: int,
+    warpgroup: Optional[int],
+    attempt: int,
+    cutracer_so: Optional[str],
+    runner: Optional[RunTarget],
+) -> _AttemptResult:
+    event_dir = (
+        tempfile.mkdtemp(prefix=".stress_events_", dir=config.output_dir)
+        if warpgroup is not None
+        else None
+    )
+    try:
+        return _run_attempt_in_output_dir(
+            config,
+            delay_ns=delay_ns,
+            warpgroup=warpgroup,
+            attempt=attempt,
+            cutracer_so=cutracer_so,
+            runner=runner,
+            instrumentation_output_dir=event_dir or config.output_dir,
+        )
+    finally:
+        if event_dir is not None:
+            shutil.rmtree(event_dir, ignore_errors=True)
+
+
+def _fsync_directory(path: str) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_stress_log(
+    output_dir: str,
+    log_part: str,
+    *,
+    append: bool,
+) -> tuple[str, int]:
+    """Durably append one trial, rolling back a failed partial write."""
+    log_path = os.path.join(output_dir, "stress.log")
+    previous_size = 0
+    try:
+        if append:
+            try:
+                previous_size = os.path.getsize(log_path)
+            except FileNotFoundError as exc:
+                raise OSError(
+                    "durable stress log disappeared before the next append"
+                ) from exc
+        payload = (("\n" if previous_size else "") + log_part).encode("utf-8")
+        with open(log_path, "ab" if append else "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        if not append:
+            _fsync_directory(output_dir)
+        return log_path, previous_size + len(payload)
+    except OSError:
+        if append:
+            try:
+                with open(log_path, "r+b") as output:
+                    output.truncate(previous_size)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except OSError:
+                pass
+        else:
+            _unlink(log_path)
+        raise
+
+
+def _prepare_stress_log(
+    output_dir: str,
+    result: Optional[StressResult],
+) -> tuple[Optional[str], int]:
+    """Start a live append-only log from the last durable checkpoint prefix."""
+    log_path = os.path.join(output_dir, "stress.log")
+    if result is None:
+        _unlink(log_path)
+        return None, 0
+    attempted = result.completed_trials + result.infra_errors + result.timed_out
+    if attempted == 0:
+        _unlink(log_path)
+        return None, 0
+    if result.log_path is None:
+        raise ValueError("resumed stress progress requires a persisted log")
+    source_size = os.path.getsize(result.log_path)
+    expected_size = (
+        source_size if result.log_size_bytes is None else result.log_size_bytes
+    )
+    if expected_size < 0 or source_size < expected_size:
+        raise ValueError("resumed stress log is shorter than its durable prefix")
+
+    if os.path.abspath(result.log_path) == os.path.abspath(log_path):
+        if source_size > expected_size:
+            with open(log_path, "r+b") as output:
+                output.truncate(expected_size)
+                output.flush()
+                os.fsync(output.fileno())
+        return log_path, expected_size
+
+    descriptor, temporary = tempfile.mkstemp(prefix=".stress.log.", dir=output_dir)
+    try:
+        with (
+            open(result.log_path, "rb") as source,
+            os.fdopen(descriptor, "wb") as output,
+        ):
+            descriptor = -1
+            remaining = expected_size
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError(
+                        "resumed stress log ended before its durable prefix"
+                    )
+                output.write(chunk)
+                remaining -= len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, log_path)
+        temporary = ""
+        _fsync_directory(output_dir)
+        return log_path, expected_size
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            _unlink(temporary)
 
 
 @dataclass(frozen=True)
@@ -396,6 +762,8 @@ def _run_baseline(
                     instrument="random_delay",
                     analysis="random_delay",
                     kernel_filters=config.kernel_filters,
+                    exact_kernel_name=config.exact_kernel_name,
+                    exact_kernel_checksum=config.exact_kernel_checksum,
                     output_dir=config.output_dir,
                     delay_ns=delay_ns,
                     delay_enable_prob=0.0,
@@ -403,6 +771,7 @@ def _run_baseline(
                     cwd=config.cwd,
                     timeout=config.timeout,
                     base_env=config.base_env,
+                    use_bundled_cuda_tools=config.use_bundled_cuda_tools,
                 ),
                 runner=runner,
             )
