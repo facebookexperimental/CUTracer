@@ -846,7 +846,7 @@ def _attribution(
     return ATTRIBUTION_ATTRIBUTED
 
 
-def run_stress(
+def run_stress(  # noqa: C901
     config: StressConfig,
     *,
     cutracer_so: Optional[str] = None,
@@ -861,22 +861,87 @@ def run_stress(
     failure -- counted as an unattributed reproduction).
     """
     os.makedirs(config.output_dir, exist_ok=True)
-    completed = 0
-    reproductions = 0
-    infra_errors = 0
-    timed_out = 0
-    unattributed = 0
-    baseline = _run_baseline(config, cutracer_so=cutracer_so, runner=runner)
-    triggering: Optional[TriggeringConfig] = None
-    log_parts: List[str] = list(baseline.logs)
+    resume = config.resume_result
+    completed = 0 if resume is None else resume.completed_trials
+    reproductions = 0 if resume is None else resume.reproductions
+    infra_errors = 0 if resume is None else resume.infra_errors
+    timed_out = 0 if resume is None else resume.timed_out
+    unattributed = 0 if resume is None else resume.unattributed_reproductions
+    baseline = (
+        _run_baseline(config, cutracer_so=cutracer_so, runner=runner)
+        if resume is None
+        else _BaselineResult(
+            requested=resume.baseline_requested,
+            completed=resume.baseline_completed,
+            reproductions=resume.baseline_reproductions,
+            timed_out=resume.baseline_timed_out,
+            infra_errors=resume.baseline_infra_errors,
+            logs=[],
+        )
+    )
+    triggering = None if resume is None else resume.triggering
     stop = False
     warp_targets: List[Optional[int]] = (
         [int(x) for x in config.warpgroup_ids] if config.warpgroup_ids else [None]
     )
+    planned_trials = (
+        len(config.delay_ladder_ns) * len(warp_targets) * config.attempts_per_delay
+    )
+    attempted_trials = completed + infra_errors + timed_out
+    if min(completed, reproductions, unattributed, infra_errors, timed_out) < 0:
+        raise ValueError("resumed stress progress contains negative counts")
+    if reproductions + unattributed > completed or attempted_trials > planned_trials:
+        raise ValueError("resumed stress progress is outside the campaign plan")
+    if triggering is not None and reproductions == 0:
+        raise ValueError("resumed triggering config has no reproduced trial")
+    if triggering is not None and not os.path.isfile(triggering.config_path):
+        raise ValueError("resumed triggering config is unavailable")
+    if reproductions > 0 and triggering is None:
+        raise ValueError("resumed reproduction is missing its triggering config")
+    log_path, log_size_bytes = _prepare_stress_log(config.output_dir, resume)
+    if baseline.logs:
+        log_path, log_size_bytes = _write_stress_log(
+            config.output_dir,
+            "\n".join(baseline.logs),
+            append=log_path is not None,
+        )
+    if triggering is not None and config.stop_on_first:
+        stop = True
 
+    def progress_result(log_path: Optional[str]) -> StressResult:
+        return StressResult(
+            reproduced=triggering is not None,
+            completed_trials=completed,
+            reproductions=reproductions,
+            infra_errors=infra_errors,
+            reproduction_rate=reproductions / completed if completed else 0.0,
+            triggering=triggering,
+            log_path=log_path,
+            timed_out=timed_out,
+            unattributed_reproductions=unattributed,
+            baseline_requested=baseline.requested,
+            baseline_completed=baseline.completed,
+            baseline_reproductions=baseline.reproductions,
+            baseline_timed_out=baseline.timed_out,
+            baseline_infra_errors=baseline.infra_errors,
+            attribution=_attribution(
+                baseline_requested=baseline.requested,
+                baseline_completed=baseline.completed,
+                baseline_reproductions=baseline.reproductions,
+                triggering=triggering,
+            ),
+            log_size_bytes=log_size_bytes if log_path is not None else None,
+        )
+
+    trial_ordinal = 0
     for delay_ns in config.delay_ladder_ns:
         for warpgroup in warp_targets:
             for attempt in range(config.attempts_per_delay):
+                if trial_ordinal < attempted_trials:
+                    trial_ordinal += 1
+                    continue
+                if stop:
+                    break
                 outcome = _run_attempt(
                     config,
                     delay_ns=delay_ns,
@@ -890,27 +955,34 @@ def run_stress(
                 infra_errors += outcome.infra_errors
                 timed_out += outcome.timed_out
                 unattributed += outcome.unattributed
-                log_parts.append(outcome.log)
+                trial_ordinal += 1
                 if outcome.triggering is not None:
                     if triggering is None:
                         triggering = outcome.triggering
                     if config.stop_on_first:
                         stop = True
+
+                try:
+                    log_path, log_size_bytes = _write_stress_log(
+                        config.output_dir,
+                        outcome.log,
+                        append=log_path is not None,
+                    )
+                except OSError:
+                    # Surface the just-completed attempt to an adapter before
+                    # propagating persistence failure. The adapter can retain
+                    # exact counts even though no durable log is available.
+                    if config.progress_callback is not None:
+                        config.progress_callback(progress_result(None))
+                    raise
+                if config.progress_callback is not None:
+                    config.progress_callback(progress_result(log_path))
                 if stop:
                     break
             if stop:
                 break
         if stop:
             break
-
-    log_path: Optional[str] = None
-    if log_parts:
-        log_path = os.path.join(config.output_dir, "stress.log")
-        try:
-            with open(log_path, "w") as fh:
-                fh.write("\n".join(log_parts))
-        except OSError:
-            log_path = None
 
     rate = (reproductions / completed) if completed else 0.0
     return StressResult(
@@ -934,6 +1006,7 @@ def run_stress(
             baseline_reproductions=baseline.reproductions,
             triggering=triggering,
         ),
+        log_size_bytes=log_size_bytes if log_path is not None else None,
     )
 
 
