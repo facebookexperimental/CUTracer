@@ -30,6 +30,13 @@ from cutracer.service.contracts import (
 
 _MAX_TRACE_PC_OFFSETS = 32
 
+DEFAULT_LOCAL_SANITIZER_TOOLS = (
+    "memcheck",
+    "synccheck",
+    "initcheck",
+    "racecheck",
+)
+
 
 def _experiment_id(
     session_id: str,
@@ -203,6 +210,13 @@ class InitialCampaignPolicy:
 
     sanitizer_tools: tuple[str, ...] = ("racecheck",)
     stress_options: StressOptions = dataclasses.field(default_factory=StressOptions)
+
+    def __post_init__(self) -> None:
+        unknown = sorted(set(self.sanitizer_tools) - set(DEFAULT_LOCAL_SANITIZER_TOOLS))
+        if unknown:
+            raise ValueError(f"unsupported sanitizer tools: {', '.join(unknown)}")
+        if len(self.sanitizer_tools) != len(set(self.sanitizer_tools)):
+            raise ValueError("sanitizer tools must not contain duplicates")
 
     def plan(self, session_id: str, unit: WorkUnit) -> CampaignPlan:
         specs: List[ExperimentSpec] = []

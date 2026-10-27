@@ -21,7 +21,11 @@ from cutracer.service.experiments.reduce import run_reduce_experiment
 from cutracer.service.experiments.sanitizer import run_sanitizer_experiment
 from cutracer.service.experiments.stress import run_stress_experiment
 from cutracer.service.experiments.trace import run_trace_experiment
-from cutracer.service.policy import ExperimentGuardPolicy, InitialCampaignPolicy
+from cutracer.service.policy import (
+    DEFAULT_LOCAL_SANITIZER_TOOLS,
+    ExperimentGuardPolicy,
+    InitialCampaignPolicy,
+)
 from cutracer.service.reasoner import ClaudeReasoner
 from cutracer.service.session import (
     build_session_report,
@@ -213,11 +217,14 @@ def run_local_session(
     store: Optional[SessionStore] = None,
     sink: Optional[ReportSink] = None,
 ) -> SessionReport:
+    active_campaign = campaign_policy or InitialCampaignPolicy(
+        sanitizer_tools=DEFAULT_LOCAL_SANITIZER_TOOLS
+    )
     transition = create_session(
         session_id or f"session-{uuid.uuid4().hex}",
         unit,
         budget=budget,
-        campaign_policy=campaign_policy,
+        campaign_policy=active_campaign,
     )
     current = transition.session
     effects = list(transition.effects)

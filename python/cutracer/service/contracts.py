@@ -158,14 +158,23 @@ def _as_bool(value: Any) -> bool:
 class KernelId:
     name: str
     cubin_hash: str
+    # Vendor-facing execution metadata; stable identity remains name + checksum.
+    mangled_name: Optional[str] = dataclasses.field(default=None, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "cubin_hash": self.cubin_hash}
+        result = {"name": self.name, "cubin_hash": self.cubin_hash}
+        if self.mangled_name is not None:
+            result["mangled_name"] = self.mangled_name
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "KernelId":
         d = _known(cls, d)
-        return cls(name=d["name"], cubin_hash=d["cubin_hash"])
+        return cls(
+            name=d["name"],
+            cubin_hash=d["cubin_hash"],
+            mangled_name=d.get("mangled_name"),
+        )
 
 
 @dataclasses.dataclass

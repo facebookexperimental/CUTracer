@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from cutracer.compute_sanitizer.parser import (
     CheckerIssue,
@@ -18,12 +18,15 @@ from cutracer.service.contracts import (
     ExecutionStatus,
     ExperimentSpec,
     FindingRecord,
+    KernelId,
     ResultCompleteness,
     SanitizerOutcome,
     SanitizerSummary,
     SanitizerSweepResult,
     SourceLoc,
 )
+
+TARGET_SCOPED_SANITIZER_TOOLS = ("initcheck",)
 
 # Stable, vendor-neutral finding classes. The tool's own wording is preserved
 # separately in ``FindingRecord.error_detail``; it encodes specifics such as
@@ -52,6 +55,11 @@ _ERROR_TYPE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("Program hit ", ERROR_TYPE_HARDWARE_EXCEPTION),
     ("Leaked ", ERROR_TYPE_MEMORY_LEAK),
 )
+
+
+def is_target_scoped_sanitizer(tool: str) -> bool:
+    """Whether the checker must observe every kernel launched by the target."""
+    return tool in TARGET_SCOPED_SANITIZER_TOOLS
 
 
 def classify_error_type(message: str) -> str:
@@ -154,6 +162,79 @@ def _sanitizer_outcome(
     return SanitizerOutcome.UNKNOWN
 
 
+def _matches_kernel(finding: FindingRecord, kernel: KernelId) -> bool:
+    if finding.kernel_name is None:
+        return False
+    names = {kernel.name}
+    mangled_name = kernel.mangled_name
+    if isinstance(mangled_name, str):
+        names.add(mangled_name)
+    return finding.kernel_name in names
+
+
+def project_target_scoped_sanitizer_result(
+    result: SanitizerSweepResult,
+    *,
+    experiment_id: str,
+    kernel: KernelId,
+) -> SanitizerSweepResult:
+    """Conservatively project one whole-target checker run onto a kernel."""
+    if not is_target_scoped_sanitizer(result.tool):
+        raise ValueError(f"sanitizer tool is not target-scoped: {result.tool}")
+
+    provenance = replace(result.provenance, kernel=kernel)
+    if not result.has_positive_signal:
+        return replace(result, experiment_id=experiment_id, provenance=provenance)
+
+    matching = [
+        replace(finding, kernel_name=kernel.name)
+        for finding in result.findings
+        if _matches_kernel(finding, kernel)
+    ]
+    observed_count = sum(finding.count for finding in result.findings)
+    counts_match = (
+        result.summary is not None and result.summary.errors == observed_count
+    )
+    fully_attributed = (
+        bool(matching)
+        and len(matching) == len(result.findings)
+        and counts_match
+        and not result.output_truncated
+    )
+    if fully_attributed:
+        return replace(
+            result,
+            experiment_id=experiment_id,
+            findings=matching,
+            provenance=provenance,
+        )
+
+    issues = list(result.summary_issues)
+    if result.output_truncated:
+        issues.append("target_scope_output_truncated")
+    if not counts_match:
+        issues.append("target_scope_finding_count_mismatch")
+    if any(finding.kernel_name is None for finding in result.findings):
+        issues.append("target_scope_contains_unattributed_findings")
+    if any(
+        finding.kernel_name is not None and not _matches_kernel(finding, kernel)
+        for finding in result.findings
+    ):
+        issues.append("target_scope_contains_other_kernel_findings")
+    if not matching:
+        issues.append("target_scope_has_no_matching_finding")
+    return replace(
+        result,
+        experiment_id=experiment_id,
+        outcome=SanitizerOutcome.UNKNOWN,
+        findings=matching,
+        provenance=provenance,
+        summary=None,
+        completeness=ResultCompleteness.PARTIAL,
+        summary_issues=list(dict.fromkeys(issues)),
+    )
+
+
 def build_sanitizer_result(
     spec: ExperimentSpec,
     *,
@@ -177,7 +258,7 @@ def build_sanitizer_result(
             else f"{error}; {_INTERNAL_TOOL_ERROR}"
         )
 
-    return SanitizerSweepResult(
+    result = SanitizerSweepResult(
         experiment_id=spec.experiment_id,
         execution_status=execution_status,
         outcome=_sanitizer_outcome(evidence, execution_status, log),
@@ -196,4 +277,11 @@ def build_sanitizer_result(
         completeness=evidence.completeness,
         summary_issues=evidence.issues,
         output_truncated=evidence.output_truncated,
+    )
+    if spec.unit.kernel is None or not is_target_scoped_sanitizer(tool):
+        return result
+    return project_target_scoped_sanitizer_result(
+        result,
+        experiment_id=spec.experiment_id,
+        kernel=spec.unit.kernel,
     )

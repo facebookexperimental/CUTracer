@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from collections import Counter
 from enum import Enum
-from typing import List, NoReturn, Optional
+from typing import List, NoReturn, Optional, Sequence
 
 from cutracer.service.contracts import (
     AnalysisDecision,
@@ -23,6 +23,7 @@ from cutracer.service.contracts import (
     ExperimentResult,
     ExperimentSpec,
     ExplainReport,
+    KernelId,
     ReduceExperimentResult,
     ReduceOutcome,
     ResultCompleteness,
@@ -40,9 +41,14 @@ from cutracer.service.contracts import (
     WorkUnit,
 )
 from cutracer.service.policy import (
+    CampaignPlan,
     experiment_spec_fingerprint,
     ExperimentGuardPolicy,
     InitialCampaignPolicy,
+)
+from cutracer.service.sanitizer_results import (
+    is_target_scoped_sanitizer,
+    project_target_scoped_sanitizer_result,
 )
 from cutracer.service.triage import initial_evidence_requires_inconclusive
 
@@ -788,23 +794,76 @@ def _triage_report(session: AnalysisSession, decision: TriageDecision) -> Explai
     )
 
 
+def _initial_campaign_state(
+    plan: CampaignPlan,
+    shared_results: Sequence[SanitizerSweepResult],
+    kernel: KernelId | None,
+) -> tuple[
+    EvidenceBundle,
+    list[ExperimentSpec],
+    list[str],
+    list[ExperimentRecord],
+]:
+    shared_by_tool: dict[str, SanitizerSweepResult] = {}
+    for result in shared_results:
+        if not is_target_scoped_sanitizer(result.tool):
+            raise ValueError(f"sanitizer tool is not target-scoped: {result.tool}")
+        if result.tool in shared_by_tool:
+            raise ValueError(f"duplicate shared sanitizer result: {result.tool}")
+        shared_by_tool[result.tool] = result
+
+    evidence = EvidenceBundle()
+    for skipped in plan.skipped_results:
+        evidence.add(skipped)
+    pending: list[ExperimentSpec] = []
+    completed_ids: list[str] = []
+    history: list[ExperimentRecord] = []
+    for spec in plan.experiments:
+        tool = spec.sanitizer_tool
+        shared = None if tool is None else shared_by_tool.pop(tool, None)
+        if shared is None:
+            pending.append(spec)
+            continue
+        if kernel is None:
+            raise ValueError("shared sanitizer evidence requires a pinned kernel")
+        projected = project_target_scoped_sanitizer_result(
+            shared,
+            experiment_id=spec.experiment_id,
+            kernel=kernel,
+        )
+        _validate_result_against_spec(spec, projected)
+        evidence.add(projected)
+        completed_ids.append(projected.experiment_id)
+        history.append(_experiment_record(spec, projected))
+    if shared_by_tool:
+        raise ValueError(
+            "shared sanitizer results are not present in the child policy: "
+            f"{', '.join(sorted(shared_by_tool))}"
+        )
+    return evidence, pending, completed_ids, history
+
+
 def create_session(
     session_id: str,
     unit: WorkUnit,
     *,
     budget: Optional[SessionBudget] = None,
     campaign_policy: Optional[InitialCampaignPolicy] = None,
+    shared_sanitizer_results: Sequence[SanitizerSweepResult] = (),
 ) -> Transition:
+    kernel = unit.kernel
     policy = campaign_policy or InitialCampaignPolicy()
     plan = policy.plan(session_id, unit)
     active_budget = budget or SessionBudget()
-    evidence = EvidenceBundle()
-    for skipped in plan.skipped_results:
-        evidence.add(skipped)
-    if len(plan.experiments) > active_budget.max_experiments:
+    evidence, pending, completed_ids, history = _initial_campaign_state(
+        plan,
+        shared_sanitizer_results,
+        kernel,
+    )
+    if len(pending) > active_budget.max_experiments:
         reason = (
             "initial experiment budget exhausted: "
-            f"required={len(plan.experiments)}, "
+            f"required={len(pending)}, "
             f"limit={active_budget.max_experiments}"
         )
         session = AnalysisSession(
@@ -816,10 +875,11 @@ def create_session(
             status=SessionStatus.WAITING_TRIAGE,
             evidence=evidence,
             budget=active_budget,
+            completed_experiment_ids=completed_ids,
+            experiment_history=history,
         )
         return _terminate_inconclusive(session, reason)
 
-    pending = list(plan.experiments)
     session = AnalysisSession(
         session_id=session_id,
         unit=unit,
@@ -829,16 +889,16 @@ def create_session(
         evidence=evidence,
         budget=active_budget,
         pending_experiments=pending,
-        experiment_fingerprints=[
-            experiment_spec_fingerprint(spec) for spec in plan.experiments
-        ],
-        submitted_experiments=len(plan.experiments),
+        experiment_fingerprints=[experiment_spec_fingerprint(spec) for spec in pending],
+        submitted_experiments=len(pending),
+        completed_experiment_ids=completed_ids,
+        experiment_history=history,
     )
-    if plan.experiments:
+    if pending:
         effects = (
             SessionEffect(
                 kind=EffectKind.SUBMIT_EXPERIMENTS,
-                experiments=plan.experiments,
+                experiments=tuple(pending),
             ),
         )
     else:

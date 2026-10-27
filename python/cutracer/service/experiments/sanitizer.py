@@ -24,7 +24,10 @@ from cutracer.service.contracts import (
     ExperimentSpec,
     SanitizerSweepResult,
 )
-from cutracer.service.sanitizer_results import build_sanitizer_result
+from cutracer.service.sanitizer_results import (
+    build_sanitizer_result,
+    is_target_scoped_sanitizer,
+)
 
 Reader = Callable[[str], str]
 
@@ -44,6 +47,19 @@ def _record_artifact_failure(status: ExecutionStatus) -> ExecutionStatus:
     if status == ExecutionStatus.SUCCEEDED:
         return ExecutionStatus.INFRA_ERROR
     return status
+
+
+def _kernel_filter_name(spec: ExperimentSpec) -> str | None:
+    if spec.sanitizer_tool is not None and is_target_scoped_sanitizer(
+        spec.sanitizer_tool
+    ):
+        return None
+    kernel = spec.unit.kernel
+    if kernel is None:
+        return None
+    if not isinstance(kernel.mangled_name, str) or not kernel.mangled_name.strip():
+        raise ValueError("pinned sanitizer experiment requires a mangled kernel name")
+    return kernel.mangled_name
 
 
 def _invoke_sanitizer(
@@ -68,6 +84,7 @@ def _invoke_sanitizer(
                 timeout=timeout,
                 base_env=os.environ,
                 env=spec.unit.env,
+                kernel_name=_kernel_filter_name(spec),
             ),
             runner=runner,
             supports_tensor_ops=supports_tensor_ops,

@@ -9,6 +9,7 @@ import click
 from cutracer.runner import resolve_cutracer_so
 from cutracer.service.artifacts import local_artifact, runtime_identity_is_missing
 from cutracer.service.contracts import SessionReport, WorkUnit
+from cutracer.service.policy import DEFAULT_LOCAL_SANITIZER_TOOLS, InitialCampaignPolicy
 from cutracer.service.runner import (
     FileReportSink,
     FileSessionStore,
@@ -39,6 +40,7 @@ def run_diagnosis(
     cutracer_so: Optional[str],
     toolchain_version: str,
     run_local_fn: RunLocalFn,
+    sanitizer_tools: tuple[str, ...] = DEFAULT_LOCAL_SANITIZER_TOOLS,
 ) -> SessionReport:
     """Load a work unit and drive the shared session loop on this host."""
     toolchain_identity = toolchain_version.strip()
@@ -67,7 +69,13 @@ def run_diagnosis(
         )
     )
     store = None if state is None else FileSessionStore(state)
-    report = run_local_fn(unit, executor=executor, sink=None, store=store)
+    report = run_local_fn(
+        unit,
+        executor=executor,
+        campaign_policy=InitialCampaignPolicy(sanitizer_tools=sanitizer_tools),
+        sink=None,
+        store=store,
+    )
     if out is not None:
         FileReportSink(out).publish(report)
     return report
@@ -90,6 +98,15 @@ def run_diagnosis(
 @click.option("--out-dir", type=click.Path(), default=None)
 @click.option("--compute-sanitizer", type=click.Path(), default=None)
 @click.option(
+    "--sanitizer-tool",
+    "sanitizer_tools",
+    type=click.Choice(DEFAULT_LOCAL_SANITIZER_TOOLS),
+    multiple=True,
+    default=DEFAULT_LOCAL_SANITIZER_TOOLS,
+    show_default=True,
+    help="Compute Sanitizer tools in the initial campaign; repeat to select a subset.",
+)
+@click.option(
     "--cutracer-so",
     type=click.Path(exists=True, dir_okay=False),
     default=None,
@@ -108,6 +125,7 @@ def diagnose_command(
     state: Optional[str],
     out_dir: Optional[str],
     compute_sanitizer: Optional[str],
+    sanitizer_tools: tuple[str, ...],
     cutracer_so: Optional[str],
     toolchain_version: str,
 ) -> None:
@@ -128,6 +146,7 @@ def diagnose_command(
         cutracer_so=cutracer_so,
         toolchain_version=toolchain_version,
         run_local_fn=run_local_session,
+        sanitizer_tools=sanitizer_tools,
     )
     if out is None:
         click.echo(report.to_json(indent=2))

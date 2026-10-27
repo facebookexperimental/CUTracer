@@ -28,6 +28,7 @@ class ComputeSanitizerConfig:
     base_env: Optional[Mapping[str, str]] = None
     env: Optional[Mapping[str, str]] = None
     capture_output: bool = True
+    kernel_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ def build_compute_sanitizer_argv(
     log_file: Optional[str] = None,
     *,
     check_tensor_ops: bool = False,
+    kernel_name: Optional[str] = None,
 ) -> list[str]:
     argv = [
         sanitizer_bin,
@@ -89,8 +91,14 @@ def build_compute_sanitizer_argv(
         "--target-processes",
         "all",
     ]
+    if tool == "initcheck":
+        argv += ["--demangle", "no"]
     if check_tensor_ops:
         argv += ["--check-tensor-ops", "yes"]
+    if kernel_name is not None:
+        if not kernel_name.strip():
+            raise ValueError("compute-sanitizer kernel_name must not be empty")
+        argv += ["--kernel-name", f"kns={kernel_name}"]
     # --report-api-errors is a memcheck option; passing it to the other tools
     # makes some Compute Sanitizer versions reject the invocation.
     if tool == "memcheck":
@@ -138,6 +146,7 @@ def run_compute_sanitizer(
             config.argv,
             log_file=log_path,
             check_tensor_ops=tensor_ops,
+            kernel_name=config.kernel_name,
         ),
         env=env,
         cwd=config.cwd,
