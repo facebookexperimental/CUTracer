@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, List, Mapping, Optional, Sequence
 
 from click import ClickException
 from cutracer.runner import RunTarget
@@ -24,6 +25,10 @@ from cutracer.service.contracts import (
     StressTestResult,
     TriggeringDelayConfig,
 )
+from cutracer.stress.retention import (
+    MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
+    retain_oldest_and_newest,
+)
 from cutracer.stress.stress import (
     run_stress,
     StressConfig,
@@ -34,6 +39,106 @@ from cutracer.stress.stress import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 StressProgressCallback = Callable[[StressTestResult], None]
+MAX_REJECTED_CONFIGS = _MAX_REJECTED_CONFIGS
+_REJECTED_CONFIG_NAME_RE = re.compile(r"^rejected_delay_config_[0-9a-f]{64}\.json$")
+
+
+def _promote_rejected_configs(
+    result: StressResult,
+    out_dir: str,
+) -> List[ArtifactRef]:
+    """Move rejected delay configs out of the attempt dir before it is removed.
+
+    Diagnostic artifacts only. A rejected config is by definition not a
+    triggering config, so it is published under its own name and never as
+    ``triggering_config``. Promotion failures are swallowed: losing a
+    diagnostic must not turn a classified result into an error.
+    """
+    unique_sources = list(dict.fromkeys(result.rejected_config_paths))
+    preferred = retain_oldest_and_newest(unique_sources)
+    preferred_set = set(preferred)
+    sources = [
+        *preferred,
+        *(source for source in unique_sources if source not in preferred_set),
+    ]
+    promoted: dict[str, ArtifactRef] = {}
+    attempted = 0
+    for source in sources:
+        if len(promoted) >= MAX_REJECTED_CONFIGS:
+            break
+        attempted += 1
+        destination = os.path.join(out_dir, "rejected_delay_config.json")
+        try:
+            artifact = publish_local_artifact(
+                source,
+                destination,
+                media_type="application/json",
+                content_addressed=True,
+            )
+            promoted[artifact.relative_path] = artifact
+        except Exception:
+            logger.exception("failed to promote rejected delay config %s", source)
+            continue
+    if attempted < len(unique_sources):
+        logger.warning(
+            "omitting %d rejected delay config source paths above the diagnostic cap",
+            len(unique_sources) - attempted,
+        )
+    return list(promoted.values())
+
+
+def _merge_rejected_configs(
+    previous: Sequence[ArtifactRef],
+    current: Sequence[ArtifactRef],
+) -> List[ArtifactRef]:
+    by_path = {artifact.relative_path: artifact for artifact in previous}
+    for artifact in current:
+        by_path[artifact.relative_path] = artifact
+    merged = list(by_path.values())
+    return retain_oldest_and_newest(merged)
+
+
+def _cleanup_unreferenced_rejected_configs(
+    out_dir: str,
+    referenced: Sequence[ArtifactRef],
+) -> None:
+    referenced_names = {artifact.relative_path for artifact in referenced}
+    for name in os.listdir(out_dir):
+        if name in referenced_names or _REJECTED_CONFIG_NAME_RE.fullmatch(name) is None:
+            continue
+        try:
+            os.unlink(os.path.join(out_dir, name))
+        except OSError as error:
+            logger.warning(
+                "could not remove unreferenced rejected config %s: %s",
+                name,
+                error,
+            )
+
+
+def _stage_rejected_configs_for_resume(
+    resume_from: StressTestResult,
+    out_dir: str,
+    attempt_dir: str,
+) -> List[str]:
+    staged: List[str] = []
+    for index, artifact in enumerate(resume_from.rejected_configs):
+        source = os.path.join(out_dir, artifact.relative_path)
+        destination = os.path.join(
+            attempt_dir,
+            f"resumed_rejected_config_{index}.json",
+        )
+        try:
+            shutil.copyfile(source, destination)
+        except OSError as error:
+            logger.warning(
+                "could not stage rejected config %s for resume: %s",
+                source,
+                error,
+            )
+            continue
+        staged.append(destination)
+    return staged
 
 
 def _campaign_completed(result: StressResult, planned_trials: int) -> bool:
@@ -137,6 +242,7 @@ def _stress_provenance(
 def _resume_core_result(
     spec: ExperimentSpec,
     out_dir: str,
+    attempt_dir: str,
     planned_trials: int,
     provenance: ExecutionProvenance,
     resume_from: Optional[StressTestResult],
@@ -176,6 +282,11 @@ def _resume_core_result(
         log_path=resume_log_path,
         timed_out=resume_from.timed_out_trials,
         unattributed_reproductions=resume_from.unattributed_reproductions,
+        rejected_config_paths=_stage_rejected_configs_for_resume(
+            resume_from,
+            out_dir,
+            attempt_dir,
+        ),
         log_size_bytes=(
             None
             if resume_from.log is None or resume_from.log.size_bytes is None
@@ -362,6 +473,7 @@ def _terminal_stress_result(
     unattributed_reproductions: int = 0,
     log: Optional[ArtifactRef] = None,
     triggering_config: Optional[TriggeringDelayConfig] = None,
+    rejected_configs: Optional[Sequence[ArtifactRef]] = None,
 ) -> StressTestResult:
     return StressTestResult(
         experiment_id=spec.experiment_id,
@@ -379,6 +491,7 @@ def _terminal_stress_result(
         timed_out_trials=timed_out_trials,
         completeness=ResultCompleteness.PARTIAL,
         unattributed_reproductions=unattributed_reproductions,
+        rejected_configs=list(rejected_configs or []),
     )
 
 
@@ -453,6 +566,10 @@ def _adapt_core_progress(
         if previous is None
         else previous.triggering_config
     )
+    durable_rejected = _merge_rejected_configs(
+        [] if previous is None else previous.rejected_configs,
+        _promote_rejected_configs(core_result, out_dir),
+    )
     progress = StressTestResult(
         experiment_id=spec.experiment_id,
         execution_status=ExecutionStatus.SUCCEEDED,
@@ -472,6 +589,7 @@ def _adapt_core_progress(
         timed_out_trials=core_result.timed_out,
         completeness=ResultCompleteness.PARTIAL,
         unattributed_reproductions=core_result.unattributed_reproductions,
+        rejected_configs=durable_rejected,
     )
     return progress, error
 
@@ -503,6 +621,11 @@ class _StressProgressAdapter:
             cutracer_version=self.cutracer_version,
             toolchain_version=self.toolchain_version,
         )
+        if self.callback is None:
+            _cleanup_unreferenced_rejected_configs(
+                self.out_dir,
+                self.latest.rejected_configs,
+            )
         if error is not None:
             raise error
         if self.callback is not None:
@@ -550,6 +673,7 @@ def _run_stress_attempt(
     core_resume = _resume_core_result(
         spec,
         out_dir,
+        attempt_dir,
         planned_trials,
         provenance,
         resume_from,
@@ -565,7 +689,6 @@ def _run_stress_attempt(
         callback=progress_callback,
         latest=resume_from,
     )
-
     try:
         result = run_stress(
             StressConfig(
@@ -613,7 +736,16 @@ def _run_stress_attempt(
             progress_adapter.latest_core,
             progress_adapter.latest,
         )
-        return _terminal_stress_result(
+        observed = progress_adapter.latest_core
+        rejected_configs = _merge_rejected_configs(
+            (
+                []
+                if progress_adapter.latest is None
+                else progress_adapter.latest.rejected_configs
+            ),
+            [] if observed is None else _promote_rejected_configs(observed, out_dir),
+        )
+        terminal = _terminal_stress_result(
             spec,
             provenance,
             planned_trials,
@@ -632,7 +764,11 @@ def _run_stress_attempt(
             unattributed_reproductions=unattributed_reproductions,
             log=terminal_log,
             triggering_config=terminal_trigger,
+            rejected_configs=rejected_configs,
         )
+        if progress_callback is None:
+            _cleanup_unreferenced_rejected_configs(out_dir, rejected_configs)
+        return terminal
 
     log, triggering_config, artifact_errors = _publish_stress_artifacts(
         spec,
@@ -641,7 +777,14 @@ def _run_stress_attempt(
         cutracer_version=cutracer_version,
         toolchain_version=toolchain_version,
     )
-
+    rejected_configs = _merge_rejected_configs(
+        (
+            []
+            if progress_adapter.latest is None
+            else progress_adapter.latest.rejected_configs
+        ),
+        _promote_rejected_configs(result, out_dir),
+    )
     if artifact_errors:
         # Preserve independently published evidence from this attempt, then
         # fall back to the last durable checkpoint for anything still missing.
@@ -656,7 +799,7 @@ def _run_stress_attempt(
             reproductions=result.reproductions,
             unattributed_reproductions=result.unattributed_reproductions,
         )
-        return _terminal_stress_result(
+        terminal = _terminal_stress_result(
             spec,
             provenance,
             planned_trials,
@@ -671,7 +814,11 @@ def _run_stress_attempt(
             unattributed_reproductions=result.unattributed_reproductions,
             log=fallback_log,
             triggering_config=fallback_trigger,
+            rejected_configs=rejected_configs,
         )
+        if progress_callback is None:
+            _cleanup_unreferenced_rejected_configs(out_dir, rejected_configs)
+        return terminal
 
     outcome, status, error, completeness = _classify_stress_result(
         result,
@@ -696,7 +843,10 @@ def _run_stress_attempt(
         timed_out_trials=result.timed_out,
         completeness=completeness,
         unattributed_reproductions=result.unattributed_reproductions,
+        rejected_configs=rejected_configs,
     )
+    if progress_callback is None:
+        _cleanup_unreferenced_rejected_configs(out_dir, rejected_configs)
     return terminal_result
 
 

@@ -1,9 +1,9 @@
 """Wire contracts for the CUTracer automated diagnosis service.
 
-This module is the service-layer handoff schema. It is pure stdlib and has zero
-dependency on CUTracer. It contains the session-oriented experiment/evidence
-contracts plus the original single-trace explain contracts retained for
-compatibility.
+This module is the service-layer handoff schema. It and its shared retention
+policy dependency are pure stdlib and do not load CUTracer runtime or analysis
+code. It contains the session-oriented experiment/evidence contracts plus the
+original single-trace explain contracts retained for compatibility.
 
 Design notes:
   * Enums subclass ``(str, Enum)`` so JSON is stable human-readable text.
@@ -25,6 +25,8 @@ import math
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, TextIO, Tuple, Type, TypeVar, Union
+
+from cutracer.stress.retention import MAX_REJECTED_CONFIGS
 
 # ---------------------------------------------------------------------------
 # Enums (str-valued for stable JSON text)
@@ -1357,6 +1359,9 @@ class SanitizerSweepResult:
         )
 
 
+MAX_REJECTED_STRESS_CONFIGS = MAX_REJECTED_CONFIGS
+
+
 @dataclasses.dataclass
 class StressTestResult:
     experiment_id: str
@@ -1374,6 +1379,11 @@ class StressTestResult:
     timed_out_trials: int = 0
     completeness: ResultCompleteness = ResultCompleteness.UNKNOWN
     unattributed_reproductions: int = 0
+    # Delay configs of attempts rejected by validation. Diagnostic only: these
+    # are NOT triggering configs and must never be replayed as evidence. They
+    # exist because a rejection is otherwise unexplainable from the published
+    # artifacts of a remote worker.
+    rejected_configs: List[ArtifactRef] = dataclasses.field(default_factory=list)
 
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.RANDOM_DELAY_STRESS, init=False
@@ -1386,11 +1396,19 @@ class StressTestResult:
             self.infra_errors,
             self.planned_trials,
             self.timed_out_trials,
+            self.unattributed_reproductions,
         )
         if any(count < 0 for count in counts):
             raise ValueError("stress result counts must not be negative")
-        if self.reproductions > self.completed_trials:
-            raise ValueError("reproductions cannot exceed completed_trials")
+        # Attributed and unattributed reproductions are disjoint outcomes of a
+        # completed oracle trial, so their union cannot exceed that trial set.
+        if self.reproductions + self.unattributed_reproductions > self.completed_trials:
+            raise ValueError(
+                "attributed and unattributed reproductions cannot exceed "
+                "completed_trials"
+            )
+        if len(self.rejected_configs) > MAX_REJECTED_STRESS_CONFIGS:
+            raise ValueError("stress result contains too many rejected configs")
 
     @property
     def reproduction_rate(self) -> float:
@@ -1441,6 +1459,7 @@ class StressTestResult:
                 else self.triggering_config.to_dict()
             ),
             "log": None if self.log is None else self.log.to_dict(),
+            "rejected_configs": [x.to_dict() for x in self.rejected_configs],
             "duration_s": self.duration_s,
             "error": self.error,
             "planned_trials": self.planned_trials,
@@ -1465,6 +1484,9 @@ class StressTestResult:
                 None if config is None else TriggeringDelayConfig.from_dict(config)
             ),
             log=None if log is None else ArtifactRef.from_dict(log),
+            rejected_configs=[
+                ArtifactRef.from_dict(x) for x in d.get("rejected_configs", [])
+            ],
             duration_s=float(d.get("duration_s", 0.0)),
             error=d.get("error"),
             planned_trials=int(d.get("planned_trials", 0)),

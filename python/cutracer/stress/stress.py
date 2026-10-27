@@ -16,6 +16,7 @@ self-subprocessing.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -25,6 +26,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import click
 from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
+from cutracer.stress.retention import (
+    MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
+    retain_oldest_and_newest,
+)
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+MAX_REJECTED_CONFIGS = _MAX_REJECTED_CONFIGS
 
 
 @dataclass
@@ -165,6 +174,9 @@ class StressResult:
     # in-memory callers that did not record a boundary; zero is an explicit
     # empty durable prefix. This lets resume discard an uncheckpointed tail.
     log_size_bytes: Optional[int] = None
+    # Delay configs of attempts rejected by validation, newest last. Retained
+    # so a rejection can be explained from published artifacts alone.
+    rejected_config_paths: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -186,6 +198,7 @@ class StressResult:
             "triggering_config": (
                 None if self.triggering is None else self.triggering.to_dict()
             ),
+            "rejected_config_paths": list(self.rejected_config_paths),
         }
 
 
@@ -198,6 +211,11 @@ class _AttemptResult:
     log: str
     timed_out: int = 0
     unattributed: int = 0
+    # Delay config of an attempt that was rejected by validation. Kept so the
+    # rejection can be diagnosed after the fact; a remote worker cannot be
+    # attached to, and deleting the evidence at the moment validation fails
+    # makes the failure unexplainable from the published artifacts.
+    rejected_config_path: Optional[str] = None
 
 
 def _enabled_point_count(config_path: str) -> Optional[int]:
@@ -227,11 +245,91 @@ def _enabled_point_count(config_path: str) -> Optional[int]:
         return None
 
 
+def _preserve_rejected_config(config_path: str) -> Optional[str]:
+    """Move a rejected delay config aside under a unique diagnostic name.
+
+    Returns the retained path, or ``None`` when there was nothing to keep.
+    Renaming (instead of leaving it in place) keeps the per-attempt config
+    namespace free for the next attempt while preserving the evidence.
+    """
+    if not os.path.isfile(config_path):
+        return None
+    directory, name = os.path.split(config_path)
+    stem, suffix = os.path.splitext(name)
+    descriptor = -1
+    rejected: Optional[str] = None
+    try:
+        descriptor, rejected = tempfile.mkstemp(
+            prefix=f"rejected-{stem}-",
+            suffix=suffix,
+            dir=directory,
+        )
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(config_path, rejected)
+    except OSError as exc:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if rejected is not None:
+            _unlink(rejected)
+        logger.warning(
+            "failed to preserve rejected delay config %s: %s",
+            config_path,
+            exc,
+        )
+        return None
+    return rejected
+
+
 def _unlink(path: str) -> None:
     try:
         os.unlink(path)
     except OSError:
         pass
+
+
+def _is_owned_path(path: str, owned_root: str) -> bool:
+    root = os.path.abspath(owned_root)
+    absolute = os.path.abspath(path)
+    try:
+        return os.path.commonpath((root, absolute)) == root
+    except ValueError:
+        return False
+
+
+def _bounded_rejected_config_paths(
+    paths: List[str],
+    *,
+    owned_root: Optional[str] = None,
+) -> List[str]:
+    unique = list(dict.fromkeys(paths))
+    retained = retain_oldest_and_newest(unique)
+    if owned_root is not None:
+        retained_set = set(retained)
+        for path in unique:
+            if path not in retained_set and _is_owned_path(path, owned_root):
+                _unlink(os.path.abspath(path))
+    return retained
+
+
+def _record_rejected_config(
+    paths: List[str],
+    rejected: Optional[str],
+    *,
+    owned_root: str,
+) -> None:
+    if rejected is None or rejected in paths:
+        return
+    candidates = [*paths, rejected]
+    retained = retain_oldest_and_newest(candidates)
+    retained_set = set(retained)
+    for path in candidates:
+        if path not in retained_set and _is_owned_path(path, owned_root):
+            _unlink(path)
+    paths[:] = retained
 
 
 def _attempt_log(
@@ -484,13 +582,14 @@ def _run_attempt_in_output_dir(
         or proc.returncode in config.not_interesting_exit_codes
     )
     if not is_interesting and not is_clean:
-        _unlink(config_path)
+        rejected = _preserve_rejected_config(config_path)
         return _AttemptResult(
             0,
             0,
             1,
             None,
             log + f"\n--- error ---\nunexpected oracle returncode {proc.returncode}",
+            rejected_config_path=rejected,
         )
 
     if (
@@ -529,13 +628,14 @@ def _run_attempt_in_output_dir(
         expected_kernel_checksum=config.expected_kernel_checksum,
     )
     if config_error is not None:
-        _unlink(config_path)
+        rejected = _preserve_rejected_config(config_path)
         return _AttemptResult(
             0,
             0,
             1,
             None,
             log + f"\n--- error ---\n{config_error}",
+            rejected_config_path=rejected,
         )
     assert kernel_identity is not None
     assert enabled_point_count is not None
@@ -546,13 +646,14 @@ def _run_attempt_in_output_dir(
             kernel_identity=kernel_identity,
         )
         if targeting_error is not None:
-            _unlink(config_path)
+            rejected = _preserve_rejected_config(config_path)
             return _AttemptResult(
                 0,
                 0,
                 1,
                 None,
                 log + f"\n--- error ---\n{targeting_error}",
+                rejected_config_path=rejected,
             )
 
     if is_interesting:
@@ -879,6 +980,10 @@ def run_stress(  # noqa: C901
             logs=[],
         )
     )
+    rejected_config_paths: List[str] = _bounded_rejected_config_paths(
+        [] if resume is None else list(resume.rejected_config_paths),
+        owned_root=config.output_dir,
+    )
     triggering = None if resume is None else resume.triggering
     stop = False
     warp_targets: List[Optional[int]] = (
@@ -931,6 +1036,7 @@ def run_stress(  # noqa: C901
                 triggering=triggering,
             ),
             log_size_bytes=log_size_bytes if log_path is not None else None,
+            rejected_config_paths=list(rejected_config_paths),
         )
 
     trial_ordinal = 0
@@ -956,6 +1062,11 @@ def run_stress(  # noqa: C901
                 timed_out += outcome.timed_out
                 unattributed += outcome.unattributed
                 trial_ordinal += 1
+                _record_rejected_config(
+                    rejected_config_paths,
+                    outcome.rejected_config_path,
+                    owned_root=config.output_dir,
+                )
                 if outcome.triggering is not None:
                     if triggering is None:
                         triggering = outcome.triggering
@@ -1007,6 +1118,7 @@ def run_stress(  # noqa: C901
             triggering=triggering,
         ),
         log_size_bytes=log_size_bytes if log_path is not None else None,
+        rejected_config_paths=list(rejected_config_paths),
     )
 
 
