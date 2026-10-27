@@ -15,6 +15,7 @@ from typing import Any, Callable, cast, Mapping, Optional, Sequence, Union
 from click import ClickException
 from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
 from cutracer.service.artifacts import (
+    ArtifactVerificationError,
     local_artifact,
     local_file_uri,
     local_path,
@@ -38,6 +39,7 @@ from cutracer.validation.compression import open_trace_file
 
 TraceLocator = Callable[[str], Union[str, Sequence[str], None]]
 TraceAnalysisRunner = Callable[..., TraceAnalysisEvidence]
+TraceProgressCallback = Callable[[TraceExperimentResult], None]
 logger: logging.Logger = logging.getLogger(__name__)
 
 _TRACE_SUFFIXES = (".ndjson", ".ndjson.zst")
@@ -705,11 +707,7 @@ def _run_trace_capture(
     categories = ",".join(
         category.value for category in spec.trace.selector.instruction_categories
     )
-    if resolved_base_env is None:
-        base_env = os.environ.copy()
-        base_env.update(spec.unit.env)
-    else:
-        base_env = dict(resolved_base_env)
+    base_env = _trace_base_env(spec, resolved_base_env)
     argv = list(spec.unit.argv if resolved_argv is None else resolved_argv)
     cwd = resolved_cwd if resolved_cwd is not None else (spec.unit.cwd or None)
     return run_instrumented_target(
@@ -733,6 +731,17 @@ def _run_trace_capture(
         ),
         runner=runner,
     )
+
+
+def _trace_base_env(
+    spec: ExperimentSpec,
+    resolved_base_env: Optional[Mapping[str, str]],
+) -> dict[str, str]:
+    if resolved_base_env is not None:
+        return dict(resolved_base_env)
+    base_env = os.environ.copy()
+    base_env.update(spec.unit.env)
+    return base_env
 
 
 def _seal_capture_artifacts(
@@ -817,14 +826,23 @@ def _run_trace_analyzer(
     arch: str,
     out_dir: str,
     trace_analyzer: Optional[TraceAnalysisRunner],
+    tool_env: Mapping[str, str],
 ) -> tuple[Optional[TraceAnalysisEvidence], Optional[str]]:
     analysis_runner = trace_analyzer or run_trace_analysis
     try:
-        analysis = analysis_runner(
-            analysis_paths,
-            arch=arch,
-            out_dir=out_dir,
-        )
+        if analysis_runner is run_trace_analysis:
+            analysis = run_trace_analysis(
+                analysis_paths,
+                arch=arch,
+                out_dir=out_dir,
+                tool_env=tool_env,
+            )
+        else:
+            analysis = analysis_runner(
+                analysis_paths,
+                arch=arch,
+                out_dir=out_dir,
+            )
     except Exception as exc:
         logger.exception("deterministic trace analysis runner failed")
         candidate = getattr(analysis_runner, "__name__", "")
@@ -922,6 +940,7 @@ class _TraceRunOptions:
     resolved_base_env: Optional[Mapping[str, str]]
     resolved_config_path: Optional[str]
     use_bundled_cuda_tools: bool
+    progress_callback: Optional[TraceProgressCallback]
 
 
 @dataclasses.dataclass
@@ -986,6 +1005,41 @@ def _new_trace_run_state(
     )
 
 
+def _load_resume_state(
+    state: _TraceRunState,
+    resume_from: TraceExperimentResult,
+) -> None:
+    _validate_resume(
+        resume_from,
+        spec=state.spec,
+        provenance=state.provenance,
+    )
+    state.traces = list(resume_from.traces)
+    state.supporting = list(resume_from.supporting_artifacts)
+    state.log = resume_from.log
+    state.capture_duration_s = resume_from.duration_s
+    state.analysis_duration_s = resume_from.analysis_duration_s
+
+
+def _resume_analysis_paths(
+    state: _TraceRunState,
+    attempt_dir: str,
+) -> list[str]:
+    staged_capture = _stage_resume_artifacts(
+        [*state.traces, *state.supporting],
+        source_dir=state.out_dir,
+        destination_dir=os.path.join(attempt_dir, "resume_capture"),
+    )
+    if state.log is None:
+        raise ValueError("resume checkpoint has no log artifact")
+    _stage_resume_artifacts(
+        [state.log],
+        source_dir=state.out_dir,
+        destination_dir=os.path.join(attempt_dir, "resume_log"),
+    )
+    return staged_capture[: len(state.traces)]
+
+
 def _seal_fresh_capture(
     state: _TraceRunState,
     attempt_dir: str,
@@ -1023,14 +1077,22 @@ def _seal_fresh_capture(
         state.supporting,
         all_have_records,
     )
-    if capture_error is None:
-        return None
-    status, error = capture_error
-    return state.result(
-        status,
-        error=error,
-        completeness=ResultCompleteness.PARTIAL,
-    )
+    if capture_error is not None:
+        status, error = capture_error
+        return state.result(
+            status,
+            error=error,
+            completeness=ResultCompleteness.PARTIAL,
+        )
+    if options.progress_callback is not None:
+        options.progress_callback(
+            state.result(
+                ExecutionStatus.SUCCEEDED,
+                error=None,
+                completeness=ResultCompleteness.PARTIAL,
+            )
+        )
+    return None
 
 
 def _fresh_analysis_paths(
@@ -1066,6 +1128,7 @@ def _analyze_trace_paths(
             arch=state.spec.unit.arch,
             out_dir=state.out_dir,
             trace_analyzer=options.trace_analyzer,
+            tool_env=_trace_base_env(state.spec, options.resolved_base_env),
         )
     finally:
         state.analysis_duration_s += time.monotonic() - analysis_started
@@ -1120,8 +1183,10 @@ def run_trace_experiment(
     resolved_base_env: Optional[Mapping[str, str]] = None,
     resolved_config_path: Optional[str] = None,
     use_bundled_cuda_tools: bool = True,
+    resume_from: Optional[TraceExperimentResult] = None,
+    progress_callback: Optional[TraceProgressCallback] = None,
 ) -> TraceExperimentResult:
-    """Capture, seal, and analyze every targeted trace from one attempt."""
+    """Capture every targeted trace, checkpoint it, then analyze the batch."""
     _validate_trace_spec(spec)
     os.makedirs(out_dir, exist_ok=True)
     attempt_dir = tempfile.mkdtemp(prefix=".trace_attempt_", dir=out_dir)
@@ -1142,18 +1207,26 @@ def run_trace_experiment(
         resolved_base_env=resolved_base_env,
         resolved_config_path=resolved_config_path,
         use_bundled_cuda_tools=use_bundled_cuda_tools,
+        progress_callback=progress_callback,
     )
     try:
+        if resume_from is not None:
+            # Trust the checkpoint only after identity validation, but retain
+            # its sealed evidence if the current runtime spec is invalid.
+            _load_resume_state(state, resume_from)
         _validate_trace_runtime_spec(spec)
-        analysis_paths, early_result = _fresh_analysis_paths(
-            state, attempt_dir, options
-        )
-        if early_result is not None:
-            return early_result
+        if resume_from is not None:
+            analysis_paths = _resume_analysis_paths(state, attempt_dir)
+        else:
+            analysis_paths, early_result = _fresh_analysis_paths(
+                state, attempt_dir, options
+            )
+            if early_result is not None:
+                return early_result
         return _analyze_trace_paths(state, analysis_paths, options)
     except subprocess.TimeoutExpired as exc:
         return _timeout_trace_result(state, attempt_dir, options, exc)
-    except (ClickException, OSError, ValueError) as exc:
+    except (ArtifactVerificationError, ClickException, OSError, ValueError) as exc:
         return state.result(
             ExecutionStatus.INFRA_ERROR,
             error=str(exc),
