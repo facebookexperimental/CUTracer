@@ -439,6 +439,15 @@ class TriageOutcome(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class BaselineVerdict(str, Enum):
+    """How a scope's findings compare with the last complete campaign."""
+
+    NEW = "new"
+    UNCHANGED = "unchanged"
+    RESOLVED = "resolved"
+    NO_BASELINE = "no_baseline"
+
+
 class SessionStatus(str, Enum):
     WAITING_INITIAL = "waiting_initial"
     WAITING_TRIAGE = "waiting_triage"
@@ -800,6 +809,39 @@ class SuppressionRule:
             error_types=tuple(d.get("error_types", ())),
             expires_on=d.get("expires_on"),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopeId:
+    """The unit a baseline is kept for.
+
+    Deliberately per (test family, tool) rather than per campaign: the sweep
+    corpus times out on 40% of its runs, so a campaign-wide scope would never
+    be complete and no clean baseline could ever be established. Per-scope, the
+    60% that do complete keep working while the rest stay inconclusive.
+    """
+
+    test_family: str
+    tool: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.test_family}::{self.tool}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"test_family": self.test_family, "tool": self.tool}
+
+    @classmethod
+    def from_dict(cls, d: object) -> "ScopeId":
+        if not isinstance(d, dict):
+            raise ValueError("scope must be a JSON object")
+        test_family = d.get("test_family")
+        if not isinstance(test_family, str):
+            raise ValueError("scope test_family must be a string")
+        tool = d.get("tool")
+        if not isinstance(tool, str):
+            raise ValueError("scope tool must be a string")
+        return cls(test_family=test_family, tool=tool)
 
 
 @dataclasses.dataclass
