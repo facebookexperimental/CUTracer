@@ -2245,6 +2245,46 @@ class AnalysisTurn:
 
 
 @dataclasses.dataclass
+class ExperimentRecord:
+    """One line of what the session actually ran, for the report history."""
+
+    experiment_id: str
+    kind: ExperimentKind
+    phase: ExperimentPhase
+    round_index: int
+    execution_status: ExecutionStatus
+    outcome: str = ""
+    completeness: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "experiment_id": self.experiment_id,
+            "kind": self.kind.value,
+            "phase": self.phase.value,
+            "round_index": self.round_index,
+            "execution_status": self.execution_status.value,
+            "outcome": self.outcome,
+            "completeness": self.completeness,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ExperimentRecord":
+        return cls(
+            experiment_id=d["experiment_id"],
+            kind=ExperimentKind(d["kind"]),
+            phase=ExperimentPhase(d["phase"]),
+            round_index=int(d.get("round_index", 0)),
+            execution_status=ExecutionStatus(d["execution_status"]),
+            outcome=d.get("outcome", ""),
+            completeness=d.get("completeness", ""),
+        )
+
+
+ANALYSIS_SESSION_SCHEMA_VERSION = 4
+_MIN_ANALYSIS_SESSION_SCHEMA_VERSION = 3
+
+
+@dataclasses.dataclass
 class AnalysisSession:
     session_id: str
     unit: WorkUnit
@@ -2259,9 +2299,12 @@ class AnalysisSession:
     turns: List[AnalysisTurn] = dataclasses.field(default_factory=list)
     report: Optional[ExplainReport] = None
     triage: Optional[TriageDecision] = None
+    experiment_history: List["ExperimentRecord"] = dataclasses.field(
+        default_factory=list
+    )
     termination_reason: str = ""
     state_revision: int = 0
-    schema_version: int = 3
+    schema_version: int = ANALYSIS_SESSION_SCHEMA_VERSION
 
     @property
     def pending_experiment_ids(self) -> List[str]:
@@ -2283,6 +2326,7 @@ class AnalysisSession:
             "turns": [x.to_dict() for x in self.turns],
             "report": None if self.report is None else self.report.to_dict(),
             "triage": None if self.triage is None else self.triage.to_dict(),
+            "experiment_history": [x.to_dict() for x in self.experiment_history],
             "termination_reason": self.termination_reason,
             "state_revision": self.state_revision,
         }
@@ -2292,8 +2336,8 @@ class AnalysisSession:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AnalysisSession":
-        version = int(d.get("schema_version", 3))
-        if version < 3:
+        version = int(d.get("schema_version", _MIN_ANALYSIS_SESSION_SCHEMA_VERSION))
+        if version < _MIN_ANALYSIS_SESSION_SCHEMA_VERSION:
             raise ValueError(f"unsupported AnalysisSession schema_version: {version}")
         report = d.get("report")
         triage = d.get("triage")
@@ -2313,9 +2357,12 @@ class AnalysisSession:
             turns=[AnalysisTurn.from_dict(x) for x in d.get("turns", [])],
             report=None if report is None else ExplainReport.from_dict(report),
             triage=None if triage is None else TriageDecision.from_dict(triage),
+            experiment_history=[
+                ExperimentRecord.from_dict(x) for x in d.get("experiment_history", [])
+            ],
             termination_reason=d.get("termination_reason", ""),
             state_revision=int(d.get("state_revision", 0)),
-            schema_version=version,
+            schema_version=max(version, ANALYSIS_SESSION_SCHEMA_VERSION),
         )
 
     @classmethod
@@ -2331,6 +2378,13 @@ class SessionReport:
     evidence: EvidenceBundle
     turns: List[AnalysisTurn]
     termination_reason: str
+    unit: Optional[WorkUnit] = None
+    triage: Optional[TriageDecision] = None
+    experiments: List[ExperimentRecord] = dataclasses.field(default_factory=list)
+    artifact_citations: List[str] = dataclasses.field(default_factory=list)
+    triggering_configs: List[str] = dataclasses.field(default_factory=list)
+    minimized_configs: List[str] = dataclasses.field(default_factory=list)
+    rounds_used: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2340,6 +2394,13 @@ class SessionReport:
             "evidence": self.evidence.to_dict(),
             "turns": [x.to_dict() for x in self.turns],
             "termination_reason": self.termination_reason,
+            "unit": None if self.unit is None else self.unit.to_dict(),
+            "triage": None if self.triage is None else self.triage.to_dict(),
+            "experiments": [x.to_dict() for x in self.experiments],
+            "artifact_citations": list(self.artifact_citations),
+            "triggering_configs": list(self.triggering_configs),
+            "minimized_configs": list(self.minimized_configs),
+            "rounds_used": self.rounds_used,
         }
 
     def to_json(self, **kwargs: Any) -> str:
@@ -2355,6 +2416,19 @@ class SessionReport:
             evidence=EvidenceBundle.from_dict(d.get("evidence", {})),
             turns=[AnalysisTurn.from_dict(x) for x in d.get("turns", [])],
             termination_reason=d.get("termination_reason", ""),
+            unit=None if d.get("unit") is None else WorkUnit.from_dict(d["unit"]),
+            triage=(
+                None
+                if d.get("triage") is None
+                else TriageDecision.from_dict(d["triage"])
+            ),
+            experiments=[
+                ExperimentRecord.from_dict(x) for x in d.get("experiments", [])
+            ],
+            artifact_citations=list(d.get("artifact_citations", [])),
+            triggering_configs=list(d.get("triggering_configs", [])),
+            minimized_configs=list(d.get("minimized_configs", [])),
+            rounds_used=int(d.get("rounds_used", 0)),
         )
 
     @classmethod

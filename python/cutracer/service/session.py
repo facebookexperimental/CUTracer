@@ -19,6 +19,7 @@ from cutracer.service.contracts import (
     ExecutionStatus,
     ExperimentKind,
     ExperimentPhase,
+    ExperimentRecord,
     ExperimentResult,
     ExperimentSpec,
     ExplainReport,
@@ -105,7 +106,7 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
             refs.append(result.minimized_config.uri)
         if result.report is not None:
             refs.append(result.report.uri)
-    return refs
+    return list(dict.fromkeys(refs))
 
 
 def _evidence_results(evidence: EvidenceBundle) -> List[ExperimentResult]:
@@ -735,6 +736,36 @@ def _inconclusive_report(session: AnalysisSession, reason: str) -> ExplainReport
     )
 
 
+def _experiment_record(
+    spec: ExperimentSpec,
+    result: ExperimentResult,
+) -> ExperimentRecord:
+    outcome = ""
+    completeness = ""
+    if isinstance(result, SanitizerSweepResult):
+        outcome = result.outcome.value
+        completeness = result.completeness.value
+    elif isinstance(result, StressTestResult):
+        outcome = result.outcome.value
+        completeness = result.completeness.value
+    elif isinstance(result, TraceExperimentResult):
+        completeness = result.completeness.value
+    elif isinstance(result, ReduceExperimentResult):
+        outcome = result.outcome.value
+    # Unknown/future result types record with empty outcome/completeness:
+    # history recording must not abort a transition that validation (which
+    # rejects kind/type mismatches above) has already accepted.
+    return ExperimentRecord(
+        experiment_id=result.experiment_id,
+        kind=result.kind,
+        phase=spec.phase,
+        round_index=spec.round_index,
+        execution_status=result.execution_status,
+        outcome=outcome,
+        completeness=completeness,
+    )
+
+
 def _triage_report(session: AnalysisSession, decision: TriageDecision) -> ExplainReport:
     """Terminal report for a session that finished without an AI turn.
 
@@ -862,6 +893,10 @@ def record_experiment_result(
         if spec.experiment_id != result.experiment_id
     ]
     updated.completed_experiment_ids.append(result.experiment_id)
+    # Record while the spec is still known: phase and round cannot be recovered
+    # afterwards, and inferring them from the result kind would mislabel a
+    # follow-up sanitizer run as part of the initial campaign.
+    updated.experiment_history.append(_experiment_record(spec, result))
     if updated.pending_experiments:
         return Transition(session=updated, effects=())
     if spec.phase == ExperimentPhase.INITIAL:
@@ -1024,4 +1059,27 @@ def build_session_report(session: AnalysisSession) -> SessionReport:
         evidence=session.evidence,
         turns=session.turns,
         termination_reason=session.termination_reason,
+        unit=session.unit,
+        triage=session.triage,
+        experiments=list(session.experiment_history),
+        artifact_citations=_artifact_refs(session.evidence),
+        triggering_configs=list(
+            dict.fromkeys(
+                result.triggering_config.artifact.uri
+                for result in session.evidence.stress
+                if result.triggering_config is not None
+            )
+        ),
+        minimized_configs=list(
+            dict.fromkeys(
+                result.minimized_config.uri
+                for result in session.evidence.reductions
+                if result.minimized_config is not None
+            )
+        ),
+        rounds_used=(
+            max(record.round_index for record in session.experiment_history) + 1
+            if session.experiment_history
+            else 0
+        ),
     )
