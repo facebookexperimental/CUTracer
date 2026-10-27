@@ -82,6 +82,23 @@ class RacecheckFinding:
 
 
 @dataclass(frozen=True)
+class RacecheckInvalidAccess:
+    """A ``Potential invalid __shared__`` block.
+
+    Racecheck emits these when it cannot prove the target block has entered.
+    They carry a single access rather than a conflicting pair, so they are kept
+    out of :attr:`RacecheckParseResult.findings` to leave the paired-access
+    contract that downstream race analysis relies on intact.
+    """
+
+    message: str
+    access_type: str
+    size_bytes: int
+    access: Optional[RacecheckAccess] = None
+    raw_block: str = ""
+
+
+@dataclass(frozen=True)
 class RacecheckSummary:
     """Aggregate counts from the ``RACECHECK SUMMARY`` line."""
 
@@ -99,10 +116,22 @@ class RacecheckParseResult:
     summary: Optional[RacecheckSummary] = None
     tool: str = "racecheck"
     diagnostics: List[RacecheckParseDiagnostic] = field(default_factory=list)
+    output_truncated: bool = False
+    invalid_accesses: List[RacecheckInvalidAccess] = field(default_factory=list)
+
+    @property
+    def has_positive_signal(self) -> bool:
+        """Whether the log reported anything at all, of either racecheck kind."""
+        return bool(self.findings) or bool(self.invalid_accesses)
 
     @property
     def is_complete(self) -> bool:
-        """Whether the log has a single self-consistent summary and findings."""
+        """Whether the log has a single self-consistent summary and findings.
+
+        Truncated output stays complete: racecheck caps how many hazard blocks
+        it prints, but the summary counts remain authoritative, so the run is
+        still a proven positive rather than an unknown one.
+        """
         return self.summary is not None and not self.diagnostics
 
 
@@ -124,6 +153,31 @@ _SUMMARY_RE = re.compile(
     r"^RACECHECK SUMMARY: (?P<total>\d+) hazards? displayed "
     r"\((?P<errors>\d+) errors?, (?P<warnings>\d+) warnings?\)$"
 )
+_TRUNCATION_RE = re.compile(r"^Warning: Maximum number of hazards reached")
+_INVALID_ACCESS_RE = re.compile(
+    r"^Potential invalid __shared__ (?P<type>\w+) of size (?P<size>\d+) bytes\s*$"
+)
+_INVALID_SITE_RE = re.compile(
+    r"^at (?P<func>.+?)\+(?P<offset>0x[0-9a-fA-F]+)"
+    r"(?: in (?P<file>.+?):(?P<line>\d+))?\s*$"
+)
+
+# How many sanitizer lines after a message may still carry its ``at`` site.
+_SITE_LOOKAHEAD = 3
+
+
+def _sanitizer_body(line: str) -> Optional[str]:
+    """Return the sanitizer payload of ``line``, or ``None`` if it has none.
+
+    Compute Sanitizer and the child process write to the same stream without
+    coordinating, so the first diagnostic of a run is regularly appended to a
+    pytest progress line instead of starting one.  Anchoring on the marker
+    rather than the start of the line is what makes those blocks visible.
+    """
+    marker = line.find(_PREFIX + " ")
+    if marker < 0:
+        return None
+    return line[marker + len(_PREFIX) :].strip()
 
 
 def _required(groups: Dict[str, Optional[str]], name: str) -> str:
@@ -165,9 +219,40 @@ def _build_finding(
     )
 
 
+def _build_invalid_access(
+    groups: Dict[str, Optional[str]],
+    site: Optional[Dict[str, Optional[str]]],
+    raw_lines: List[str],
+) -> RacecheckInvalidAccess:
+    access_type = _required(groups, "type")
+    size_bytes = int(_required(groups, "size"))
+    access: Optional[RacecheckAccess] = None
+    if site is not None:
+        line = site.get("line")
+        file = site.get("file")
+        access = RacecheckAccess(
+            role="primary",
+            access_type=access_type,
+            function=_required(site, "func"),
+            offset=_required(site, "offset"),
+            file=file if file is not None else "",
+            line=int(line) if line is not None else 0,
+        )
+    return RacecheckInvalidAccess(
+        message=(
+            f"Potential invalid __shared__ {access_type} of size {size_bytes} bytes"
+        ),
+        access_type=access_type,
+        size_bytes=size_bytes,
+        access=access,
+        raw_block="\n".join(raw_lines),
+    )
+
+
 def _summary_consistency_diagnostics(
     summary: RacecheckSummary,
     findings: List[RacecheckFinding],
+    invalid_accesses: List[RacecheckInvalidAccess],
 ) -> List[RacecheckParseDiagnostic]:
     """Report contradictions between a parsed summary and finding blocks."""
     diagnostics: List[RacecheckParseDiagnostic] = []
@@ -177,7 +262,7 @@ def _summary_consistency_diagnostics(
         diagnostics.append(RacecheckParseDiagnostic.SUMMARY_COUNT_MISMATCH)
 
     summary_is_positive = not (total_is_zero and severities_are_zero)
-    findings_mismatch = summary_is_positive != bool(findings)
+    reported_anything = bool(findings) or bool(invalid_accesses)
     errors_mismatch = (
         any(finding.severity == RacecheckSeverity.ERROR for finding in findings)
         and summary.errors == 0
@@ -186,7 +271,9 @@ def _summary_consistency_diagnostics(
         any(finding.severity == RacecheckSeverity.WARNING for finding in findings)
         and summary.warnings == 0
     )
-    if findings_mismatch or errors_mismatch or warnings_mismatch:
+    missing_report = summary_is_positive and not reported_anything
+    unexpected_report = not summary_is_positive and reported_anything
+    if missing_report or unexpected_report or errors_mismatch or warnings_mismatch:
         diagnostics.append(RacecheckParseDiagnostic.SUMMARY_FINDING_MISMATCH)
     return diagnostics
 
@@ -194,12 +281,16 @@ def _summary_consistency_diagnostics(
 @dataclass
 class _RacecheckParser:
     findings: List[RacecheckFinding] = field(default_factory=list)
+    invalid_accesses: List[RacecheckInvalidAccess] = field(default_factory=list)
     diagnostics: List[RacecheckParseDiagnostic] = field(default_factory=list)
     summary: Optional[RacecheckSummary] = None
     summary_markers: int = 0
+    output_truncated: bool = False
     header: Optional[Dict[str, Optional[str]]] = None
     conflicts: List[Dict[str, Optional[str]]] = field(default_factory=list)
     raw_lines: List[str] = field(default_factory=list)
+    pending_invalid: Optional[Dict[str, Optional[str]]] = None
+    invalid_lookahead: int = 0
 
     def diagnose(self, issue: RacecheckParseDiagnostic) -> None:
         if issue not in self.diagnostics:
@@ -213,16 +304,19 @@ class _RacecheckParser:
                 )
             else:
                 self.diagnose(RacecheckParseDiagnostic.INCOMPLETE_FINDING)
+        if self.pending_invalid is not None:
+            self.invalid_accesses.append(
+                _build_invalid_access(self.pending_invalid, None, self.raw_lines)
+            )
         self.header = None
         self.conflicts = []
         self.raw_lines = []
+        self.pending_invalid = None
+        self.invalid_lookahead = 0
 
-    def consume(self, line: str) -> None:
-        if not line.startswith(_PREFIX):
-            return
-        body = line[len(_PREFIX) :].strip()
-
+    def consume_summary(self, body: str) -> bool:
         if "RACECHECK SUMMARY:" in body:
+            self.flush()
             self.summary_markers += 1
             summary_match = _SUMMARY_RE.fullmatch(body)
             if summary_match:
@@ -234,6 +328,57 @@ class _RacecheckParser:
                 )
             else:
                 self.diagnose(RacecheckParseDiagnostic.MALFORMED_SUMMARY)
+            return True
+        return False
+
+    def consume_auxiliary_block(self, body: str) -> bool:
+        if _TRUNCATION_RE.match(body):
+            # A display cap, not a hazard: the summary counts stay authoritative
+            # and must not be contradicted by the smaller number of blocks.
+            self.flush()
+            self.output_truncated = True
+            return True
+
+        invalid_match = _INVALID_ACCESS_RE.match(body)
+        if invalid_match:
+            self.flush()
+            self.pending_invalid = invalid_match.groupdict()
+            self.raw_lines = [body]
+            return True
+
+        if self.pending_invalid is not None:
+            if _HEADER_RE.match(body):
+                self.flush()
+                return False
+            site_match = _INVALID_SITE_RE.match(body)
+            if site_match:
+                self.raw_lines.append(body)
+                self.invalid_accesses.append(
+                    _build_invalid_access(
+                        self.pending_invalid,
+                        site_match.groupdict(),
+                        self.raw_lines,
+                    )
+                )
+                self.pending_invalid = None
+                self.raw_lines = []
+                return True
+            # Tolerate the same number of intervening lines as the checker
+            # layer before giving up on finding this block's location.
+            self.invalid_lookahead += 1
+            if self.invalid_lookahead <= _SITE_LOOKAHEAD:
+                self.raw_lines.append(body)
+                return True
+            self.flush()
+        return False
+
+    def consume(self, line: str) -> None:
+        body = _sanitizer_body(line)
+        if body is None:
+            return
+        if self.consume_summary(body):
+            return
+        if self.consume_auxiliary_block(body):
             return
 
         header_match = _HEADER_RE.match(body)
@@ -267,12 +412,18 @@ class _RacecheckParser:
             self.diagnose(RacecheckParseDiagnostic.MULTIPLE_SUMMARIES)
 
         if self.summary is not None:
-            for issue in _summary_consistency_diagnostics(self.summary, self.findings):
+            for issue in _summary_consistency_diagnostics(
+                self.summary,
+                self.findings,
+                self.invalid_accesses,
+            ):
                 self.diagnose(issue)
         return RacecheckParseResult(
             findings=self.findings,
             summary=self.summary,
             diagnostics=self.diagnostics,
+            output_truncated=self.output_truncated,
+            invalid_accesses=self.invalid_accesses,
         )
 
 

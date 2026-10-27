@@ -159,6 +159,60 @@ class ComputeSanitizerParserTest(unittest.TestCase):
                 self.assertFalse(result.is_complete)
                 self.assertIn(diagnostic, result.diagnostics)
 
+    def test_invalid_access_site_uses_full_lookahead_budget(self) -> None:
+        text = (
+            "========= Potential invalid __shared__ read of size 8 bytes\n"
+            "=========     by thread (0,0,0) in block (0,0,0)\n"
+            "=========     Address 0x10 is out of bounds\n"
+            "=========     device frame follows\n"
+            "=========     at k+0x20 in t.py:3\n"
+            "========= RACECHECK SUMMARY: 1 hazard displayed "
+            "(1 error, 0 warnings)\n"
+        )
+
+        result = parse_racecheck_log(text)
+
+        self.assertEqual(len(result.invalid_accesses), 1)
+        access = result.invalid_accesses[0].access
+        self.assertIsNotNone(access)
+        assert access is not None
+        self.assertEqual(access.function, "k")
+
+    def test_invalid_access_site_accepts_a_source_path_with_spaces(self) -> None:
+        text = (
+            "========= Potential invalid __shared__ read of size 8 bytes\n"
+            "=========     at k+0x20 in /tmp/source tree/t.py:3\n"
+            "========= RACECHECK SUMMARY: 1 hazard displayed "
+            "(1 error, 0 warnings)\n"
+        )
+
+        result = parse_racecheck_log(text)
+
+        access = result.invalid_accesses[0].access
+        self.assertIsNotNone(access)
+        assert access is not None
+        self.assertEqual(
+            (access.function, access.offset, access.file, access.line),
+            ("k", "0x20", "/tmp/source tree/t.py", 3),
+        )
+
+    def test_truncation_without_a_report_is_incomplete(self) -> None:
+        text = (
+            "========= Warning: Maximum number of hazards reached, "
+            "output will be truncated\n"
+            "========= RACECHECK SUMMARY: 100 hazards displayed "
+            "(316 errors, 1 warning)\n"
+        )
+
+        result = parse_racecheck_log(text)
+
+        self.assertTrue(result.output_truncated)
+        self.assertIn(
+            RacecheckParseDiagnostic.SUMMARY_FINDING_MISMATCH,
+            result.diagnostics,
+        )
+        self.assertFalse(result.is_complete)
+
 
 if __name__ == "__main__":
     unittest.main()
