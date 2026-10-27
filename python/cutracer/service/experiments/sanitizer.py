@@ -7,13 +7,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from click import ClickException
-from cutracer.compute_sanitizer.parser import (
-    parse_racecheck_log as parse_canonical_racecheck_log,
-)
 from cutracer.compute_sanitizer.run import (
     ComputeSanitizerConfig,
     run_compute_sanitizer,
@@ -23,27 +19,14 @@ from cutracer.compute_sanitizer.run import (
 from cutracer.service.artifacts import publish_local_artifact
 from cutracer.service.contracts import (
     ArtifactRef,
-    ExecutionProvenance,
     ExecutionStatus,
     ExperimentKind,
     ExperimentSpec,
-    FindingRecord,
-    ResultCompleteness,
-    SanitizerOutcome,
-    SanitizerSummary,
     SanitizerSweepResult,
-    SourceLoc,
 )
+from cutracer.service.sanitizer_results import build_sanitizer_result
 
 Reader = Callable[[str], str]
-
-
-@dataclass(frozen=True)
-class _RacecheckEvidence:
-    findings: List[FindingRecord]
-    summary: Optional[SanitizerSummary]
-    completeness: ResultCompleteness
-    issues: List[str]
 
 
 def _default_reader(path: str) -> str:
@@ -61,50 +44,6 @@ def _record_artifact_failure(status: ExecutionStatus) -> ExecutionStatus:
     if status == ExecutionStatus.SUCCEEDED:
         return ExecutionStatus.INFRA_ERROR
     return status
-
-
-def _parse_racecheck_evidence(text: str) -> _RacecheckEvidence:
-    """Convert one canonical parser result without discarding run-level facts."""
-    parsed = parse_canonical_racecheck_log(text)
-    records: List[FindingRecord] = []
-    for finding in parsed.findings:
-        primary = finding.accesses[0]
-        count = finding.max_hazards
-        records.append(
-            FindingRecord(
-                source_tool="compute_sanitizer/racecheck",
-                error_type="race-condition",
-                kernel_name=primary.function,
-                source=SourceLoc(file=primary.file, line=primary.line),
-                count=count if count is not None else 1,
-                raw=finding.raw_block,
-            )
-        )
-    summary = (
-        None
-        if parsed.summary is None
-        else SanitizerSummary(
-            total_hazards=parsed.summary.total_hazards,
-            errors=parsed.summary.errors,
-            warnings=parsed.summary.warnings,
-            raw=parsed.summary.raw,
-        )
-    )
-    return _RacecheckEvidence(
-        findings=records,
-        summary=summary,
-        completeness=(
-            ResultCompleteness.COMPLETE
-            if parsed.is_complete
-            else ResultCompleteness.PARTIAL
-        ),
-        issues=[diagnostic.value for diagnostic in parsed.diagnostics],
-    )
-
-
-def parse_racecheck_log(text: str) -> List[FindingRecord]:
-    """Compatibility wrapper returning only converted finding blocks."""
-    return _parse_racecheck_evidence(text).findings
 
 
 def _invoke_sanitizer(
@@ -189,21 +128,6 @@ def _read_and_publish_log(
     return text, log, status, error
 
 
-def _sanitizer_outcome(
-    racecheck: _RacecheckEvidence | None,
-    *,
-    status: ExecutionStatus,
-    log: ArtifactRef | None,
-) -> SanitizerOutcome:
-    if racecheck is None or racecheck.completeness != ResultCompleteness.COMPLETE:
-        return SanitizerOutcome.UNKNOWN
-    if racecheck.summary is not None and racecheck.summary.is_positive:
-        return SanitizerOutcome.FINDING
-    if status == ExecutionStatus.SUCCEEDED and log is not None:
-        return SanitizerOutcome.CLEAN
-    return SanitizerOutcome.UNKNOWN
-
-
 def _run_sanitizer_attempt(
     spec: ExperimentSpec,
     *,
@@ -238,31 +162,13 @@ def _run_sanitizer_attempt(
         error=error,
     )
 
-    racecheck = _parse_racecheck_evidence(text) if tool == "racecheck" else None
-    findings = [] if racecheck is None else racecheck.findings
-    summary = None if racecheck is None else racecheck.summary
-    completeness = (
-        ResultCompleteness.UNKNOWN if racecheck is None else racecheck.completeness
-    )
-    summary_issues = [] if racecheck is None else racecheck.issues
-
-    return SanitizerSweepResult(
-        experiment_id=spec.experiment_id,
+    return build_sanitizer_result(
+        spec,
         execution_status=status,
-        outcome=_sanitizer_outcome(racecheck, status=status, log=log),
-        tool=tool,
-        findings=findings,
-        provenance=ExecutionProvenance(
-            source_revision=spec.unit.source_revision,
-            arch=spec.unit.arch,
-            kernel=spec.unit.kernel,
-        ),
+        log_text=text,
         log=log,
         duration_s=time.monotonic() - started,
         error=error,
-        summary=summary,
-        completeness=completeness,
-        summary_issues=summary_issues,
     )
 
 

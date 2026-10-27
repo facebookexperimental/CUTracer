@@ -1556,6 +1556,21 @@ class ExperimentDispatchBinding:
             "dispatch_key": self.dispatch_key,
         }
 
+    def validate_experiment_identity(
+        self,
+        session_id: str,
+        experiment_id: str,
+    ) -> None:
+        """Prove that a dispatched callback belongs to one exact spec."""
+        if self.session_id != session_id:
+            raise ValueError(
+                "dispatch binding session_id does not match experiment spec"
+            )
+        if self.experiment_id != experiment_id:
+            raise ValueError(
+                "dispatch binding experiment_id does not match experiment spec"
+            )
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExperimentDispatchBinding":
         return cls(
