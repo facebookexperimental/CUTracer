@@ -1401,6 +1401,8 @@ class TraceAnalysisEvidence:
     artifact: Optional[ArtifactRef] = None
     error: Optional[str] = None
     schema_version: int = TRACE_ANALYSIS_SCHEMA_VERSION
+    capture_summaries: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    omitted_capture_summaries: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -1422,7 +1424,7 @@ class TraceAnalysisEvidence:
         return self.total_findings - len(self.findings)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "schema_version": self.schema_version,
             "analyzer": self.analyzer,
             "execution_status": self.execution_status.value,
@@ -1435,6 +1437,12 @@ class TraceAnalysisEvidence:
             "artifact": None if self.artifact is None else self.artifact.to_dict(),
             "error": self.error,
         }
+        if self.capture_summaries or self.omitted_capture_summaries:
+            payload["capture_summaries"] = [
+                dict(item) for item in self.capture_summaries
+            ]
+            payload["omitted_capture_summaries"] = self.omitted_capture_summaries
+        return payload
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TraceAnalysisEvidence":
@@ -1459,6 +1467,8 @@ class TraceAnalysisEvidence:
             artifact=None if artifact is None else ArtifactRef.from_dict(artifact),
             error=d.get("error"),
             schema_version=d["schema_version"],
+            capture_summaries=[dict(item) for item in d.get("capture_summaries", [])],
+            omitted_capture_summaries=int(d.get("omitted_capture_summaries", 0)),
         )
 
 
