@@ -39,7 +39,7 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 ArtifactLoader = Callable[[ArtifactRef, int], Optional[str]]
 logger: logging.Logger = logging.getLogger(__name__)
 
-_DECISION_SCHEMA = json.dumps(
+DECISION_SCHEMA = json.dumps(
     {
         "type": "object",
         "additionalProperties": False,
@@ -348,6 +348,32 @@ def _prompt(projected_state: str, artifact_context: str) -> str:
     )
 
 
+def build_reasoning_prompt(
+    session: AnalysisSession,
+    *,
+    artifact_loader: ArtifactLoader,
+    max_session_bytes: int,
+    max_artifact_bytes: int,
+) -> str:
+    triage = correlate_evidence(
+        session.unit.unit_id,
+        session.evidence,
+        test_id=session.unit.test_id,
+    )
+    return _prompt(
+        project_session_context(
+            session,
+            triage.to_dict(),
+            max_session_bytes,
+        ),
+        _artifact_context(
+            session,
+            artifact_loader,
+            max_artifact_bytes,
+        ),
+    )
+
+
 def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
     reproduced = any(result.has_positive_signal for result in session.evidence.stress)
     refs: List[str] = []
@@ -462,22 +488,11 @@ class ClaudeReasoner:
             return fallback_decision(session, "Claude is unavailable")
         run = self._runner or _subprocess_runner
         try:
-            triage = correlate_evidence(
-                session.unit.unit_id,
-                session.evidence,
-                test_id=session.unit.test_id,
-            )
-            prompt = _prompt(
-                project_session_context(
-                    session,
-                    triage.to_dict(),
-                    self._max_session_bytes,
-                ),
-                _artifact_context(
-                    session,
-                    self._artifact_loader,
-                    self._max_artifact_bytes,
-                ),
+            prompt = build_reasoning_prompt(
+                session,
+                artifact_loader=self._artifact_loader,
+                max_session_bytes=self._max_session_bytes,
+                max_artifact_bytes=self._max_artifact_bytes,
             )
         except PromptProjectionError as exc:
             logger.warning("reasoner prompt projection failed: %s", exc)
@@ -490,7 +505,7 @@ class ClaudeReasoner:
                     self._claude_bin,
                     "-p",
                     "--json-schema",
-                    _DECISION_SCHEMA,
+                    DECISION_SCHEMA,
                     "--output-format",
                     "json",
                 ],
