@@ -359,7 +359,7 @@ def _execute_reduction(
     )
 
 
-def _classify_reduction_failure(
+def classify_reduction_failure(
     exc: Exception,
 ) -> tuple[ReduceOutcome, ExecutionStatus, str]:
     if isinstance(
@@ -447,7 +447,7 @@ def run_reduce_experiment(
         OSError,
         ValueError,
     ) as exc:
-        outcome, status, error = _classify_reduction_failure(exc)
+        outcome, status, error = classify_reduction_failure(exc)
 
     return ReduceExperimentResult(
         experiment_id=spec.experiment_id,
