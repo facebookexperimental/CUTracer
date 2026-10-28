@@ -7,6 +7,7 @@ from collections import Counter
 from enum import Enum
 from typing import List, NoReturn, Optional, Sequence
 
+from cutracer.service.artifacts import same_artifact_content
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
@@ -24,6 +25,7 @@ from cutracer.service.contracts import (
     ExperimentSpec,
     ExplainReport,
     KernelId,
+    RaceClass,
     ReduceExperimentResult,
     ReduceOutcome,
     ResultCompleteness,
@@ -34,6 +36,7 @@ from cutracer.service.contracts import (
     SessionStatus,
     StressOutcome,
     StressTestResult,
+    TraceAnalysisSeverity,
     TraceExperimentResult,
     TriageDecision,
     TriageOutcome,
@@ -47,6 +50,11 @@ from cutracer.service.policy import (
     InitialCampaignPolicy,
 )
 from cutracer.service.sanitizer_results import (
+    ERROR_TYPE_INVALID_MEMORY_ACCESS,
+    ERROR_TYPE_MEMORY_LEAK,
+    ERROR_TYPE_MISALIGNED_ACCESS,
+    ERROR_TYPE_RACE_CONDITION,
+    ERROR_TYPE_UNINITIALIZED_READ,
     is_target_scoped_sanitizer,
     project_target_scoped_sanitizer_result,
 )
@@ -638,7 +646,22 @@ def _validate_reduce_result(
     result: ReduceExperimentResult,
 ) -> None:
     assert spec.reduction is not None
-    if result.input_config != spec.reduction.triggering_config:
+    expected_input = spec.reduction.triggering_config
+    returned_input = result.input_config
+    input_matches = returned_input.to_dict() == expected_input.to_dict()
+    if (
+        not input_matches
+        and result.execution_status == ExecutionStatus.SUCCEEDED
+        and result.outcome == ReduceOutcome.REDUCED
+        and same_artifact_content(returned_input.artifact, expected_input.artifact)
+    ):
+        input_matches = (
+            dataclasses.replace(
+                returned_input, artifact=expected_input.artifact
+            ).to_dict()
+            == expected_input.to_dict()
+        )
+    if not input_matches:
         _reject_result(
             "reduce_input_config_mismatch",
             "reduction input differs from the pending triggering config",
@@ -731,7 +754,7 @@ def _inconclusive_report(session: AnalysisSession, reason: str) -> ExplainReport
     reproduced = any(result.has_positive_signal for result in session.evidence.stress)
     return ExplainReport(
         root_cause="",
-        race_class="unknown",
+        race_class=RaceClass.UNKNOWN,
         confidence=Confidence.L,
         is_reproduced=reproduced,
         cross_validation=CrossValidation(agrees=False, notes=reason),
@@ -783,7 +806,7 @@ def _triage_report(session: AnalysisSession, decision: TriageDecision) -> Explai
     reproduced = any(result.has_positive_signal for result in session.evidence.stress)
     return ExplainReport(
         root_cause="",
-        race_class="unknown",
+        race_class=RaceClass.UNKNOWN,
         confidence=Confidence.L,
         is_reproduced=reproduced,
         cross_validation=CrossValidation(agrees=True, notes=decision.reason),
@@ -1036,6 +1059,154 @@ def _terminate_inconclusive(
     )
 
 
+def _cited_complete_sanitizer_results(
+    evidence: EvidenceBundle, report: ExplainReport
+) -> List[SanitizerSweepResult]:
+    return [
+        result
+        for result in evidence.sanitizer
+        if result.execution_status == ExecutionStatus.SUCCEEDED
+        and result.outcome == SanitizerOutcome.FINDING
+        and result.completeness == ResultCompleteness.COMPLETE
+        and not result.output_truncated
+        and not result.summary_issues
+        and result.log is not None
+        and result.log.uri in report.evidence_refs
+    ]
+
+
+def _has_cited_sanitizer_diagnosis(
+    evidence: EvidenceBundle, report: ExplainReport
+) -> bool:
+    """Support a diagnosis without a race class, not a claim of race freedom."""
+    return any(
+        finding.error_type
+        in (
+            ERROR_TYPE_UNINITIALIZED_READ,
+            ERROR_TYPE_INVALID_MEMORY_ACCESS,
+            ERROR_TYPE_MISALIGNED_ACCESS,
+            ERROR_TYPE_MEMORY_LEAK,
+        )
+        for result in _cited_complete_sanitizer_results(evidence, report)
+        for finding in result.findings
+    )
+
+
+def _raw_trace_claim_is_unsupported(
+    evidence: EvidenceBundle, report: ExplainReport
+) -> bool:
+    if any(
+        result.tool == "racecheck"
+        and any(
+            finding.error_type == ERROR_TYPE_RACE_CONDITION
+            and finding.count > 0
+            and (finding.error_detail.strip() or finding.raw.strip())
+            for finding in result.findings
+        )
+        for result in _cited_complete_sanitizer_results(evidence, report)
+    ):
+        return False
+    limited_raw_evidence = False
+    cited = set(report.evidence_refs)
+    for result in evidence.traces:
+        analysis = result.analysis
+        trace_cited = (
+            analysis is not None
+            and analysis.artifact is not None
+            and analysis.artifact.uri in cited
+        ) or any(trace.uri in cited for trace in result.traces)
+        if analysis is None:
+            limited_raw_evidence |= trace_cited
+            continue
+        summaries = [
+            summary
+            for summary in analysis.detector_summaries
+            if summary.source_tool == "cutracer"
+            and summary.sub_component in ("data_race_raw", "global_mem_raw")
+        ]
+        complete = (
+            result.execution_status == ExecutionStatus.SUCCEEDED
+            and result.completeness == ResultCompleteness.COMPLETE
+            and analysis.execution_status == ExecutionStatus.SUCCEEDED
+        )
+        limited_raw_evidence |= (trace_cited and not complete) or any(
+            not complete
+            or summary.verdict == "indeterminate"
+            or summary.severity == TraceAnalysisSeverity.WARNING
+            for summary in summaries
+        )
+        if (
+            complete
+            and trace_cited
+            and any(
+                summary.verdict == "violations_found"
+                and summary.severity == TraceAnalysisSeverity.ERROR
+                and summary.finding_count > 0
+                for summary in summaries
+            )
+        ):
+            return False
+    return limited_raw_evidence
+
+
+def _analysis_report_rejection(
+    session: AnalysisSession,
+    decision: AnalysisDecision,
+) -> Optional[str]:
+    report = decision.report
+    if report is None:
+        return None
+    available = set(_artifact_refs(session.evidence))
+    foreign = sorted(set(report.evidence_refs) - available)
+    if foreign:
+        return "reasoner cited artifacts outside this session: " + ", ".join(foreign)
+    if decision.kind != DecisionKind.FINAL:
+        return None
+    if report.evidence_sufficiency != EvidenceSufficiency.SUFFICIENT:
+        return "reasoner final claim is not supported by sufficient evidence"
+    if report.race_class == RaceClass.UNKNOWN:
+        return "reasoner final claim has an unknown race class"
+    if report.race_class == RaceClass.RAW and _raw_trace_claim_is_unsupported(
+        session.evidence, report
+    ):
+        return (
+            "reasoner RAW diagnosis relies on incomplete ordering evidence; "
+            "no cited complete RAW finding supports the mechanism"
+        )
+    if (
+        report.race_class == RaceClass.NONE
+        and report.root_cause.strip()
+        and not _has_cited_sanitizer_diagnosis(session.evidence, report)
+    ):
+        return (
+            "reasoner reported a root cause without a race class "
+            "or a cited complete sanitizer finding"
+        )
+    if report.race_class != RaceClass.NONE and not report.root_cause.strip():
+        return "reasoner classified a race without a root-cause explanation"
+    return None
+
+
+def _record_reasoner_turn(
+    session: AnalysisSession,
+    decision: AnalysisDecision,
+) -> tuple[AnalysisSession, Optional[Transition]]:
+    updated = _clone(session)
+    updated.turns.append(AnalysisTurn(turn_index=len(updated.turns), decision=decision))
+    if session.round_index == 0 and initial_evidence_requires_inconclusive(
+        session.evidence
+    ):
+        reason = "initial evidence is incomplete"
+        updated.turns[-1].guard_notes.append(reason)
+        return updated, _terminate_inconclusive(updated, reason)
+
+    report_rejection = _analysis_report_rejection(session, decision)
+    if report_rejection is None:
+        return updated, None
+    updated.turns[-1].guard_notes.append(report_rejection)
+    return updated, _terminate_inconclusive(updated, report_rejection)
+
+
 def record_analysis_decision(
     session: AnalysisSession,
     decision: AnalysisDecision,
@@ -1044,13 +1215,9 @@ def record_analysis_decision(
 ) -> Transition:
     if session.status != SessionStatus.WAITING_REASONER:
         raise ValueError(f"reasoner result in invalid state: {session.status}")
-    updated = _clone(session)
-    turn = AnalysisTurn(turn_index=len(updated.turns), decision=decision)
-    updated.turns.append(turn)
-    if session.round_index == 0 and initial_evidence_requires_inconclusive(
-        session.evidence
-    ):
-        return _terminate_inconclusive(updated, "initial evidence is incomplete")
+    updated, rejected = _record_reasoner_turn(session, decision)
+    if rejected is not None:
+        return rejected
 
     if decision.kind == DecisionKind.FINAL:
         if decision.report is None:
@@ -1079,7 +1246,7 @@ def record_analysis_decision(
 
     guard = guard_policy or ExperimentGuardPolicy()
     guarded = guard.expand(updated, decision.requests)
-    turn.guard_notes.extend((*guarded.notes, *guarded.rejections))
+    updated.turns[-1].guard_notes.extend((*guarded.notes, *guarded.rejections))
     if not guarded.experiments:
         reason = "no new valid follow-up experiment"
         if guarded.rejections:

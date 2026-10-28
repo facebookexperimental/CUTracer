@@ -20,6 +20,7 @@ from cutracer.service.contracts import (
     ExperimentKind,
     ExperimentRequest,
     ExplainReport,
+    RaceClass,
 )
 from cutracer.service.prompt_projection import (
     project_artifact_context,
@@ -126,7 +127,10 @@ _DECISION_SCHEMA = json.dumps(
                         "additionalProperties": False,
                         "properties": {
                             "root_cause": {"type": "string"},
-                            "race_class": {"type": "string"},
+                            "race_class": {
+                                "type": "string",
+                                "enum": [race_class.value for race_class in RaceClass],
+                            },
                             "confidence": {
                                 "type": "string",
                                 "enum": ["H", "M", "L"],
@@ -209,7 +213,7 @@ def _report_from_dict(raw: Dict[str, Any], raw_ai_output: str) -> ExplainReport:
     cross_dict = cross if isinstance(cross, dict) else {}
     return ExplainReport(
         root_cause=str(raw.get("root_cause") or ""),
-        race_class=str(raw.get("race_class") or "unknown"),
+        race_class=RaceClass.from_wire(str(raw.get("race_class") or "unknown")),
         confidence=Confidence(str(raw.get("confidence") or "L")),
         is_reproduced=bool(raw.get("is_reproduced")),
         cross_validation=CrossValidation(
@@ -332,7 +336,8 @@ def _prompt(projected_state: str, artifact_context: str) -> str:
         "a triggering random-delay config; reduction never discovers or synthesizes "
         "one. When that config exists, the service will automatically add "
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "
-        "and return inconclusive rather than inventing a root cause. Deterministic "
+        "and return inconclusive rather than inventing a root cause. Cite artifacts "
+        "only by an exact URI present in the projected session. Deterministic "
         "trace-analysis evidence embedded in PROJECTED SESSION is the primary "
         "interpretation "
         "of a trace; consult its structured summaries and findings before using raw "
@@ -365,7 +370,7 @@ def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
             refs.append(result.report.uri)
     return ExplainReport(
         root_cause="",
-        race_class="unknown",
+        race_class=RaceClass.UNKNOWN,
         confidence=Confidence.L,
         is_reproduced=reproduced,
         cross_validation=CrossValidation(agrees=False, notes=reason),
@@ -394,7 +399,7 @@ def fallback_decision(session: AnalysisSession, reason: str) -> AnalysisDecision
     stress_is_clean = _stress_is_trustworthy_non_reproduction(session)
     if not has_signal and sanitizer_is_clean and stress_is_clean:
         report = _fallback_report(session, reason)
-        report.race_class = "none"
+        report.race_class = RaceClass.NONE
         report.evidence_sufficiency = EvidenceSufficiency.SUFFICIENT
         return AnalysisDecision(
             kind=DecisionKind.FINAL,

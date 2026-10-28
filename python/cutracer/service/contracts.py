@@ -8,11 +8,13 @@ original single-trace explain contracts retained for compatibility.
 Design notes:
   * Enums subclass ``(str, Enum)`` so JSON is stable human-readable text.
   * ``to_dict`` recurses into nested dataclasses, lowers enums to ``.value``,
-    and preserves ``None`` optionals as ``null`` (keys are kept).
+    and normally preserves ``None`` optionals as ``null`` (keys are kept).
+    Additive compatibility metadata may be omitted while unknown so legacy
+    payload digests remain stable.
   * ``from_dict`` is FORWARD-COMPATIBLE: it reads only known fields and silently
     drops unknown keys, so a newer producer never breaks an older consumer.
-  * ``race_class`` is a free-form ``str`` (not an enum) because the taxonomy is
-    not yet frozen; keeping it a plain string avoids churn.
+  * ``race_class`` uses a stable enum; legacy spellings are accepted only at
+    deserialization boundaries and are emitted in canonical form.
 """
 
 from __future__ import annotations
@@ -51,6 +53,35 @@ class EvidenceSufficiency(str, Enum):
     SUFFICIENT = "sufficient"
     INSUFFICIENT = "insufficient"
     DEGRADED = "degraded"
+
+
+class RaceClass(str, Enum):
+    """Stable classification of the race mechanism diagnosed in a report.
+
+    NONE makes no race diagnosis; it does not imply no GPU error or prove the
+    kernel race-free. Sanitizer symptoms are classified by FindingRecord.error_type.
+    """
+
+    NONE = "none"
+    UNKNOWN = "unknown"
+    RAW = "raw"
+    WAR = "war"
+    WAW = "waw"
+    ATOMICITY = "atomicity"
+    SYNCHRONIZATION = "synchronization"
+    LIFETIME = "lifetime"
+    UNCLASSIFIED = "unclassified"
+
+    @classmethod
+    def from_wire(cls, value: str) -> "RaceClass":
+        aliases = {
+            "RAW": cls.RAW,
+            "WAR": cls.WAR,
+            "WAW": cls.WAW,
+            "intra-wg TMEM WAR": cls.WAR,
+        }
+        alias = aliases.get(value)
+        return alias if alias is not None else cls(value)
 
 
 class ConfirmStatus(str, Enum):
@@ -270,6 +301,13 @@ class ArtifactRef:
         )
 
 
+def _is_visible_artifact_basename(artifact: ArtifactRef) -> bool:
+    path = artifact.relative_path
+    return (
+        bool(path) and not path.startswith(".") and "/" not in path and "\\" not in path
+    )
+
+
 def _deduplicate_artifact_refs(refs: List[ArtifactRef]) -> List[ArtifactRef]:
     """Return exact artifact references once, preserving producer order."""
     unique: List[ArtifactRef] = []
@@ -345,7 +383,7 @@ class ExplainReport:
     """explain output; the Local and Sandcastle runners produce the same shape."""
 
     root_cause: str
-    race_class: str
+    race_class: RaceClass
     confidence: Confidence
     is_reproduced: bool
     cross_validation: CrossValidation
@@ -354,10 +392,14 @@ class ExplainReport:
     recommended_action: str
     raw_ai_output: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.race_class, RaceClass):
+            self.race_class = RaceClass.from_wire(self.race_class)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "root_cause": self.root_cause,
-            "race_class": self.race_class,
+            "race_class": self.race_class.value,
             "confidence": self.confidence.value,
             "is_reproduced": self.is_reproduced,
             "cross_validation": self.cross_validation.to_dict(),
@@ -375,7 +417,7 @@ class ExplainReport:
         d = _known(cls, d)
         return cls(
             root_cause=d["root_cause"],
-            race_class=d["race_class"],
+            race_class=RaceClass.from_wire(d["race_class"]),
             confidence=Confidence(d["confidence"]),
             is_reproduced=_as_bool(d["is_reproduced"]),
             cross_validation=CrossValidation.from_dict(d["cross_validation"]),
@@ -396,6 +438,7 @@ class ExplainReport:
 
 
 class ExperimentKind(str, Enum):
+    KERNEL_DISCOVERY = "kernel_discovery"
     COMPUTE_SANITIZER = "compute_sanitizer"
     RANDOM_DELAY_STRESS = "random_delay_stress"
     REG_TRACE = "reg_trace"
@@ -414,6 +457,14 @@ class StressOutcome(str, Enum):
     NOT_REPRODUCED = "not_reproduced"
     INCOMPLETE = "incomplete"
     SKIPPED = "skipped"
+
+
+class KernelDiscoveryOutcome(str, Enum):
+    DISCOVERED = "discovered"
+    NO_KERNELS = "no_kernels"
+    NO_MATCHING_KERNELS = "no_matching_kernels"
+    TOO_MANY_KERNELS = "too_many_kernels"
+    INFRA_ERROR = "infra_error"
 
 
 class ReduceOutcome(str, Enum):
@@ -461,6 +512,7 @@ class BaselineVerdict(str, Enum):
 
 
 class SessionStatus(str, Enum):
+    WAITING_CHILDREN = "waiting_children"
     WAITING_INITIAL = "waiting_initial"
     WAITING_TRIAGE = "waiting_triage"
     WAITING_REASONER = "waiting_reasoner"
@@ -1071,6 +1123,27 @@ class SanitizerSummary:
         )
 
 
+DEFAULT_MAX_DISCOVERED_KERNELS = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class KernelDiscoveryOptions:
+    max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS
+
+    def __post_init__(self) -> None:
+        if self.max_kernels <= 0:
+            raise ValueError("max_kernels must be positive")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"max_kernels": self.max_kernels}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "KernelDiscoveryOptions":
+        return cls(
+            max_kernels=int(d.get("max_kernels", DEFAULT_MAX_DISCOVERED_KERNELS))
+        )
+
+
 @dataclasses.dataclass
 class StressOptions:
     delay_ladder_ns: List[int] = dataclasses.field(
@@ -1337,12 +1410,20 @@ class ExperimentSpec:
     kind: ExperimentKind
     unit: WorkUnit
     round_index: int = 0
+    discovery: Optional[KernelDiscoveryOptions] = None
     sanitizer_tool: Optional[str] = None
     stress: Optional[StressOptions] = None
     trace: Optional[TraceOptions] = None
     reduction: Optional[ReduceOptions] = None
 
     def __post_init__(self) -> None:
+        if self.kind == ExperimentKind.KERNEL_DISCOVERY and self.discovery is None:
+            raise ValueError("kernel discovery experiment requires discovery options")
+        if (
+            self.kind == ExperimentKind.KERNEL_DISCOVERY
+            and self.unit.kernel is not None
+        ):
+            raise ValueError("kernel discovery requires an unpinned WorkUnit")
         if self.kind == ExperimentKind.COMPUTE_SANITIZER and not self.sanitizer_tool:
             raise ValueError("compute-sanitizer experiment requires sanitizer_tool")
         if self.kind == ExperimentKind.RANDOM_DELAY_STRESS and self.stress is None:
@@ -1375,6 +1456,7 @@ class ExperimentSpec:
             "kind": self.kind.value,
             "unit": self.unit.to_dict(),
             "round_index": self.round_index,
+            "discovery": (None if self.discovery is None else self.discovery.to_dict()),
             "sanitizer_tool": self.sanitizer_tool,
             "stress": None if self.stress is None else self.stress.to_dict(),
             "trace": None if self.trace is None else self.trace.to_dict(),
@@ -1384,6 +1466,7 @@ class ExperimentSpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExperimentSpec":
         stress = d.get("stress")
+        discovery = d.get("discovery")
         trace = d.get("trace")
         reduction = d.get("reduction")
         return cls(
@@ -1393,12 +1476,167 @@ class ExperimentSpec:
             kind=ExperimentKind(d["kind"]),
             unit=WorkUnit.from_dict(d["unit"]),
             round_index=int(d.get("round_index", 0)),
+            discovery=(
+                None
+                if discovery is None
+                else KernelDiscoveryOptions.from_dict(discovery)
+            ),
             sanitizer_tool=d.get("sanitizer_tool"),
             stress=None if stress is None else StressOptions.from_dict(stress),
             trace=None if trace is None else TraceOptions.from_dict(trace),
             reduction=(
                 None if reduction is None else ReduceOptions.from_dict(reduction)
             ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class KernelDiscoveryManifest:
+    target_unit_id: str
+    source_revision: str
+    arch: str
+    kernels: Tuple[KernelId, ...]
+    event_artifacts: Tuple[ArtifactRef, ...]
+    target_returncode: int
+    kernel_filters: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        identities = [(kernel.name, kernel.cubin_hash) for kernel in self.kernels]
+        if not self.target_unit_id.strip():
+            raise ValueError("kernel discovery manifest requires target_unit_id")
+        if not identities or identities != sorted(set(identities)):
+            raise ValueError("discovered kernels must be nonempty, unique, and sorted")
+        if any(
+            not name.strip() or not checksum.strip() for name, checksum in identities
+        ):
+            raise ValueError("discovered kernel identities must not be empty")
+        if not self.event_artifacts:
+            raise ValueError("kernel discovery manifest requires event artifacts")
+        if any(
+            not _is_visible_artifact_basename(artifact)
+            for artifact in self.event_artifacts
+        ):
+            raise ValueError(
+                "kernel discovery event artifacts require visible basenames"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target_unit_id": self.target_unit_id,
+            "source_revision": self.source_revision,
+            "arch": self.arch,
+            "kernels": [kernel.to_dict() for kernel in self.kernels],
+            "event_artifacts": [
+                artifact.to_dict() for artifact in self.event_artifacts
+            ],
+            "target_returncode": self.target_returncode,
+            "kernel_filters": list(self.kernel_filters),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "KernelDiscoveryManifest":
+        return cls(
+            target_unit_id=d["target_unit_id"],
+            source_revision=d.get("source_revision", ""),
+            arch=d.get("arch", ""),
+            kernels=tuple(KernelId.from_dict(item) for item in d.get("kernels", [])),
+            event_artifacts=tuple(
+                ArtifactRef.from_dict(item) for item in d.get("event_artifacts", [])
+            ),
+            target_returncode=int(d.get("target_returncode", 0)),
+            kernel_filters=tuple(d.get("kernel_filters", [])),
+        )
+
+
+@dataclasses.dataclass
+class KernelDiscoveryResult:
+    experiment_id: str
+    execution_status: ExecutionStatus
+    outcome: KernelDiscoveryOutcome
+    provenance: ExecutionProvenance
+    discovery: Optional[KernelDiscoveryManifest] = None
+    manifest_artifact: Optional[ArtifactRef] = None
+    duration_s: float = 0.0
+    error: Optional[str] = None
+
+    kind: ExperimentKind = dataclasses.field(
+        default=ExperimentKind.KERNEL_DISCOVERY, init=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.outcome == KernelDiscoveryOutcome.DISCOVERED:
+            if (
+                self.execution_status != ExecutionStatus.SUCCEEDED
+                or self.discovery is None
+                or self.manifest_artifact is None
+                or self.error is not None
+            ):
+                raise ValueError(
+                    "successful kernel discovery requires kernels and artifacts"
+                )
+            if not _is_visible_artifact_basename(self.manifest_artifact):
+                raise ValueError(
+                    "kernel discovery manifest artifact requires a visible basename"
+                )
+            return
+        if self.execution_status == ExecutionStatus.SUCCEEDED:
+            raise ValueError("unsuccessful kernel discovery cannot succeed")
+        if self.discovery is not None or self.manifest_artifact is not None:
+            raise ValueError("failed kernel discovery cannot publish partial evidence")
+        if self.error is None or not self.error.strip():
+            raise ValueError("failed kernel discovery requires an error")
+        expected_statuses = {
+            KernelDiscoveryOutcome.NO_KERNELS: (ExecutionStatus.FAILED,),
+            KernelDiscoveryOutcome.NO_MATCHING_KERNELS: (ExecutionStatus.FAILED,),
+            KernelDiscoveryOutcome.TOO_MANY_KERNELS: (ExecutionStatus.FAILED,),
+            KernelDiscoveryOutcome.INFRA_ERROR: (
+                ExecutionStatus.INFRA_ERROR,
+                ExecutionStatus.TIMED_OUT,
+            ),
+        }
+        if self.execution_status not in expected_statuses[self.outcome]:
+            raise ValueError(
+                "kernel discovery outcome does not match its execution status"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "experiment_id": self.experiment_id,
+            "execution_status": self.execution_status.value,
+            "outcome": self.outcome.value,
+            "provenance": self.provenance.to_dict(),
+            "discovery": None if self.discovery is None else self.discovery.to_dict(),
+            "manifest_artifact": (
+                None
+                if self.manifest_artifact is None
+                else self.manifest_artifact.to_dict()
+            ),
+            "duration_s": self.duration_s,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "KernelDiscoveryResult":
+        discovery = d.get("discovery")
+        manifest_artifact = d.get("manifest_artifact")
+        return cls(
+            experiment_id=d["experiment_id"],
+            execution_status=ExecutionStatus(d["execution_status"]),
+            outcome=KernelDiscoveryOutcome(d["outcome"]),
+            provenance=ExecutionProvenance.from_dict(d["provenance"]),
+            discovery=(
+                None
+                if discovery is None
+                else KernelDiscoveryManifest.from_dict(discovery)
+            ),
+            manifest_artifact=(
+                None
+                if manifest_artifact is None
+                else ArtifactRef.from_dict(manifest_artifact)
+            ),
+            duration_s=float(d.get("duration_s", 0.0)),
+            error=d.get("error"),
         )
 
 
@@ -2038,6 +2276,7 @@ class ReduceExperimentResult:
 
 
 ExperimentResult = Union[
+    KernelDiscoveryResult,
     SanitizerSweepResult,
     StressTestResult,
     TraceExperimentResult,
@@ -2047,6 +2286,8 @@ ExperimentResult = Union[
 
 def experiment_result_from_dict(d: Dict[str, Any]) -> ExperimentResult:
     kind = ExperimentKind(d["kind"])
+    if kind == ExperimentKind.KERNEL_DISCOVERY:
+        return KernelDiscoveryResult.from_dict(d)
     if kind == ExperimentKind.COMPUTE_SANITIZER:
         return SanitizerSweepResult.from_dict(d)
     if kind == ExperimentKind.RANDOM_DELAY_STRESS:
@@ -2233,13 +2474,16 @@ class ExperimentEnvelope:
 
 @dataclasses.dataclass
 class EvidenceBundle:
+    discovery: List[KernelDiscoveryResult] = dataclasses.field(default_factory=list)
     sanitizer: List[SanitizerSweepResult] = dataclasses.field(default_factory=list)
     stress: List[StressTestResult] = dataclasses.field(default_factory=list)
     traces: List[TraceExperimentResult] = dataclasses.field(default_factory=list)
     reductions: List[ReduceExperimentResult] = dataclasses.field(default_factory=list)
 
     def add(self, result: ExperimentResult) -> None:
-        if isinstance(result, SanitizerSweepResult):
+        if isinstance(result, KernelDiscoveryResult):
+            self.discovery.append(result)
+        elif isinstance(result, SanitizerSweepResult):
             self.sanitizer.append(result)
         elif isinstance(result, StressTestResult):
             self.stress.append(result)
@@ -2256,6 +2500,7 @@ class EvidenceBundle:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "discovery": [x.to_dict() for x in self.discovery],
             "sanitizer": [x.to_dict() for x in self.sanitizer],
             "stress": [x.to_dict() for x in self.stress],
             "traces": [x.to_dict() for x in self.traces],
@@ -2265,6 +2510,9 @@ class EvidenceBundle:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "EvidenceBundle":
         return cls(
+            discovery=[
+                KernelDiscoveryResult.from_dict(x) for x in d.get("discovery", [])
+            ],
             sanitizer=[
                 SanitizerSweepResult.from_dict(x) for x in d.get("sanitizer", [])
             ],
@@ -2444,7 +2692,7 @@ class ExperimentRecord:
         )
 
 
-ANALYSIS_SESSION_SCHEMA_VERSION = 4
+ANALYSIS_SESSION_SCHEMA_VERSION = 5
 _MIN_ANALYSIS_SESSION_SCHEMA_VERSION = 3
 
 
@@ -2466,6 +2714,11 @@ class AnalysisSession:
     experiment_history: List["ExperimentRecord"] = dataclasses.field(
         default_factory=list
     )
+    discovery_plan: Optional[KernelDiscoveryOptions] = None
+    child_sanitizer_tools: List[str] = dataclasses.field(default_factory=list)
+    child_enable_stress: bool = True
+    child_stress_options: Optional[StressOptions] = None
+    child_session_ids: List[str] = dataclasses.field(default_factory=list)
     termination_reason: str = ""
     state_revision: int = 0
     schema_version: int = ANALYSIS_SESSION_SCHEMA_VERSION
@@ -2491,6 +2744,17 @@ class AnalysisSession:
             "report": None if self.report is None else self.report.to_dict(),
             "triage": None if self.triage is None else self.triage.to_dict(),
             "experiment_history": [x.to_dict() for x in self.experiment_history],
+            "discovery_plan": (
+                None if self.discovery_plan is None else self.discovery_plan.to_dict()
+            ),
+            "child_sanitizer_tools": list(self.child_sanitizer_tools),
+            "child_enable_stress": self.child_enable_stress,
+            "child_stress_options": (
+                None
+                if self.child_stress_options is None
+                else self.child_stress_options.to_dict()
+            ),
+            "child_session_ids": list(self.child_session_ids),
             "termination_reason": self.termination_reason,
             "state_revision": self.state_revision,
         }
@@ -2505,6 +2769,8 @@ class AnalysisSession:
             raise ValueError(f"unsupported AnalysisSession schema_version: {version}")
         report = d.get("report")
         triage = d.get("triage")
+        discovery_plan = d.get("discovery_plan")
+        child_stress_options = d.get("child_stress_options")
         return cls(
             session_id=d["session_id"],
             unit=WorkUnit.from_dict(d["unit"]),
@@ -2524,6 +2790,19 @@ class AnalysisSession:
             experiment_history=[
                 ExperimentRecord.from_dict(x) for x in d.get("experiment_history", [])
             ],
+            discovery_plan=(
+                None
+                if discovery_plan is None
+                else KernelDiscoveryOptions.from_dict(discovery_plan)
+            ),
+            child_sanitizer_tools=list(d.get("child_sanitizer_tools", [])),
+            child_enable_stress=_as_bool(d.get("child_enable_stress", True)),
+            child_stress_options=(
+                None
+                if child_stress_options is None
+                else StressOptions.from_dict(child_stress_options)
+            ),
+            child_session_ids=list(d.get("child_session_ids", [])),
             termination_reason=d.get("termination_reason", ""),
             state_revision=int(d.get("state_revision", 0)),
             schema_version=max(version, ANALYSIS_SESSION_SCHEMA_VERSION),
@@ -2598,3 +2877,31 @@ class SessionReport:
     @classmethod
     def from_json(cls, source: Union[str, bytes, TextIO]) -> "SessionReport":
         return cls.from_dict(json.loads(_load_source(source)))
+
+
+@dataclasses.dataclass(frozen=True)
+class ChildDiagnosisReport:
+    unit: WorkUnit
+    report: SessionReport
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"unit": self.unit.to_dict(), "report": self.report.to_dict()}
+
+
+@dataclasses.dataclass(frozen=True)
+class DiagnosisReport:
+    target: WorkUnit
+    discovery: KernelDiscoveryResult
+    discovery_artifact: ArtifactRef
+    children: Tuple[ChildDiagnosisReport, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target": self.target.to_dict(),
+            "discovery": self.discovery.to_dict(),
+            "discovery_artifact": self.discovery_artifact.to_dict(),
+            "children": [child.to_dict() for child in self.children],
+        }
+
+    def to_json(self, **kwargs: Any) -> str:
+        return json.dumps(self.to_dict(), **kwargs)
