@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Callable, Protocol
 
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
+    ExperimentEnvelope,
     ExperimentResult,
     ExperimentSpec,
     SessionBudget,
@@ -20,6 +22,7 @@ from cutracer.service.session import (
     build_session_report,
     create_session,
     EffectKind,
+    ExperimentResultValidationError,
     record_analysis_decision,
     record_experiment_result,
     record_triage_decision,
@@ -30,6 +33,12 @@ from cutracer.service.storage import DurableSessionStore, StoreConflict
 from cutracer.service.triage import TriagePolicy
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperimentCallbackResult:
+    session: AnalysisSession
+    accepted: bool
 
 
 class MastDispatcher(Protocol):
@@ -192,6 +201,25 @@ class DistributedCoordinator:
             session_id,
             lambda session: record_experiment_result(session, result),
         )
+
+    def on_experiment_envelope(
+        self,
+        envelope: ExperimentEnvelope,
+    ) -> ExperimentCallbackResult:
+        accepted = False
+
+        def apply_envelope(session: AnalysisSession) -> Transition:
+            nonlocal accepted
+            if envelope.analyzed_state_revision > session.state_revision:
+                raise ExperimentResultValidationError(
+                    "future_dispatch_revision",
+                    "experiment callback was dispatched from a future session revision",
+                )
+            accepted = envelope.experiment_id not in session.completed_experiment_ids
+            return record_experiment_result(session, envelope.result)
+
+        session = self._apply(envelope.session_id, apply_envelope)
+        return ExperimentCallbackResult(session=session, accepted=accepted)
 
     def on_reasoning_decision(
         self,
