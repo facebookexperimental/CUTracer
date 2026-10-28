@@ -6,7 +6,7 @@ import json
 import os
 import shlex
 import time
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from cutracer.reduce.config_mutator import DelayConfigMutator
 from cutracer.reduce.reduce import (
@@ -16,6 +16,7 @@ from cutracer.reduce.reduce import (
     ReduceConfig,
     ReduceResult,
     ReplayConfig,
+    ReplayEvaluator,
     ReplayExecutionError,
     ReplayOutcome,
 )
@@ -178,28 +179,38 @@ def _build_reduce_config(
     timeout: int,
     expected_kernel_name: Optional[str],
     expected_kernel_checksum: Optional[str],
+    resolved_oracle_argv: Optional[Sequence[str]],
+    resolved_cwd: Optional[str],
+    resolved_base_env: Optional[Mapping[str, str]],
+    replay_evaluator: Optional[ReplayEvaluator],
 ) -> ReduceConfig:
-    base_env = os.environ.copy()
-    base_env.update(spec.unit.env)
+    if resolved_base_env is None:
+        base_env = os.environ.copy()
+        base_env.update(spec.unit.env)
+    else:
+        base_env = dict(resolved_base_env)
     kernel = spec.unit.kernel
     kernel_filter = kernel.name if kernel is not None and kernel.name else None
     return ReduceConfig(
         config_path=input_path,
         output_path=minimal_path,
         replay=ReplayConfig(
-            oracle_argv=list(oracle.argv),
+            oracle_argv=list(
+                oracle.argv if resolved_oracle_argv is None else resolved_oracle_argv
+            ),
             cutracer_so=cutracer_so,
             kernel_filters=kernel_filter,
             delay_warpgroup_id=reduction.triggering_config.warpgroup_id,
             output_dir=out_dir,
             timeout=timeout,
-            cwd=spec.unit.cwd or None,
+            cwd=(resolved_cwd if resolved_cwd is not None else (spec.unit.cwd or None)),
             base_env=base_env,
             not_interesting_exit_codes=tuple(oracle.not_interesting_exit_codes),
             expected_kernel_name=expected_kernel_name,
             expected_kernel_checksum=expected_kernel_checksum,
         ),
         replay_runner=runner,
+        replay_evaluator=replay_evaluator,
     )
 
 
@@ -303,8 +314,15 @@ def _execute_reduction(
     timeout: int,
     cutracer_version: str,
     toolchain_version: str,
+    resolved_oracle_argv: Optional[Sequence[str]],
+    resolved_cwd: Optional[str],
+    resolved_base_env: Optional[Mapping[str, str]],
+    replay_evaluator: Optional[ReplayEvaluator],
 ) -> tuple[ArtifactRef, Optional[ArtifactRef], list[EssentialDelayPoint], str]:
     os.makedirs(out_dir, exist_ok=True)
+    effective_oracle_argv = (
+        oracle.argv if resolved_oracle_argv is None else resolved_oracle_argv
+    )
     verified = stage_verified_local_artifact(
         reduction.triggering_config.artifact,
         destination=os.path.join(out_dir, "verified_triggering_config.json"),
@@ -327,13 +345,17 @@ def _execute_reduction(
         timeout=timeout,
         expected_kernel_name=expected_name,
         expected_kernel_checksum=expected_checksum,
+        resolved_oracle_argv=resolved_oracle_argv,
+        resolved_cwd=resolved_cwd,
+        resolved_base_env=resolved_base_env,
+        replay_evaluator=replay_evaluator,
     )
     result = _run_reduction(reduction, config)
     return _publish_reduction_result(
         result,
         input_path=verified.path,
         report_path=os.path.join(out_dir, "reduce_report.json"),
-        oracle_argv=oracle.argv,
+        oracle_argv=effective_oracle_argv,
     )
 
 
@@ -376,6 +398,10 @@ def run_reduce_experiment(
     runner: Optional[RunTarget] = None,
     cutracer_so: Optional[str] = None,
     timeout: int = 1800,
+    resolved_oracle_argv: Optional[Sequence[str]] = None,
+    resolved_cwd: Optional[str] = None,
+    resolved_base_env: Optional[Mapping[str, str]] = None,
+    replay_evaluator: Optional[ReplayEvaluator] = None,
 ) -> ReduceExperimentResult:
     """Reduce a required triggering config; never discover one implicitly."""
     if spec.kind != ExperimentKind.REDUCE_DELAY_CONFIG:
@@ -404,6 +430,10 @@ def run_reduce_experiment(
             timeout=timeout,
             cutracer_version=cutracer_version,
             toolchain_version=toolchain_version,
+            resolved_oracle_argv=resolved_oracle_argv,
+            resolved_cwd=resolved_cwd,
+            resolved_base_env=resolved_base_env,
+            replay_evaluator=replay_evaluator,
         )
         outcome = ReduceOutcome.REDUCED
         status = ExecutionStatus.SUCCEEDED

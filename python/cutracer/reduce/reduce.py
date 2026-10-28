@@ -92,6 +92,9 @@ class ReplayResult:
         return self.outcome == ReplayOutcome.INTERESTING
 
 
+ReplayEvaluator = Callable[[str, ReplayConfig], ReplayResult]
+
+
 class ReplayExecutionError(RuntimeError):
     """Raised when a reducer candidate could not be evaluated reliably."""
 
@@ -152,6 +155,17 @@ class ReduceConfig:
     validate_schema: bool = True
     replay: Optional[ReplayConfig] = None
     replay_runner: Optional[RunTarget] = None
+    replay_evaluator: Optional[ReplayEvaluator] = None
+
+    def __post_init__(self) -> None:
+        if self.replay_runner is not None and self.replay_evaluator is not None:
+            raise ValueError(
+                "replay_runner and replay_evaluator are mutually exclusive"
+            )
+        if self.replay is None and (
+            self.replay_runner is not None or self.replay_evaluator is not None
+        ):
+            raise ValueError("replay execution hooks require a replay config")
 
 
 def _replay_delay_ns(config_path: str) -> int:
@@ -473,11 +487,14 @@ def run_test(
 
 def _candidate_is_interesting(config: ReduceConfig, config_path: str) -> bool:
     if config.replay is not None:
-        result = run_replay(
-            config_path,
-            config.replay,
-            runner=config.replay_runner,
-        )
+        if config.replay_evaluator is None:
+            result = run_replay(
+                config_path,
+                config.replay,
+                runner=config.replay_runner,
+            )
+        else:
+            result = config.replay_evaluator(config_path, config.replay)
         if result.outcome in (
             ReplayOutcome.INFRA_ERROR,
             ReplayOutcome.TIMED_OUT,

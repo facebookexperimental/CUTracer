@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from cutracer.reduce.config_mutator import DelayConfigMutator, DelayPoint
 from cutracer.reduce.reduce import (
@@ -27,6 +27,7 @@ from cutracer.reduce.reduce import (
     ReplayConfig,
     ReplayExecutionError,
     ReplayOutcome,
+    ReplayResult,
     run_replay,
 )
 from cutracer.reduce.report import format_report_text, generate_report
@@ -477,6 +478,68 @@ class ReplayTest(unittest.TestCase):
         )
         with self.assertRaises(ReplayExecutionError):
             reduce_delay_points(config)
+
+    def test_injected_replay_evaluator_preserves_failure_outcomes(self):
+        failures = (
+            ReplayOutcome.INFRA_ERROR,
+            ReplayOutcome.TIMED_OUT,
+            ReplayOutcome.STALE_INPUT,
+        )
+        for outcome in failures:
+            with self.subTest(outcome=outcome):
+                evaluate = Mock(
+                    return_value=ReplayResult(outcome, None, error="typed failure")
+                )
+                config = ReduceConfig(
+                    config_path=str(self.config_path),
+                    validate_schema=False,
+                    replay=ReplayConfig(oracle_argv=["./oracle"]),
+                    replay_evaluator=evaluate,
+                )
+                with self.assertRaises(ReplayExecutionError) as context:
+                    reduce_delay_points(config)
+
+                self.assertEqual(context.exception.outcome, outcome)
+                evaluate.assert_called_once()
+
+    def test_injected_replay_evaluator_preserves_oracle_outcomes(self):
+        not_interesting = ReduceConfig(
+            config_path=str(self.config_path),
+            validate_schema=False,
+            replay=ReplayConfig(oracle_argv=["./oracle"]),
+            replay_evaluator=lambda _path, _replay: ReplayResult(
+                ReplayOutcome.NOT_INTERESTING,
+                1,
+            ),
+        )
+        with self.assertRaises(ConfigDoesNotTriggerError):
+            reduce_delay_points(not_interesting)
+
+        interesting = ReduceConfig(
+            config_path=str(self.config_path),
+            validate_schema=False,
+            replay=ReplayConfig(oracle_argv=["./oracle"]),
+            replay_evaluator=lambda _path, _replay: ReplayResult(
+                ReplayOutcome.INTERESTING,
+                0,
+            ),
+        )
+        result = reduce_delay_points(interesting)
+        self.assertEqual(result.essential_points, [])
+
+    def test_replay_evaluator_and_runner_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            ReduceConfig(
+                config_path=str(self.config_path),
+                replay=ReplayConfig(oracle_argv=["./oracle"]),
+                replay_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 0
+                ),
+                replay_evaluator=lambda _path, _replay: ReplayResult(
+                    ReplayOutcome.INTERESTING,
+                    0,
+                ),
+            )
 
 
 class ReduceDelayPointsTest(unittest.TestCase):
