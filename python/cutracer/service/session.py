@@ -116,10 +116,7 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
     for result in evidence.traces:
         refs.extend(_trace_artifact_refs(result))
     for result in evidence.reductions:
-        if result.minimized_config is not None:
-            refs.append(result.minimized_config.uri)
-        if result.report is not None:
-            refs.append(result.report.uri)
+        refs.extend(artifact.uri for artifact in result.artifact_refs())
     return list(dict.fromkeys(refs))
 
 
@@ -681,6 +678,7 @@ def _validate_reduce_result(
             result.minimized_config is not None
             or result.report is not None
             or result.essential_points
+            or result.essential_points_artifact is not None
         ):
             _reject_result(
                 "reduce_result_inconsistent",

@@ -2218,6 +2218,7 @@ class ReduceExperimentResult:
     input_config: TriggeringDelayConfig
     minimized_config: Optional[ArtifactRef] = None
     report: Optional[ArtifactRef] = None
+    essential_points_artifact: Optional[ArtifactRef] = None
     essential_points: List[EssentialDelayPoint] = dataclasses.field(
         default_factory=list
     )
@@ -2231,6 +2232,19 @@ class ReduceExperimentResult:
     kind: ExperimentKind = dataclasses.field(
         default=ExperimentKind.REDUCE_DELAY_CONFIG, init=False
     )
+
+    def artifact_refs(self) -> List[ArtifactRef]:
+        """Return the typed reduction artifacts, with report/config priority."""
+        return [
+            artifact
+            for artifact in (
+                self.report,
+                self.minimized_config,
+                self.essential_points_artifact,
+                self.input_config.artifact,
+            )
+            if artifact is not None
+        ]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2246,6 +2260,11 @@ class ReduceExperimentResult:
                 else self.minimized_config.to_dict()
             ),
             "report": None if self.report is None else self.report.to_dict(),
+            "essential_points_artifact": (
+                None
+                if self.essential_points_artifact is None
+                else self.essential_points_artifact.to_dict()
+            ),
             "essential_points": [x.to_dict() for x in self.essential_points],
             "duration_s": self.duration_s,
             "error": self.error,
@@ -2256,6 +2275,7 @@ class ReduceExperimentResult:
     def from_dict(cls, d: Dict[str, Any]) -> "ReduceExperimentResult":
         minimized = d.get("minimized_config")
         report = d.get("report")
+        essential_points_artifact = d.get("essential_points_artifact")
         return cls(
             experiment_id=d["experiment_id"],
             execution_status=ExecutionStatus(d["execution_status"]),
@@ -2266,6 +2286,11 @@ class ReduceExperimentResult:
                 None if minimized is None else ArtifactRef.from_dict(minimized)
             ),
             report=None if report is None else ArtifactRef.from_dict(report),
+            essential_points_artifact=(
+                None
+                if essential_points_artifact is None
+                else ArtifactRef.from_dict(essential_points_artifact)
+            ),
             essential_points=[
                 EssentialDelayPoint.from_dict(x) for x in d.get("essential_points", [])
             ],

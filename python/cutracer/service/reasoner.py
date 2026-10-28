@@ -283,9 +283,7 @@ def _artifact_refs(session: AnalysisSession) -> List[ArtifactRef]:
 
     reduction_refs: List[ArtifactRef] = []
     for result in reversed(session.evidence.reductions):
-        reduction_refs.extend(
-            _present_artifacts(result.report, result.minimized_config)
-        )
+        reduction_refs.extend(result.artifact_refs())
 
     stress_configs: List[ArtifactRef] = []
     stress_logs: List[ArtifactRef] = []
