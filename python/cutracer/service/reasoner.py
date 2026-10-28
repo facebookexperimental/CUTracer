@@ -34,6 +34,8 @@ from cutracer.service.triage import (
     sanitizer_is_trustworthy_clean,
     stress_is_trustworthy_non_reproduction,
 )
+from jsonschema import validate
+from jsonschema.exceptions import ValidationError
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 ArtifactLoader = Callable[[ArtifactRef, int], Optional[str]]
@@ -47,6 +49,11 @@ DECISION_SCHEMA = json.dumps(
             "kind": {
                 "type": "string",
                 "enum": ["final", "followup_required", "inconclusive"],
+                "description": (
+                    "Use final only with sufficient evidence for the reported "
+                    "diagnosis. Use inconclusive for a remaining hypothesis "
+                    "with insufficient or degraded evidence."
+                ),
             },
             "rationale": {"type": "string"},
             "requests": {
@@ -66,6 +73,19 @@ DECISION_SCHEMA = json.dumps(
                             ],
                         },
                         "rationale": {"type": "string"},
+                        "instrument_modes": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["reg_trace", "mem_value_trace", "tma_trace"],
+                            },
+                            "maxItems": 3,
+                            "uniqueItems": True,
+                            "description": (
+                                "Optional same-run instrumentation for trace requests "
+                                "only; include the primary request kind."
+                            ),
+                        },
                         "trace_selector": {
                             "type": "object",
                             "additionalProperties": False,
@@ -76,10 +96,19 @@ DECISION_SCHEMA = json.dumps(
                                     "properties": {
                                         "name": {"type": "string"},
                                         "cubin_hash": {"type": "string"},
+                                        "mangled_name": {"type": "string"},
                                     },
                                     "required": ["name", "cubin_hash"],
                                 },
-                                "launch_id": {"type": "integer", "minimum": 0},
+                                "launch_id": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": (
+                                        "Observed global grid_launch_id for the pinned "
+                                        "kernel, not its per-kernel iteration number. "
+                                        "Omit when unknown; do not assume zero."
+                                    ),
+                                },
                                 "warp_id": {
                                     "type": "integer",
                                     "minimum": 0,
@@ -113,7 +142,10 @@ DECISION_SCHEMA = json.dumps(
                                     "enum": ["triggering", "minimized"],
                                 },
                             },
-                            "not": {"required": ["warp_id", "warpgroup_id"]},
+                            "allOf": [
+                                {"not": {"required": ["warp_id", "warpgroup_id"]}},
+                                {"not": {"required": ["pc_offsets", "config_source"]}},
+                            ],
                         },
                     },
                     "required": ["kind", "rationale"],
@@ -126,21 +158,48 @@ DECISION_SCHEMA = json.dumps(
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "root_cause": {"type": "string"},
+                            "root_cause": {
+                                "type": "string",
+                                "description": (
+                                    "Evidence-grounded explanation of the GPU "
+                                    "correctness issue, which need not be a race."
+                                ),
+                            },
                             "race_class": {
                                 "type": "string",
                                 "enum": [race_class.value for race_class in RaceClass],
+                                "description": (
+                                    "Race mechanism diagnosed in this report. "
+                                    "none means no race mechanism is diagnosed, "
+                                    "not no GPU error or proof of race-freedom. "
+                                    "The sanitizer error_type describes a "
+                                    "separate observed symptom."
+                                ),
                             },
                             "confidence": {
                                 "type": "string",
                                 "enum": ["H", "M", "L"],
                             },
-                            "is_reproduced": {"type": "boolean"},
+                            "is_reproduced": {
+                                "type": "boolean",
+                                "description": (
+                                    "An actual correctness signal was observed, "
+                                    "including a sanitizer finding. Distinguish that "
+                                    "signal from stress output-mismatch counts."
+                                ),
+                            },
                             "cross_validation": {
                                 "type": "object",
                                 "additionalProperties": False,
                                 "properties": {
-                                    "agrees": {"type": "boolean"},
+                                    "agrees": {
+                                        "type": "boolean",
+                                        "description": (
+                                            "The observations are compatible; this "
+                                            "does not establish independent proof "
+                                            "of a cause or the absence of a race."
+                                        ),
+                                    },
                                     "notes": {"type": "string"},
                                 },
                                 "required": ["agrees", "notes"],
@@ -148,6 +207,11 @@ DECISION_SCHEMA = json.dumps(
                             "evidence_sufficiency": {
                                 "type": "string",
                                 "enum": ["sufficient", "insufficient", "degraded"],
+                                "description": (
+                                    "Support for the reported diagnosis, not merely "
+                                    "successful completion of a trace capture. "
+                                    "A final report requires sufficient evidence."
+                                ),
                             },
                             "evidence_refs": {
                                 "type": "array",
@@ -175,6 +239,10 @@ DECISION_SCHEMA = json.dumps(
 )
 
 
+class ReasoningOutputError(ValueError):
+    """A model response does not satisfy the reasoning output contract."""
+
+
 def _subprocess_runner(
     argv: List[str], *, timeout: int, prompt: str
 ) -> "subprocess.CompletedProcess[str]":
@@ -200,6 +268,13 @@ def _parse_envelope(stdout: str) -> Optional[Dict[str, Any]]:
         return structured
     result = envelope.get("result")
     if isinstance(result, str):
+        lines = result.strip().split("\n")
+        if (
+            len(lines) >= 3
+            and lines[0].rstrip("\r") in ("```json", "```")
+            and lines[-1] == "```"
+        ):
+            result = "\n".join(lines[1:-1])
         try:
             parsed = json.loads(result)
         except (TypeError, ValueError):
@@ -247,6 +322,25 @@ def _decision_from_dict(raw: Dict[str, Any], raw_ai_output: str) -> AnalysisDeci
             if isinstance(request, dict)
         ],
     )
+
+
+def parse_reasoning_output(stdout: str) -> AnalysisDecision:
+    """Parse and strictly validate one Claude JSON output envelope."""
+    structured = _parse_envelope(stdout)
+    if structured is None:
+        raise ReasoningOutputError("reasoning output is not a Claude JSON envelope")
+    try:
+        validate(instance=structured, schema=json.loads(DECISION_SCHEMA))
+    except ValidationError as error:
+        raise ReasoningOutputError(
+            f"reasoning decision failed schema validation: {error.message}"
+        ) from error
+    try:
+        return _decision_from_dict(structured, stdout)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReasoningOutputError(
+            f"reasoning decision failed contract validation: {error}"
+        ) from error
 
 
 def _local_artifact_loader(ref: ArtifactRef, max_bytes: int) -> Optional[str]:
@@ -326,21 +420,86 @@ def _prompt(projected_state: str, artifact_context: str) -> str:
         "the accumulated evidence is sufficient for a final report or whether a "
         "bounded follow-up experiment is required. Request only the experiment kinds "
         "allowed by the schema. Do not emit shell commands. Prefer reg_trace for "
-        "control/register provenance and mem_value_trace only when memory values are "
-        "needed. Trace selectors are optional, data-only, and allowlisted: use only the "
+        "control/register provenance. For TMA producer, mbarrier, and MMA consumer "
+        'ordering, request instrument_modes=["reg_trace","tma_trace"] in one '
+        "reg_trace experiment so the records describe the same execution. Add "
+        "mem_value_trace only when ordinary memory addresses or values are needed. "
+        "Trace selectors are optional, data-only, and allowlisted: use only the "
         "pinned kernel identity, non-negative launch IDs, CTA-local warp or warpgroup, "
         "hex PC offsets, mma/tma/sync categories, or an existing triggering/minimized "
-        "config. Do not request reduce_delay_config unless the session already contains "
+        "config. launch_id is the observed global grid_launch_id for the pinned "
+        "kernel, not a per-kernel iteration number or an iter0 filename suffix. "
+        "Omit launch_id when unknown; do not assume zero. Native delay-config keys "
+        "and reduction essential_points.pc_offset are decimal unless explicitly "
+        "0x/0X-prefixed. The projected pc_offset_value and pc_offset_hex are "
+        "deterministically computed from the original value before sampling. Use "
+        "pc_offset_hex for hexadecimal citations and selectors: decimal 14672 "
+        "equals 0x3950, not 0x14672. Never just prefix a decimal string with 0x. "
+        "Null derived PC fields mean the original value could not be interpreted "
+        "as an unsigned 64-bit offset; do not guess it. Preserve original replay "
+        "config keys. A config source selects its enabled PCs; it does not replay delay "
+        "injection. Never combine explicit PC offsets with a config source. A "
+        "minimized delay point is a localization anchor, not a complete causal "
+        "capture window or proof of the missing synchronization. Capture the "
+        "producer, conflicting consumer, relevant ordering, and iteration boundary "
+        "together. Do not automatically trace only the minimized PCs. If a complete "
+        "small PC set cannot be established, omit the PC/config selector and capture "
+        "the pinned kernel or launch under the existing time and trace-size limits. "
+        "Instruction-category filters also remove evidence: omit categories when "
+        "the detector requires a full instruction stream. An indeterminate detector "
+        "or WARNING candidate cannot prove a missing wait or a RAW mechanism. "
+        "Request a sufficiently complete capture when budget permits; otherwise "
+        "report inconclusive. Missing EXIT records alone do not prove a truncated "
+        "execution, because EXIT may not be included by the capture filters. "
+        "Request reduction first when needed, then use the remaining follow-up "
+        "round for this diagnostic capture. Do not request reduce_delay_config unless "
+        "the session already contains "
         "a triggering random-delay config; reduction never discovers or synthesizes "
         "one. When that config exists, the service will automatically add "
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "
-        "and return inconclusive rather than inventing a root cause. Cite artifacts "
-        "only by an exact URI present in the projected session. Deterministic "
+        "and return inconclusive rather than inventing a root cause. A final report "
+        "requires evidence_sufficiency=sufficient; a completed capture with "
+        "insufficient mechanism evidence remains inconclusive. Cite artifacts "
+        "only by an exact URI present in the projected session. The race_class field "
+        "describes the diagnosed race mechanism, not whether a GPU correctness issue "
+        "exists. Use none when this report diagnoses no race mechanism; this is not "
+        "proof that the kernel is race-free. A sanitizer error_type such as "
+        "uninitialized-read describes an observed symptom, not proof of the presence "
+        "or absence of a race. Do not infer a race class from the sanitizer tool name "
+        "or relabel an unclassified race as none. Negative stress trials and clean "
+        "sanitizer checks mean only that no issue was observed within those tests; "
+        "they do not exclude a race or prove an observed invalid read harmless. "
+        "Say no output mismatch was observed in the stated trials, not that an "
+        "invalid read does not affect deterministic correctness. "
+        "An unchanged output does not turn a sanitizer finding into a code-quality "
+        "issue with no functional risk. Describe cross_validation.agrees as "
+        "compatible observations, not independent confirmation of a cause. State "
+        "which signal is reproduced: a sanitizer finding and a stress output "
+        "mismatch are distinct. For a final report with "
+        "race_class=none and nonempty root_cause, cite the log of a successful, "
+        "complete sanitizer result with a detailed uninitialized-read, "
+        "invalid-memory-access, misaligned-access, or memory-leak finding. A summary "
+        "alone or partial/failed evidence does not suffice. Deterministic "
         "trace-analysis evidence embedded in PROJECTED SESSION is the primary "
         "interpretation "
         "of a trace; consult its structured summaries and findings before using raw "
-        "trace excerpts as supporting evidence. Projection omissions are explicit; "
-        "do not infer facts from omitted history or content.\n\n"
+        "trace excerpts as supporting evidence. capture_summaries provide bounded "
+        "instruction/source context for planning: static instructions do not prove "
+        "execution, and missing requested PCs mean not observed, not necessarily "
+        "not executed. Findings are bounded samples. total_findings and per-detector "
+        "finding_count give aggregate counts, not exhaustive PC/CTA/warp coverage. "
+        "State aggregate counts separately from sampled examples; do not generalize "
+        "sampled locations to all findings unless complete supplied evidence "
+        "explicitly establishes that scope. An artifact reference or truncated "
+        "excerpt does not establish that its full contents were examined. "
+        "Projection omissions are explicit; "
+        "do not infer facts from omitted history or content. Historical AI turns "
+        "are proposals; their guard_notes may record rejection, and only the final "
+        "session report is the accepted conclusion. Historical AI explanations "
+        "may contain mistakes; prefer structured experiment evidence and computed "
+        "PC fields over conflicting historical claims. A nonzero sanitizer exit "
+        "with a zero-error footer is inconclusive, not a clean check. Do not infer "
+        "a target signal or crash mechanism from the sanitizer return code alone.\n\n"
         "PROJECTED SESSION AND CORRELATED TRIAGE (JSON):\n"
         + projected_state
         + "\n\nBOUNDED ARTIFACT CONTENT (JSON):\n"
@@ -516,12 +675,9 @@ class ClaudeReasoner:
             return fallback_decision(session, f"Claude invocation failed: {exc}")
         if proc.returncode != 0 or not proc.stdout:
             return fallback_decision(session, "Claude returned no valid decision")
-        structured = _parse_envelope(proc.stdout)
-        if structured is None:
-            return fallback_decision(session, "Claude decision was not valid JSON")
         try:
-            return _decision_from_dict(structured, proc.stdout)
-        except (KeyError, TypeError, ValueError) as exc:
+            return parse_reasoning_output(proc.stdout)
+        except ReasoningOutputError as exc:
             return fallback_decision(
                 session, f"Claude decision failed validation: {exc}"
             )
