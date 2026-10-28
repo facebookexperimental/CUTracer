@@ -33,10 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 class MastDispatcher(Protocol):
-    """Submit by stable experiment_id; implementations must be idempotent."""
+    """Submit by revision-bound dispatch key; implementations are idempotent."""
 
     def submit(
-        self, session_id: str, experiments: tuple[ExperimentSpec, ...]
+        self,
+        session_id: str,
+        state_revision: int,
+        experiments: tuple[ExperimentSpec, ...],
     ) -> None: ...
 
 
@@ -85,7 +88,11 @@ class DistributedCoordinator:
             raise ValueError("RUN_TRIAGE must be the only effect in a transition")
         for effect in transition.effects:
             if effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
-                self._mast.submit(session.session_id, effect.experiments)
+                self._mast.submit(
+                    session.session_id,
+                    session.state_revision,
+                    effect.experiments,
+                )
             elif effect.kind == EffectKind.RUN_TRIAGE:
                 # Pure computation with no remote effect: resolved after the
                 # loop and committed through its own CAS round.
