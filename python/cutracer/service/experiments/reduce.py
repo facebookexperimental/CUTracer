@@ -44,11 +44,11 @@ from cutracer.service.contracts import (
 )
 
 
-class _StaleReplayInputError(ValueError):
+class StaleReplayInputError(ValueError):
     """The replay input identity does not match the active runtime."""
 
 
-class _MissingActiveRuntimeIdentityError(ValueError):
+class MissingActiveRuntimeIdentityError(ValueError):
     """The replay caller did not identify its active runtime."""
 
 
@@ -74,7 +74,7 @@ def _require_active_runtime_identity(
             "active CUTracer": cutracer_version,
             "active toolchain": toolchain_version,
         },
-        error_type=_MissingActiveRuntimeIdentityError,
+        error_type=MissingActiveRuntimeIdentityError,
         message="reduction caller requires immutable runtime identity",
     )
 
@@ -86,7 +86,7 @@ def _require_trigger_runtime_identity(reduction: ReduceOptions) -> None:
             "trigger CUTracer": config.cutracer_version,
             "trigger toolchain": config.toolchain_version,
         },
-        error_type=_StaleReplayInputError,
+        error_type=StaleReplayInputError,
         message="reduction requires immutable runtime identity",
     )
 
@@ -108,7 +108,7 @@ def _resolve_expected_kernel_identity(
         or not config_kernel.cubin_hash.strip()
         or config_kernel != kernel
     ):
-        raise _StaleReplayInputError(
+        raise StaleReplayInputError(
             "reduction requires matching kernel name and cubin identity"
         )
     return kernel.name, kernel.cubin_hash
@@ -125,11 +125,11 @@ def _validate_runtime_identity(
     _require_active_runtime_identity(cutracer_version, toolchain_version)
     _require_trigger_runtime_identity(reduction)
     if config.cutracer_version != cutracer_version:
-        raise _StaleReplayInputError(
+        raise StaleReplayInputError(
             "triggering config CUTracer version does not match the active runtime"
         )
     if config.toolchain_version != toolchain_version:
-        raise _StaleReplayInputError(
+        raise StaleReplayInputError(
             "triggering config toolchain version does not match the active runtime"
         )
     return _resolve_expected_kernel_identity(spec, reduction)
@@ -144,20 +144,20 @@ def _validate_artifact_kernel_identity(
         return
     kernel = spec.unit.kernel
     if kernel is None:
-        raise _StaleReplayInputError("reduction requires pinned kernel identity")
+        raise StaleReplayInputError("reduction requires pinned kernel identity")
     try:
         with open(path) as fh:
             document = json.load(fh)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise _StaleReplayInputError("verified delay config is not valid JSON") from exc
+        raise StaleReplayInputError("verified delay config is not valid JSON") from exc
     if not isinstance(document, dict) or not isinstance(document.get("kernels"), dict):
-        raise _StaleReplayInputError("verified delay config has no kernel metadata")
+        raise StaleReplayInputError("verified delay config has no kernel metadata")
     kernels = document["kernels"]
     if not any(
         isinstance(entry, dict) and entry.get("kernel_checksum") == kernel.cubin_hash
         for entry in kernels.values()
     ):
-        raise _StaleReplayInputError(
+        raise StaleReplayInputError(
             "verified delay config does not contain the pinned kernel identity "
             "checksum "
             f"{kernel.cubin_hash!r}; config names may be mangled while the "
@@ -203,20 +203,41 @@ def _build_reduce_config(
     )
 
 
-def _validate_reduction_input(config: ReduceConfig) -> None:
+def _validate_reduction_input(path: str) -> None:
     try:
         mutator = DelayConfigMutator(
-            config.config_path,
-            validate=config.validate_schema,
+            path,
+            validate=True,
         )
     except ValueError as exc:
-        raise _StaleReplayInputError(str(exc)) from exc
+        raise StaleReplayInputError(str(exc)) from exc
     if not mutator.enabled_points:
-        raise _StaleReplayInputError("No enabled delay points in config")
+        raise StaleReplayInputError("No enabled delay points in config")
+
+
+def validate_reduce_input(
+    spec: ExperimentSpec,
+    path: str,
+    *,
+    cutracer_version: str,
+    toolchain_version: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate staged replay bytes and their complete execution identity."""
+    reduction = spec.reduction
+    if spec.kind != ExperimentKind.REDUCE_DELAY_CONFIG or reduction is None:
+        raise ValueError("reduce input validation requires a reduce experiment")
+    expected = _validate_runtime_identity(
+        spec,
+        reduction,
+        cutracer_version=cutracer_version,
+        toolchain_version=toolchain_version,
+    )
+    _validate_artifact_kernel_identity(spec, reduction, path)
+    _validate_reduction_input(path)
+    return expected
 
 
 def _run_reduction(reduction: ReduceOptions, config: ReduceConfig) -> ReduceResult:
-    _validate_reduction_input(config)
     if reduction.strategy == "linear":
         return reduce_delay_points(
             config,
@@ -283,18 +304,17 @@ def _execute_reduction(
     cutracer_version: str,
     toolchain_version: str,
 ) -> tuple[ArtifactRef, Optional[ArtifactRef], list[EssentialDelayPoint], str]:
-    expected_name, expected_checksum = _validate_runtime_identity(
-        spec,
-        reduction,
-        cutracer_version=cutracer_version,
-        toolchain_version=toolchain_version,
-    )
     os.makedirs(out_dir, exist_ok=True)
     verified = stage_verified_local_artifact(
         reduction.triggering_config.artifact,
         destination=os.path.join(out_dir, "verified_triggering_config.json"),
     )
-    _validate_artifact_kernel_identity(spec, reduction, verified.path)
+    expected_name, expected_checksum = validate_reduce_input(
+        spec,
+        verified.path,
+        cutracer_version=cutracer_version,
+        toolchain_version=toolchain_version,
+    )
     config = _build_reduce_config(
         spec,
         reduction,
@@ -322,12 +342,12 @@ def _classify_reduction_failure(
 ) -> tuple[ReduceOutcome, ExecutionStatus, str]:
     if isinstance(
         exc,
-        (ArtifactIdentityError, ArtifactIntegrityError, _StaleReplayInputError),
+        (ArtifactIdentityError, ArtifactIntegrityError, StaleReplayInputError),
     ):
         return ReduceOutcome.STALE_INPUT, ExecutionStatus.FAILED, str(exc)
     if isinstance(exc, ArtifactMaterializationError):
         return ReduceOutcome.INFRA_ERROR, ExecutionStatus.INFRA_ERROR, str(exc)
-    if isinstance(exc, _MissingActiveRuntimeIdentityError):
+    if isinstance(exc, MissingActiveRuntimeIdentityError):
         return ReduceOutcome.INFRA_ERROR, ExecutionStatus.INFRA_ERROR, str(exc)
     if isinstance(exc, ReplayExecutionError):
         if exc.outcome == ReplayOutcome.STALE_INPUT:
@@ -390,8 +410,8 @@ def run_reduce_experiment(
         error = None
     except (
         ArtifactVerificationError,
-        _MissingActiveRuntimeIdentityError,
-        _StaleReplayInputError,
+        MissingActiveRuntimeIdentityError,
+        StaleReplayInputError,
         ReplayExecutionError,
         ConfigDoesNotTriggerError,
         OSError,
