@@ -26,22 +26,10 @@ from cutracer.service.session import (
     SessionEffect,
     Transition,
 )
+from cutracer.service.storage import DurableSessionStore, StoreConflict
 from cutracer.service.triage import TriagePolicy
 
 logger = logging.getLogger(__name__)
-
-
-class DurableSessionStore(Protocol):
-    def create(self, session: AnalysisSession) -> bool: ...
-
-    def load(self, session_id: str) -> AnalysisSession: ...
-
-    def compare_and_swap(
-        self,
-        session_id: str,
-        expected_revision: int,
-        session: AnalysisSession,
-    ) -> bool: ...
 
 
 class MastDispatcher(Protocol):
@@ -136,12 +124,15 @@ class DistributedCoordinator:
             ):
                 return current
             transition.session.state_revision = current.state_revision + 1
-            if self._store.compare_and_swap(
-                session_id,
-                current.state_revision,
-                transition.session,
-            ):
+            try:
+                self._store.compare_and_swap(
+                    session_id,
+                    current.state_revision,
+                    transition.session,
+                )
                 return self._dispatch(transition)
+            except StoreConflict:
+                continue
         raise RuntimeError(
             f"session update contention exceeded retry limit: {session_id}"
         )
@@ -161,7 +152,9 @@ class DistributedCoordinator:
             campaign_policy=campaign_policy,
         )
         transition.session.state_revision = 1
-        if not self._store.create(transition.session):
+        try:
+            self._store.create(transition.session)
+        except StoreConflict:
             return self.resume(session_id)
         return self._dispatch(transition)
 
