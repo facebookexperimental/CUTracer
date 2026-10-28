@@ -591,6 +591,17 @@ class WorkUnit:
     kernel: Optional[KernelId] = None
     oracle: Optional[OracleSpec] = None
     env: Dict[str, str] = dataclasses.field(default_factory=dict)
+    kernel_filters: list[str] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kernel_filters, list) or any(
+            not isinstance(value, str) for value in self.kernel_filters
+        ):
+            raise ValueError("WorkUnit kernel filters must be a string array")
+        if len(self.kernel_filters) != len(set(self.kernel_filters)) or any(
+            not value.strip() or "," in value for value in self.kernel_filters
+        ):
+            raise ValueError("WorkUnit kernel filters must be unique and comma-free")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -604,6 +615,7 @@ class WorkUnit:
             "kernel": None if self.kernel is None else self.kernel.to_dict(),
             "oracle": None if self.oracle is None else self.oracle.to_dict(),
             "env": dict(self.env),
+            "kernel_filters": list(self.kernel_filters),
         }
 
     def to_json(self, **kwargs: Any) -> str:
@@ -613,6 +625,9 @@ class WorkUnit:
     def from_dict(cls, d: Dict[str, Any]) -> "WorkUnit":
         kernel = d.get("kernel")
         oracle = d.get("oracle")
+        kernel_filters = d.get("kernel_filters", [])
+        if not isinstance(kernel_filters, list):
+            raise ValueError("WorkUnit kernel filters must be a string array")
         return cls(
             unit_id=d["unit_id"],
             argv=list(d["argv"]),
@@ -624,6 +639,7 @@ class WorkUnit:
             kernel=None if kernel is None else KernelId.from_dict(kernel),
             oracle=None if oracle is None else OracleSpec.from_dict(oracle),
             env=dict(d.get("env", {})),
+            kernel_filters=list(kernel_filters),
         )
 
     @classmethod
