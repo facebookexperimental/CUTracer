@@ -41,6 +41,12 @@ class ExperimentCallbackResult:
     accepted: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class ReasoningCallbackResult:
+    session: AnalysisSession
+    accepted: bool
+
+
 class MastDispatcher(Protocol):
     """Submit by revision-bound dispatch key; implementations are idempotent."""
 
@@ -226,9 +232,13 @@ class DistributedCoordinator:
         session_id: str,
         state_revision: int,
         decision: AnalysisDecision,
-    ) -> AnalysisSession:
+    ) -> ReasoningCallbackResult:
+        accepted = False
+
         def apply_decision(session: AnalysisSession) -> Transition:
+            nonlocal accepted
             if session.state_revision != state_revision:
+                accepted = False
                 logger.info(
                     "Discarding stale reasoning decision: session=%s "
                     "expected_revision=%d current_revision=%d",
@@ -237,9 +247,11 @@ class DistributedCoordinator:
                     session.state_revision,
                 )
                 return Transition(session, ())
+            accepted = True
             return record_analysis_decision(session, decision, guard_policy=self._guard)
 
-        return self._apply(
+        session = self._apply(
             session_id,
             apply_decision,
         )
+        return ReasoningCallbackResult(session=session, accepted=accepted)
