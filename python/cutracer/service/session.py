@@ -8,6 +8,7 @@ from enum import Enum
 from typing import List, NoReturn, Optional, Sequence
 
 from cutracer.service.artifacts import same_artifact_content
+from cutracer.service.citations import evidence_artifact_refs
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
@@ -92,32 +93,8 @@ def _clone(session: AnalysisSession) -> AnalysisSession:
     return AnalysisSession.from_dict(session.to_dict())
 
 
-def _trace_artifact_refs(result: TraceExperimentResult) -> List[str]:
-    refs: List[str] = []
-    if result.analysis is not None and result.analysis.artifact is not None:
-        refs.append(result.analysis.artifact.uri)
-    refs.extend(trace.uri for trace in result.traces)
-    refs.extend(artifact.uri for artifact in result.supporting_artifacts)
-    if result.log is not None:
-        refs.append(result.log.uri)
-    return refs
-
-
 def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
-    refs: List[str] = []
-    for result in evidence.sanitizer:
-        if result.log is not None:
-            refs.append(result.log.uri)
-    for result in evidence.stress:
-        if result.triggering_config is not None:
-            refs.append(result.triggering_config.artifact.uri)
-        if result.log is not None:
-            refs.append(result.log.uri)
-    for result in evidence.traces:
-        refs.extend(_trace_artifact_refs(result))
-    for result in evidence.reductions:
-        refs.extend(artifact.uri for artifact in result.artifact_refs())
-    return list(dict.fromkeys(refs))
+    return list(dict.fromkeys(ref.uri for ref in evidence_artifact_refs(evidence)))
 
 
 def _evidence_results(evidence: EvidenceBundle) -> List[ExperimentResult]:

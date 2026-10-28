@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
 from cutracer.service.artifacts import local_path
+from cutracer.service.citations import CitationRegistry, evidence_artifact_refs
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
@@ -35,7 +37,7 @@ from cutracer.service.triage import (
     stress_is_trustworthy_non_reproduction,
 )
 from jsonschema import validate
-from jsonschema.exceptions import ValidationError
+from jsonschema.exceptions import SchemaError, ValidationError
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 ArtifactLoader = Callable[[ArtifactRef, int], Optional[str]]
@@ -243,6 +245,29 @@ class ReasoningOutputError(ValueError):
     """A model response does not satisfy the reasoning output contract."""
 
 
+class CitationResolutionError(ReasoningOutputError):
+    """A model citation is not an ID in this frozen reasoning turn."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReasoningInput:
+    prompt: str
+    decision_schema: str
+    citations: CitationRegistry
+
+
+def citation_decision_schema(citations: CitationRegistry) -> str:
+    schema = json.loads(DECISION_SCHEMA)
+    refs = schema["properties"]["report"]["anyOf"][1]["properties"]["evidence_refs"]
+    ids = [identifier for identifier, _uri in citations.entries]
+    refs["description"] = "Use only citation IDs from this turn's CITATION REGISTRY."
+    if ids:
+        refs["items"] = {"type": "string", "enum": ids}
+    else:
+        refs["maxItems"] = 0
+    return json.dumps(schema, separators=(",", ":"))
+
+
 def _subprocess_runner(
     argv: List[str], *, timeout: int, prompt: str
 ) -> "subprocess.CompletedProcess[str]":
@@ -324,7 +349,12 @@ def _decision_from_dict(raw: Dict[str, Any], raw_ai_output: str) -> AnalysisDeci
     )
 
 
-def parse_reasoning_output(stdout: str) -> AnalysisDecision:
+def parse_reasoning_output(  # noqa: C901
+    stdout: str,
+    *,
+    citations: Optional[CitationRegistry] = None,
+    decision_schema: str = DECISION_SCHEMA,
+) -> AnalysisDecision:
     """Parse and strictly validate one Claude JSON output envelope."""
     structured = _parse_envelope(stdout)
     if structured is None:
@@ -335,8 +365,35 @@ def parse_reasoning_output(stdout: str) -> AnalysisDecision:
         raise ReasoningOutputError(
             f"reasoning decision failed schema validation: {error.message}"
         ) from error
+    resolved_refs: Optional[List[str]] = None
+    report_raw = structured.get("report")
+    if citations is not None and isinstance(report_raw, dict):
+        registry = citations.to_dict()
+        ids = report_raw.get("evidence_refs", [])
+        if not isinstance(ids, list) or any(
+            not isinstance(identifier, str) for identifier in ids
+        ):
+            raise CitationResolutionError(
+                "reasoner evidence_refs must be a list of citation IDs"
+            )
+        unknown = sorted(set(ids) - registry.keys())
+        if unknown:
+            raise CitationResolutionError(
+                "reasoner cited IDs outside this frozen turn: " + ", ".join(unknown)
+            )
+        resolved_refs = [registry[identifier] for identifier in ids]
+    if decision_schema != DECISION_SCHEMA:
+        try:
+            validate(instance=structured, schema=json.loads(decision_schema))
+        except (SchemaError, ValidationError) as error:
+            raise ReasoningOutputError(
+                f"reasoning decision failed frozen schema validation: {error.message}"
+            ) from error
     try:
-        return _decision_from_dict(structured, stdout)
+        decision = _decision_from_dict(structured, stdout)
+        if decision.report is not None and resolved_refs is not None:
+            decision.report.evidence_refs = resolved_refs
+        return decision
     except (KeyError, TypeError, ValueError) as error:
         raise ReasoningOutputError(
             f"reasoning decision failed contract validation: {error}"
@@ -413,7 +470,7 @@ def _artifact_context(
     return project_artifact_context(_artifact_refs(session), loader, max_bytes)
 
 
-def _prompt(projected_state: str, artifact_context: str) -> str:
+def _prompt(projected_state: str, artifact_context: str, citation_registry: str) -> str:
     return (
         "You are analyzing a GPU correctness issue. The initial evidence sources "
         "compute-sanitizer and CUTracer random-delay stress are peers. Decide whether "
@@ -459,8 +516,12 @@ def _prompt(projected_state: str, artifact_context: str) -> str:
         "reduce_delay_config to a follow-up round. Ground every claim in the evidence "
         "and return inconclusive rather than inventing a root cause. A final report "
         "requires evidence_sufficiency=sufficient; a completed capture with "
-        "insufficient mechanism evidence remains inconclusive. Cite artifacts "
-        "only by an exact URI present in the projected session. The race_class field "
+        "insufficient mechanism evidence remains inconclusive. In evidence_refs, "
+        "cite only the short IDs from this turn's CITATION REGISTRY, never copy "
+        "artifact URIs. IDs in historical AI output belong to other turns; do not "
+        "reuse them. The service resolves current IDs to canonical artifact URIs. "
+        "The registry identifies files; it does not prove their full contents were "
+        "loaded. The race_class field "
         "describes the diagnosed race mechanism, not whether a GPU correctness issue "
         "exists. Use none when this report diagnoses no race mechanism; this is not "
         "proof that the kernel is race-free. A sanitizer error_type such as "
@@ -500,11 +561,50 @@ def _prompt(projected_state: str, artifact_context: str) -> str:
         "PC fields over conflicting historical claims. A nonzero sanitizer exit "
         "with a zero-error footer is inconclusive, not a clean check. Do not infer "
         "a target signal or crash mechanism from the sanitizer return code alone.\n\n"
-        "PROJECTED SESSION AND CORRELATED TRIAGE (JSON):\n"
+        "CITATION REGISTRY (JSON):\n"
+        + citation_registry
+        + "\n\nPROJECTED SESSION AND CORRELATED TRIAGE (JSON):\n"
         + projected_state
         + "\n\nBOUNDED ARTIFACT CONTENT (JSON):\n"
         + artifact_context
     )
+
+
+def build_reasoning_input(
+    session: AnalysisSession,
+    *,
+    artifact_loader: ArtifactLoader,
+    max_session_bytes: int,
+    max_artifact_bytes: int,
+) -> ReasoningInput:
+    citations = CitationRegistry.create(
+        session_id=session.session_id,
+        state_revision=session.state_revision,
+        uris=(ref.uri for ref in evidence_artifact_refs(session.evidence)),
+    )
+    registry = json.dumps(
+        citations.to_dict(), ensure_ascii=False, separators=(",", ":")
+    )
+    session_budget = max_session_bytes - len(registry.encode("utf-8"))
+    triage = correlate_evidence(
+        session.unit.unit_id,
+        session.evidence,
+        test_id=session.unit.test_id,
+    )
+    prompt = _prompt(
+        project_session_context(
+            session,
+            triage.to_dict(),
+            session_budget,
+        ),
+        _artifact_context(
+            session,
+            artifact_loader,
+            max_artifact_bytes,
+        ),
+        registry,
+    )
+    return ReasoningInput(prompt, citation_decision_schema(citations), citations)
 
 
 def build_reasoning_prompt(
@@ -514,23 +614,12 @@ def build_reasoning_prompt(
     max_session_bytes: int,
     max_artifact_bytes: int,
 ) -> str:
-    triage = correlate_evidence(
-        session.unit.unit_id,
-        session.evidence,
-        test_id=session.unit.test_id,
-    )
-    return _prompt(
-        project_session_context(
-            session,
-            triage.to_dict(),
-            max_session_bytes,
-        ),
-        _artifact_context(
-            session,
-            artifact_loader,
-            max_artifact_bytes,
-        ),
-    )
+    return build_reasoning_input(
+        session,
+        artifact_loader=artifact_loader,
+        max_session_bytes=max_session_bytes,
+        max_artifact_bytes=max_artifact_bytes,
+    ).prompt
 
 
 def _fallback_report(session: AnalysisSession, reason: str) -> ExplainReport:
@@ -647,7 +736,7 @@ class ClaudeReasoner:
             return fallback_decision(session, "Claude is unavailable")
         run = self._runner or _subprocess_runner
         try:
-            prompt = build_reasoning_prompt(
+            reasoning_input = build_reasoning_input(
                 session,
                 artifact_loader=self._artifact_loader,
                 max_session_bytes=self._max_session_bytes,
@@ -664,19 +753,31 @@ class ClaudeReasoner:
                     self._claude_bin,
                     "-p",
                     "--json-schema",
-                    DECISION_SCHEMA,
+                    reasoning_input.decision_schema,
                     "--output-format",
                     "json",
                 ],
                 timeout=self._timeout,
-                prompt=prompt,
+                prompt=reasoning_input.prompt,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return fallback_decision(session, f"Claude invocation failed: {exc}")
         if proc.returncode != 0 or not proc.stdout:
             return fallback_decision(session, "Claude returned no valid decision")
         try:
-            return parse_reasoning_output(proc.stdout)
+            return parse_reasoning_output(
+                proc.stdout,
+                citations=reasoning_input.citations,
+                decision_schema=reasoning_input.decision_schema,
+            )
+        except CitationResolutionError as exc:
+            report = _fallback_report(session, str(exc))
+            report.raw_ai_output = proc.stdout
+            return AnalysisDecision(
+                kind=DecisionKind.INCONCLUSIVE,
+                rationale=str(exc),
+                report=report,
+            )
         except ReasoningOutputError as exc:
             return fallback_decision(
                 session, f"Claude decision failed validation: {exc}"
