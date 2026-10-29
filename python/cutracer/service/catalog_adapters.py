@@ -29,6 +29,7 @@ class CatalogWorkUnit:
     cadence_days: int
     estimated_gpu_seconds: int
     unit: WorkUnit
+    enabled: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -40,6 +41,7 @@ class CatalogWorkUnit:
             "cadence_days": self.cadence_days,
             "estimated_gpu_seconds": self.estimated_gpu_seconds,
             "unit": self.unit.to_dict(),
+            "enabled": self.enabled,
         }
 
 
@@ -144,6 +146,7 @@ class PytestCatalogAdapter:
                         cadence_days=entry.cadence_days,
                         estimated_gpu_seconds=entry.estimated_gpu_seconds,
                         unit=unit,
+                        enabled=entry.enabled,
                     )
                 )
         return tuple(targets)
@@ -177,7 +180,7 @@ def _tritonbench_argv(
         for argument in entry.extra_args
         if _option_name(argument) in _TRITONBENCH_FORBIDDEN_OPTIONS
     ]
-    if forbidden:
+    if entry.enabled and forbidden:
         raise ValueError(
             "tritonbench catalog extra_args override guarded options: "
             f"{', '.join(forbidden)}"
@@ -247,6 +250,7 @@ class TritonbenchCatalogAdapter:
                         cadence_days=entry.cadence_days,
                         estimated_gpu_seconds=entry.estimated_gpu_seconds,
                         unit=unit,
+                        enabled=entry.enabled,
                     )
                 )
         return tuple(targets)
@@ -270,11 +274,12 @@ def expand_workload_catalog(
     catalog: WorkloadCatalog,
     *,
     adapters: Mapping[CatalogAdapter, WorkloadCatalogAdapter] | None = None,
+    include_disabled: bool = False,
 ) -> tuple[CatalogWorkUnit, ...]:
     resolved_adapters = default_catalog_adapters() if adapters is None else adapters
     targets: list[CatalogWorkUnit] = []
     for entry in catalog.entries:
-        if not entry.enabled:
+        if not entry.enabled and not include_disabled:
             continue
         adapter = resolved_adapters.get(entry.adapter)
         if adapter is None:
