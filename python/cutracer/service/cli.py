@@ -25,6 +25,7 @@ from cutracer.service.contracts import (
 from cutracer.service.kernel_discovery import discover_work_units, KernelDiscoveryError
 from cutracer.service.local_workflow import PartialDiagnosisError, run_local_diagnosis
 from cutracer.service.policy import DEFAULT_LOCAL_SANITIZER_TOOLS, InitialCampaignPolicy
+from cutracer.service.presets import load_preset_registry
 from cutracer.service.runner import (
     FileReportSink,
     LocalExperimentExecutor,
@@ -439,7 +440,26 @@ def _resolve_work_unit(
     arch: Optional[str],
     source_revision: Optional[str],
     cwd: Optional[str],
+    preset: Optional[str],
+    preset_registry: Optional[str],
 ) -> WorkUnit:
+    if preset is None and preset_registry is not None:
+        raise click.UsageError(
+            "--preset-registry is only valid with the --preset target form"
+        )
+    if preset is not None:
+        if command_mode:
+            raise click.UsageError("--preset and `-- <cmd>` are mutually exclusive")
+        if inputs:
+            raise click.UsageError("target JSON and --preset are mutually exclusive")
+        if preset_registry is None:
+            raise click.UsageError("--preset requires --preset-registry")
+        if any(value is not None for value in (unit_id, arch, source_revision, cwd)):
+            raise click.UsageError("command identity options cannot override a preset")
+        try:
+            return load_preset_registry(preset_registry).resolve(preset)
+        except (KeyError, ValueError) as error:
+            raise click.ClickException(str(error)) from error
     if command_mode:
         return _command_work_unit(
             inputs,
@@ -453,7 +473,7 @@ def _resolve_work_unit(
     command_options = (unit_id, arch, source_revision, cwd)
     if any(value is not None for value in command_options):
         raise click.UsageError(
-            "--unit-id, --arch, --source-revision, and --cwd require `-- <cmd>`"
+            "command and preset options require their matching target form"
         )
     return _load_work_unit(inputs[0])
 
@@ -535,6 +555,13 @@ def _resolve_work_unit(
     help="Immutable source revision for a `-- <cmd>` target.",
 )
 @click.option("--cwd", default=None, help="Working directory for a `-- <cmd>` target.")
+@click.option("--preset", default=None, help="Approved target name from a registry.")
+@click.option(
+    "--preset-registry",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Versioned JSON registry used by --preset.",
+)
 @click.pass_context
 def diagnose_command(
     ctx: click.Context,
@@ -557,6 +584,8 @@ def diagnose_command(
     arch: Optional[str],
     source_revision: Optional[str],
     cwd: Optional[str],
+    preset: Optional[str],
+    preset_registry: Optional[str],
 ) -> None:
     """Run a bounded sanitizer, stress, trace, and reasoning session."""
     target = _resolve_work_unit(
@@ -566,6 +595,8 @@ def diagnose_command(
         arch=arch,
         source_revision=source_revision,
         cwd=cwd,
+        preset=preset,
+        preset_registry=preset_registry,
     )
     if local and distributed:
         raise click.UsageError("--local and --distributed are mutually exclusive")
