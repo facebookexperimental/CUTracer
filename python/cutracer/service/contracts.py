@@ -863,6 +863,11 @@ class SuppressionRule:
     tools: Tuple[str, ...] = ()
     error_types: Tuple[str, ...] = ()
     expires_on: Optional[str] = None
+    tracking_ticket: str = ""
+    reviewed_by: str = ""
+    reviewed_on: Optional[str] = None
+    review_due_on: Optional[str] = None
+    permanent: bool = False
 
     def __post_init__(self) -> None:
         # A malformed expiry would compare wrongly as a plain string and could
@@ -873,6 +878,15 @@ class SuppressionRule:
                 f"suppression rule {self.rule_id}: expires_on must be YYYY-MM-DD, "
                 f"got {self.expires_on!r}"
             )
+        for field_name in ("reviewed_on", "review_due_on"):
+            value = getattr(self, field_name)
+            if value is not None and parse_ymd_date(value) is None:
+                raise ValueError(
+                    f"suppression rule {self.rule_id}: {field_name} must be "
+                    f"YYYY-MM-DD, got {value!r}"
+                )
+        if self.permanent and self.expires_on is not None:
+            raise ValueError("permanent suppression rule cannot have an expiry")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -884,6 +898,11 @@ class SuppressionRule:
             "tools": list(self.tools),
             "error_types": list(self.error_types),
             "expires_on": self.expires_on,
+            "tracking_ticket": self.tracking_ticket,
+            "reviewed_by": self.reviewed_by,
+            "reviewed_on": self.reviewed_on,
+            "review_due_on": self.review_due_on,
+            "permanent": self.permanent,
         }
 
     @classmethod
@@ -897,6 +916,11 @@ class SuppressionRule:
             tools=tuple(d.get("tools", ())),
             error_types=tuple(d.get("error_types", ())),
             expires_on=d.get("expires_on"),
+            tracking_ticket=d.get("tracking_ticket", ""),
+            reviewed_by=d.get("reviewed_by", ""),
+            reviewed_on=d.get("reviewed_on"),
+            review_due_on=d.get("review_due_on"),
+            permanent=_as_bool(d.get("permanent", False)),
         )
 
 
@@ -1057,12 +1081,26 @@ class SuppressionDecision:
     rule_id: str
     rule_version: int
     reason: str
+    owner: str = ""
+    expires_on: Optional[str] = None
+    tracking_ticket: str = ""
+    reviewed_by: str = ""
+    reviewed_on: Optional[str] = None
+    review_due_on: Optional[str] = None
+    permanent: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "rule_id": self.rule_id,
             "rule_version": self.rule_version,
             "reason": self.reason,
+            "owner": self.owner,
+            "expires_on": self.expires_on,
+            "tracking_ticket": self.tracking_ticket,
+            "reviewed_by": self.reviewed_by,
+            "reviewed_on": self.reviewed_on,
+            "review_due_on": self.review_due_on,
+            "permanent": self.permanent,
         }
 
     @classmethod
@@ -1071,6 +1109,13 @@ class SuppressionDecision:
             rule_id=d["rule_id"],
             rule_version=int(d["rule_version"]),
             reason=d["reason"],
+            owner=d.get("owner", ""),
+            expires_on=d.get("expires_on"),
+            tracking_ticket=d.get("tracking_ticket", ""),
+            reviewed_by=d.get("reviewed_by", ""),
+            reviewed_on=d.get("reviewed_on"),
+            review_due_on=d.get("review_due_on"),
+            permanent=_as_bool(d.get("permanent", False)),
         )
 
 

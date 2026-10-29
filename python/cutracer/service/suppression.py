@@ -30,6 +30,8 @@ from cutracer.service.contracts import (
 # Only patterns with evidence in that corpus are in v1. Adding cutlass, cub,
 # thrust, or cuBLAS on suspicion would put unverified matchers in the path of
 # real findings; they belong in a v2 raised when a real log demands them.
+# The sanitizer adapter canonicalizes finding sources as
+# ``compute_sanitizer/<tool>``; bare checker names are intentionally not matched.
 FRAMEWORK_SITE_PATTERN: str = r"(?:^|[^A-Za-z0-9_])(?:at|c10)::"
 
 DEFAULT_SUPPRESSION_RULES: Tuple[SuppressionRule, ...] = (
@@ -42,6 +44,12 @@ DEFAULT_SUPPRESSION_RULES: Tuple[SuppressionRule, ...] = (
         ),
         owner="triton_tools",
         kernel_pattern=FRAMEWORK_SITE_PATTERN,
+        tools=("compute_sanitizer/initcheck",),
+        tracking_ticket="framework-initcheck-noise-20260720",
+        reviewed_by="triton_tools",
+        reviewed_on="2026-09-05",
+        review_due_on="2026-12-04",
+        permanent=True,
     ),
 )
 
@@ -159,6 +167,13 @@ class SuppressionPolicy:
                         rule_id=rule.rule_id,
                         rule_version=rule.version,
                         reason=rule.reason,
+                        owner=rule.owner,
+                        expires_on=rule.expires_on,
+                        tracking_ticket=rule.tracking_ticket,
+                        reviewed_by=rule.reviewed_by,
+                        reviewed_on=rule.reviewed_on,
+                        review_due_on=rule.review_due_on,
+                        permanent=rule.permanent,
                     )
                     break
             if decision is None:
