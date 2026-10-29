@@ -22,6 +22,16 @@ class SamplingDisposition(str, Enum):
     SAMPLED_OUT = "sampled_out"
 
 
+class AdmissionDisposition(str, Enum):
+    ADMITTED = "admitted"
+    DEFERRED = "deferred"
+
+
+class BudgetConstraint(str, Enum):
+    RUN_CAP = "run_cap"
+    GPU_SECONDS = "gpu_seconds"
+
+
 @dataclasses.dataclass(frozen=True)
 class SamplingDecision:
     target: CatalogWorkUnit
@@ -65,6 +75,57 @@ class SamplingPlan:
             self.to_dict(), sort_keys=True, separators=(",", ":")
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class CampaignBudget:
+    max_runs: int | None = None
+    max_gpu_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in dataclasses.asdict(self).items():
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"campaign {name} must be a non-negative integer")
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionDecision:
+    target: CatalogWorkUnit
+    disposition: AdmissionDisposition
+    constraints: tuple[BudgetConstraint, ...]
+    cumulative_admitted_runs: int
+    cumulative_admitted_gpu_seconds: int
+    reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "target": self.target.to_dict(),
+            "disposition": self.disposition.value,
+            "constraints": [constraint.value for constraint in self.constraints],
+            "cumulative_admitted_runs": self.cumulative_admitted_runs,
+            "cumulative_admitted_gpu_seconds": self.cumulative_admitted_gpu_seconds,
+            "reason": self.reason,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionPlan:
+    budget: CampaignBudget
+    decisions: tuple[AdmissionDecision, ...]
+
+    @property
+    def admitted(self) -> tuple[CatalogWorkUnit, ...]:
+        return tuple(
+            decision.target
+            for decision in self.decisions
+            if decision.disposition == AdmissionDisposition.ADMITTED
+        )
+
+    @property
+    def admitted_gpu_seconds(self) -> int:
+        return sum(target.estimated_gpu_seconds for target in self.admitted)
 
 
 def deterministic_shard(unit_id: str, shard_count: int, *, seed: str) -> int:
@@ -140,6 +201,67 @@ def plan_catalog_sampling(
                 )
             )
     return SamplingPlan(catalog_revision, tuple(decisions))
+
+
+def _budget_constraints(
+    target: CatalogWorkUnit,
+    budget: CampaignBudget,
+    admitted_runs: int,
+    admitted_gpu_seconds: int,
+) -> tuple[BudgetConstraint, ...]:
+    constraints: list[BudgetConstraint] = []
+    if budget.max_runs is not None and admitted_runs >= budget.max_runs:
+        constraints.append(BudgetConstraint.RUN_CAP)
+    projected_gpu_seconds = admitted_gpu_seconds + target.estimated_gpu_seconds
+    if (
+        budget.max_gpu_seconds is not None
+        and projected_gpu_seconds > budget.max_gpu_seconds
+    ):
+        constraints.append(BudgetConstraint.GPU_SECONDS)
+    return tuple(constraints)
+
+
+def apply_campaign_budget(
+    targets: tuple[CatalogWorkUnit, ...],
+    budget: CampaignBudget,
+) -> AdmissionPlan:
+    unit_ids = [target.unit.unit_id for target in targets]
+    if len(unit_ids) != len(set(unit_ids)):
+        raise ValueError("campaign budget targets must have unique unit ids")
+    decisions: list[AdmissionDecision] = []
+    admitted_runs = 0
+    admitted_gpu_seconds = 0
+    for target in sorted(targets, key=lambda item: item.unit.unit_id):
+        constraints = _budget_constraints(
+            target,
+            budget,
+            admitted_runs,
+            admitted_gpu_seconds,
+        )
+        disposition = (
+            AdmissionDisposition.DEFERRED
+            if constraints
+            else AdmissionDisposition.ADMITTED
+        )
+        if disposition == AdmissionDisposition.ADMITTED:
+            admitted_runs += 1
+            admitted_gpu_seconds += target.estimated_gpu_seconds
+        decisions.append(
+            AdmissionDecision(
+                target=target,
+                disposition=disposition,
+                constraints=constraints,
+                cumulative_admitted_runs=admitted_runs,
+                cumulative_admitted_gpu_seconds=admitted_gpu_seconds,
+                reason=(
+                    "within campaign budget"
+                    if not constraints
+                    else "exceeded "
+                    + ", ".join(constraint.value for constraint in constraints)
+                ),
+            )
+        )
+    return AdmissionPlan(budget, tuple(decisions))
 
 
 def assign_catalog_shards(
