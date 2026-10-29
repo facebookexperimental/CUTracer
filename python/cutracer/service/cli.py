@@ -7,13 +7,13 @@ import importlib
 import os
 import tempfile
 import uuid
-from typing import Callable, cast, Optional
+from typing import Callable, cast, Optional, Protocol
 
 import click
 from cutracer.runner import resolve_cutracer_so
 from cutracer.service.artifacts import local_artifact, runtime_identity_is_missing
 from cutracer.service.baseline import FileBaselineStore
-from cutracer.service.contracts import AnalysisSession, SessionReport, WorkUnit
+from cutracer.service.contracts import SessionReport, WorkUnit
 from cutracer.service.policy import DEFAULT_LOCAL_SANITIZER_TOOLS, InitialCampaignPolicy
 from cutracer.service.runner import (
     FileReportSink,
@@ -26,8 +26,14 @@ from cutracer.service.suppression import load_suppression_policy, SuppressionPol
 from cutracer.service.triage import TriagePolicy
 
 RunLocalFn = Callable[..., SessionReport]
-RunDistributedStartFn = Callable[..., AnalysisSession]
 _DISTRIBUTED_CLI_MODULE = "cutracer.service.fb.distributed_cli"
+
+
+class _JsonOutput(Protocol):
+    def to_json(self, **kwargs: object) -> str: ...
+
+
+DistributedFn = Callable[..., _JsonOutput]
 
 
 def _default_baseline_dir() -> str:
@@ -57,7 +63,7 @@ def _cutracer_runtime_identity(cutracer_so: str) -> str:
     return f"sha256:{artifact.sha256}"
 
 
-def _distributed_start_fn() -> RunDistributedStartFn:
+def _distributed_fn(name: str) -> DistributedFn:
     try:
         module = importlib.import_module(_DISTRIBUTED_CLI_MODULE)
     except ModuleNotFoundError as error:
@@ -69,10 +75,10 @@ def _distributed_start_fn() -> RunDistributedStartFn:
                 "this CUTracer build does not include the distributed adapter"
             ) from error
         raise
-    function = getattr(module, "start_distributed_session", None)
+    function = getattr(module, name, None)
     if not callable(function):
-        raise click.ClickException("distributed adapter has no start entry point")
-    return cast(RunDistributedStartFn, function)
+        raise click.ClickException(f"distributed adapter has no {name} entry point")
+    return cast(DistributedFn, function)
 
 
 def _run_distributed_start(
@@ -82,14 +88,48 @@ def _run_distributed_start(
     session_id: str,
     toolchain_version: str,
     sanitizer_tools: tuple[str, ...],
-) -> AnalysisSession:
-    return _distributed_start_fn()(
+) -> _JsonOutput:
+    return _distributed_fn("start_distributed_session")(
         target,
         config_path=config_path,
         session_id=session_id,
         toolchain_version=toolchain_version,
         sanitizer_tools=sanitizer_tools,
     )
+
+
+def _run_distributed_status(
+    *,
+    config_path: str,
+    session_id: str,
+) -> _JsonOutput:
+    return _distributed_fn("status_distributed_session")(
+        config_path=config_path,
+        session_id=session_id,
+    )
+
+
+def _run_distributed_resume(
+    *,
+    config_path: str,
+    session_id: str,
+    result_limit: int,
+) -> _JsonOutput:
+    return _distributed_fn("resume_distributed_session")(
+        config_path=config_path,
+        session_id=session_id,
+        result_limit=result_limit,
+    )
+
+
+def _emit_json(value: _JsonOutput, out: Optional[str]) -> None:
+    payload = value.to_json(indent=2)
+    if out is None:
+        click.echo(payload)
+        return
+    with click.open_file(out, "w", atomic=True) as output:
+        output.write(payload)
+        output.write("\n")
 
 
 def _validate_distributed_options(
@@ -169,10 +209,7 @@ def _start_distributed_from_cli(
         toolchain_version=toolchain_version,
         sanitizer_tools=sanitizer_tools,
     )
-    if out is None:
-        click.echo(session.to_json(indent=2))
-    else:
-        FileSessionStore(out).save(session)
+    _emit_json(session, out)
 
 
 def run_diagnosis(
@@ -381,4 +418,62 @@ def diagnose_command(
         sanitizer_tools=sanitizer_tools,
         baseline_dir=baseline_dir,
         suppression_policy=suppression_policy,
+    )
+
+
+def _distributed_config_option(
+    function: Callable[..., object],
+) -> Callable[..., object]:
+    return click.option(
+        "--distributed-config",
+        type=click.Path(exists=True, dir_okay=False),
+        required=True,
+        envvar="CUTRACER_DISTRIBUTED_CONFIG",
+        help="Versioned distributed deployment configuration.",
+    )(function)
+
+
+@click.command(name="diagnose-status")
+@click.argument("session_id")
+@_distributed_config_option
+@click.option("--out", type=click.Path(), default=None)
+def diagnose_status_command(
+    session_id: str,
+    distributed_config: str,
+    out: Optional[str],
+) -> None:
+    """Read one durable distributed diagnosis session without mutating it."""
+    _emit_json(
+        _run_distributed_status(
+            config_path=distributed_config,
+            session_id=session_id,
+        ),
+        out,
+    )
+
+
+@click.command(name="diagnose-resume")
+@click.argument("session_id")
+@_distributed_config_option
+@click.option(
+    "--result-limit",
+    type=click.IntRange(min=1),
+    default=256,
+    show_default=True,
+)
+@click.option("--out", type=click.Path(), default=None)
+def diagnose_resume_command(
+    session_id: str,
+    distributed_config: str,
+    result_limit: int,
+    out: Optional[str],
+) -> None:
+    """Run one idempotent reconciliation pass for a distributed session."""
+    _emit_json(
+        _run_distributed_resume(
+            config_path=distributed_config,
+            session_id=session_id,
+            result_limit=result_limit,
+        ),
+        out,
     )
