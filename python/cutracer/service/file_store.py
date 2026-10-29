@@ -109,6 +109,7 @@ class FileSessionStore(ManagedSessionStore):
                 session.status,
                 updated_at_ms,
             ),
+            "pending": session.requires_reconciliation,
             "session": session.to_dict(),
         }
 
@@ -162,6 +163,12 @@ class FileSessionStore(ManagedSessionStore):
             )
         if session.status.value != record.get("status"):
             raise StoreUnavailable("file-store session status metadata is inconsistent")
+        if "pending" in record:
+            expected_pending = session.requires_reconciliation
+            if bool(record["pending"]) != expected_pending:
+                raise StoreUnavailable(
+                    "file-store session pending metadata is inconsistent"
+                )
         return session
 
     def create(self, session: AnalysisSession) -> None:
@@ -212,6 +219,12 @@ class FileSessionStore(ManagedSessionStore):
             raise StoreUnavailable(f"could not scan file store: {error}") from error
         return records
 
+    @staticmethod
+    def _is_pending_record(record: dict[str, Any]) -> bool:
+        if "pending" in record:
+            return bool(record["pending"])
+        return SessionStatus(record["status"]) not in _TERMINAL_STATUSES
+
     def list_pending(self, *, limit: int) -> tuple[str, ...]:
         if limit <= 0:
             raise ValueError("pending-session limit must be positive")
@@ -219,7 +232,7 @@ class FileSessionStore(ManagedSessionStore):
             pending = [
                 (int(record["updated_at_ms"]), str(record["session_id"]))
                 for record in self._record_summaries()
-                if SessionStatus(record["status"]) not in _TERMINAL_STATUSES
+                if self._is_pending_record(record)
             ]
         except (KeyError, TypeError, ValueError) as error:
             raise StoreUnavailable(

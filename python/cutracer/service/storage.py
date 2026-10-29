@@ -5,7 +5,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Protocol
 
-from cutracer.service.contracts import AnalysisSession, ArtifactRef, SessionStatus
+from cutracer.service.contracts import (
+    AnalysisSession,
+    ArtifactRef,
+    ReportPublicationStatus,
+    SessionStatus,
+)
 
 
 class SessionStoreError(RuntimeError):
@@ -58,6 +63,7 @@ class SessionMetadata:
     session_blob: ArtifactRef
     updated_at_ms: int
     expires_at_ms: int
+    report_publication: ReportPublicationStatus = ReportPublicationStatus.NOT_READY
 
     def __post_init__(self) -> None:
         if not self.session_id.strip():
@@ -82,11 +88,12 @@ class SessionMetadata:
 
     @property
     def pending(self) -> bool:
-        return self.status not in (
+        active = self.status not in (
             SessionStatus.COMPLETED,
             SessionStatus.INCONCLUSIVE,
             SessionStatus.FAILED,
         )
+        return active or self.report_publication == ReportPublicationStatus.PENDING
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,17 +103,27 @@ class SessionMetadata:
             "session_blob": self.session_blob.to_dict(),
             "updated_at_ms": self.updated_at_ms,
             "expires_at_ms": self.expires_at_ms,
+            "report_publication": self.report_publication.value,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "SessionMetadata":
+        status = SessionStatus(payload["status"])
+        publication = payload.get("report_publication")
+        if publication is None:
+            publication = (
+                ReportPublicationStatus.PUBLISHED.value
+                if status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE)
+                else ReportPublicationStatus.NOT_READY.value
+            )
         return cls(
             session_id=str(payload["session_id"]),
             state_revision=int(payload["state_revision"]),
-            status=SessionStatus(payload["status"]),
+            status=status,
             session_blob=ArtifactRef.from_dict(payload["session_blob"]),
             updated_at_ms=int(payload["updated_at_ms"]),
             expires_at_ms=int(payload["expires_at_ms"]),
+            report_publication=ReportPublicationStatus(publication),
         )
 
 

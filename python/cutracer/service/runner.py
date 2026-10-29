@@ -33,6 +33,7 @@ from cutracer.service.session import (
     EffectKind,
     record_analysis_decision,
     record_experiment_result,
+    record_report_published,
     record_triage_decision,
     SessionEffect,
 )
@@ -199,6 +200,10 @@ def _run_effect(
         report = build_session_report(current)
         if sink is not None:
             sink.publish(report)
+        # With no sink, run_local_session returns the report to its caller:
+        # that return is the delivery, so acknowledge it instead of leaving
+        # the session pending reconciliation forever.
+        current = record_report_published(current).session
     else:
         raise ValueError(f"unknown effect kind: {effect.kind}")
     return current, effects

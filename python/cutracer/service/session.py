@@ -29,6 +29,7 @@ from cutracer.service.contracts import (
     RaceClass,
     ReduceExperimentResult,
     ReduceOutcome,
+    ReportPublicationStatus,
     ResultCompleteness,
     SanitizerOutcome,
     SanitizerSweepResult,
@@ -1027,6 +1028,7 @@ def record_triage_decision(
         updated.status = SessionStatus.COMPLETED
         updated.termination_reason = decision.reason
         updated.report = _triage_report(updated, decision)
+        updated.report_publication = ReportPublicationStatus.PENDING
         return Transition(
             session=updated,
             effects=(SessionEffect(kind=EffectKind.PUBLISH_REPORT),),
@@ -1056,6 +1058,7 @@ def _terminate_inconclusive(
     updated.status = SessionStatus.INCONCLUSIVE
     updated.termination_reason = reason
     updated.report = _inconclusive_report(updated, reason)
+    updated.report_publication = ReportPublicationStatus.PENDING
     return Transition(
         session=updated,
         effects=(SessionEffect(kind=EffectKind.PUBLISH_REPORT),),
@@ -1228,6 +1231,7 @@ def record_analysis_decision(
         updated.status = SessionStatus.COMPLETED
         updated.report = decision.report
         updated.termination_reason = "reasoner finalized the report"
+        updated.report_publication = ReportPublicationStatus.PENDING
         return Transition(
             session=updated,
             effects=(SessionEffect(kind=EffectKind.PUBLISH_REPORT),),
@@ -1238,6 +1242,7 @@ def record_analysis_decision(
         updated.status = SessionStatus.INCONCLUSIVE
         updated.report = decision.report
         updated.termination_reason = decision.rationale
+        updated.report_publication = ReportPublicationStatus.PENDING
         return Transition(
             session=updated,
             effects=(SessionEffect(kind=EffectKind.PUBLISH_REPORT),),
@@ -1275,6 +1280,23 @@ def record_analysis_decision(
             ),
         ),
     )
+
+
+def record_report_published(session: AnalysisSession) -> Transition:
+    """Acknowledge successful delivery without changing diagnosis semantics."""
+    if session.status not in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
+        raise ValueError(f"cannot publish report in state: {session.status}")
+    if session.report is None:
+        raise ValueError("cannot publish a missing report")
+    if session.report_publication == ReportPublicationStatus.PUBLISHED:
+        return Transition(session=session, effects=())
+    if session.report_publication != ReportPublicationStatus.PENDING:
+        raise ValueError(
+            f"report is not pending publication: {session.report_publication}"
+        )
+    updated = _clone(session)
+    updated.report_publication = ReportPublicationStatus.PUBLISHED
+    return Transition(session=updated, effects=())
 
 
 def build_session_report(session: AnalysisSession) -> SessionReport:

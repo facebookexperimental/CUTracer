@@ -12,6 +12,7 @@ from cutracer.service.contracts import (
     ExperimentEnvelope,
     ExperimentResult,
     ExperimentSpec,
+    ReportPublicationStatus,
     SessionBudget,
     SessionReport,
     SessionStatus,
@@ -26,6 +27,7 @@ from cutracer.service.session import (
     record_analysis_decision,
     record_experiment_result,
     record_infrastructure_failure,
+    record_report_published,
     record_triage_decision,
     SessionEffect,
     Transition,
@@ -125,6 +127,7 @@ class DistributedCoordinator:
                 )
             elif effect.kind == EffectKind.PUBLISH_REPORT:
                 self._reports.publish(build_session_report(session))
+                session = self._apply(session.session_id, record_report_published)
             else:
                 raise ValueError(f"unknown effect kind: {effect.kind}")
         if pending_triage:
@@ -201,8 +204,10 @@ class DistributedCoordinator:
             effect = SessionEffect(EffectKind.RUN_TRIAGE)
         elif session.status == SessionStatus.WAITING_REASONER:
             effect = SessionEffect(EffectKind.RUN_REASONER)
-        elif session.status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
+        elif session.report_publication == ReportPublicationStatus.PENDING:
             effect = SessionEffect(EffectKind.PUBLISH_REPORT)
+        elif session.status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
+            return session
         else:
             raise ValueError(f"cannot resume session in state: {session.status}")
         return self._dispatch(Transition(session, (effect,)))

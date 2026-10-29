@@ -522,6 +522,14 @@ class SessionStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReportPublicationStatus(str, Enum):
+    """Durable delivery state for a terminal diagnosis report."""
+
+    NOT_READY = "not_ready"
+    PENDING = "pending"
+    PUBLISHED = "published"
+
+
 _MAX_RANDOM_DELAY_NS = (1 << 32) - 2
 
 
@@ -2761,12 +2769,22 @@ class AnalysisSession:
     child_stress_options: Optional[StressOptions] = None
     child_session_ids: List[str] = dataclasses.field(default_factory=list)
     termination_reason: str = ""
+    report_publication: ReportPublicationStatus = ReportPublicationStatus.NOT_READY
     state_revision: int = 0
     schema_version: int = ANALYSIS_SESSION_SCHEMA_VERSION
 
     @property
     def pending_experiment_ids(self) -> List[str]:
         return [spec.experiment_id for spec in self.pending_experiments]
+
+    @property
+    def requires_reconciliation(self) -> bool:
+        active = self.status not in (
+            SessionStatus.COMPLETED,
+            SessionStatus.INCONCLUSIVE,
+            SessionStatus.FAILED,
+        )
+        return active or self.report_publication == ReportPublicationStatus.PENDING
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2797,6 +2815,7 @@ class AnalysisSession:
             ),
             "child_session_ids": list(self.child_session_ids),
             "termination_reason": self.termination_reason,
+            "report_publication": self.report_publication.value,
             "state_revision": self.state_revision,
         }
 
@@ -2812,10 +2831,18 @@ class AnalysisSession:
         triage = d.get("triage")
         discovery_plan = d.get("discovery_plan")
         child_stress_options = d.get("child_stress_options")
+        status = SessionStatus(d["status"])
+        publication = d.get("report_publication")
+        if publication is None:
+            publication = (
+                ReportPublicationStatus.PUBLISHED.value
+                if status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE)
+                else ReportPublicationStatus.NOT_READY.value
+            )
         return cls(
             session_id=d["session_id"],
             unit=WorkUnit.from_dict(d["unit"]),
-            status=SessionStatus(d["status"]),
+            status=status,
             evidence=EvidenceBundle.from_dict(d.get("evidence", {})),
             budget=SessionBudget.from_dict(d.get("budget", {})),
             pending_experiments=[
@@ -2845,6 +2872,7 @@ class AnalysisSession:
             ),
             child_session_ids=list(d.get("child_session_ids", [])),
             termination_reason=d.get("termination_reason", ""),
+            report_publication=ReportPublicationStatus(publication),
             state_revision=int(d.get("state_revision", 0)),
             schema_version=max(version, ANALYSIS_SESSION_SCHEMA_VERSION),
         )
