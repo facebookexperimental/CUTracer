@@ -13,6 +13,16 @@ class ReconcilePolicyAction(str, Enum):
     FAIL = "fail"
 
 
+class RemoteEffectKind(str, Enum):
+    EXPERIMENT_JOB = "mast"
+    REASONING_JOB = "sandcastle"
+
+    # Aliases under the deployment-specific names; the string values are
+    # persisted in durable attempt records and must not change.
+    MAST = "mast"
+    SANDCASTLE = "sandcastle"
+
+
 class _AttemptState(Protocol):
     @property
     def age_ms(self) -> int: ...
@@ -33,21 +43,25 @@ class ReconcilePolicyDecision:
 
 @dataclasses.dataclass(frozen=True)
 class ReconcilePolicy:
-    revision_timeout_ms: int = 6 * 60 * 60 * 1000
-    effect_timeout_ms: int = 2 * 60 * 60 * 1000
+    revision_timeout_ms: int = 24 * 60 * 60 * 1000
+    mast_timeout_ms: int = 7 * 60 * 60 * 1000
+    sandcastle_timeout_ms: int = 45 * 60 * 1000
     max_consecutive_failures: int = 5
     max_remote_attempts: int = 3
 
     def __post_init__(self) -> None:
         if (
             self.revision_timeout_ms <= 0
-            or self.effect_timeout_ms <= 0
+            or self.mast_timeout_ms <= 0
+            or self.sandcastle_timeout_ms <= 0
             or self.max_consecutive_failures <= 0
             or self.max_remote_attempts <= 0
         ):
             raise ValueError("reconciliation limits must be positive")
-        if self.effect_timeout_ms > self.revision_timeout_ms:
-            raise ValueError("effect timeout cannot exceed the revision deadline")
+        if max(self.mast_timeout_ms, self.sandcastle_timeout_ms) > (
+            self.revision_timeout_ms
+        ):
+            raise ValueError("effect timeouts cannot exceed the revision deadline")
 
     def assess_revision(self, attempt: _AttemptState) -> ReconcilePolicyDecision:
         if attempt.age_ms >= self.revision_timeout_ms:
@@ -65,6 +79,7 @@ class ReconcilePolicy:
     def assess_effect(
         self,
         *,
+        kind: RemoteEffectKind,
         attempts: int,
         updated_at_ms: int,
         now_ms: int,
@@ -72,9 +87,12 @@ class ReconcilePolicy:
     ) -> ReconcilePolicyDecision:
         if attempts < 0 or updated_at_ms < 0 or now_ms < 0:
             raise ValueError("remote effect timing and attempts are invalid")
-        timed_out = (
-            now_ms >= updated_at_ms and now_ms - updated_at_ms >= self.effect_timeout_ms
+        timeout_ms = (
+            self.mast_timeout_ms
+            if kind is RemoteEffectKind.EXPERIMENT_JOB
+            else self.sandcastle_timeout_ms
         )
+        timed_out = now_ms >= updated_at_ms and now_ms - updated_at_ms >= timeout_ms
         if not terminal_failure and not timed_out:
             return ReconcilePolicyDecision(ReconcilePolicyAction.WAIT)
         if attempts >= self.max_remote_attempts:
