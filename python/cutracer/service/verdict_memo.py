@@ -10,11 +10,18 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from cutracer.service.contracts import parse_ymd_date, WorkUnit
+from cutracer.service.contracts import (
+    AnalysisSession,
+    parse_ymd_date,
+    ReportPublicationStatus,
+    SessionStatus,
+    WorkUnit,
+)
 from cutracer.service.suppression import SuppressionPolicy
 
 
 VERDICT_MEMO_KEY_SCHEMA_VERSION = 1
+VERDICT_MEMO_RECORD_SCHEMA_VERSION = 1
 
 
 def _canonical_digest(payload: object) -> str:
@@ -169,3 +176,106 @@ class CompleteVerdictKey:
             scope_digest=str(payload["scope_digest"]),
             suppression_policy_digest=str(payload["suppression_policy_digest"]),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class CompleteVerdictMemo:
+    key: CompleteVerdictKey
+    source_session_id: str
+    source_state_revision: int
+    session_digest: str
+    report_digest: str
+    recorded_at_ms: int
+    expires_at_ms: int
+    schema_version: int = VERDICT_MEMO_RECORD_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != VERDICT_MEMO_RECORD_SCHEMA_VERSION:
+            raise ValueError("unsupported verdict memo record schema version")
+        if not self.source_session_id.strip() or self.source_state_revision <= 0:
+            raise ValueError("verdict memo requires a persisted source session")
+        for name, digest in (
+            ("session", self.session_digest),
+            ("report", self.report_digest),
+        ):
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(f"verdict memo {name} digest is invalid")
+        if self.recorded_at_ms < 0 or self.expires_at_ms <= self.recorded_at_ms:
+            raise ValueError("verdict memo lifetime is invalid")
+
+    @classmethod
+    def from_complete_session(
+        cls,
+        key: CompleteVerdictKey,
+        session: AnalysisSession,
+        *,
+        recorded_at_ms: int,
+        ttl_ms: int,
+    ) -> "CompleteVerdictMemo":
+        triage = session.triage
+        if (
+            session.status != SessionStatus.COMPLETED
+            or session.report is None
+            or triage is None
+            or triage.snapshot is None
+            or not triage.snapshot.initial_evidence_complete
+            or session.report_publication != ReportPublicationStatus.PUBLISHED
+        ):
+            raise ValueError("only a published complete verdict can be memoized")
+        kernel = session.unit.kernel
+        identity = (
+            None if kernel is None else kernel.cubin_hash,
+            session.unit.arch,
+            verdict_scope_digest(session.unit),
+        )
+        if identity != (key.cubin_hash, key.arch, key.scope_digest):
+            raise ValueError("verdict memo key does not match the source session")
+        if ttl_ms <= 0:
+            raise ValueError("verdict memo TTL must be positive")
+        return cls(
+            key=key,
+            source_session_id=session.session_id,
+            source_state_revision=session.state_revision,
+            session_digest=_canonical_digest(session.to_dict()),
+            report_digest=_canonical_digest(session.report.to_dict()),
+            recorded_at_ms=recorded_at_ms,
+            expires_at_ms=recorded_at_ms + ttl_ms,
+        )
+
+    def is_active_at(self, timestamp_ms: int) -> bool:
+        return self.recorded_at_ms <= timestamp_ms < self.expires_at_ms
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "key": self.key.to_dict(),
+            "source_session_id": self.source_session_id,
+            "source_state_revision": self.source_state_revision,
+            "session_digest": self.session_digest,
+            "report_digest": self.report_digest,
+            "recorded_at_ms": self.recorded_at_ms,
+            "expires_at_ms": self.expires_at_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CompleteVerdictMemo":
+        try:
+            key = payload["key"]
+            if not isinstance(key, dict):
+                raise ValueError("verdict memo key must be an object")
+            return cls(
+                schema_version=int(payload["schema_version"]),
+                key=CompleteVerdictKey.from_dict(key),
+                source_session_id=str(payload["source_session_id"]),
+                source_state_revision=int(payload["source_state_revision"]),
+                session_digest=str(payload["session_digest"]),
+                report_digest=str(payload["report_digest"]),
+                recorded_at_ms=int(payload["recorded_at_ms"]),
+                expires_at_ms=int(payload["expires_at_ms"]),
+            )
+        except KeyError as error:
+            raise ValueError(f"verdict memo is missing {error.args[0]}") from error
+        except TypeError as error:
+            raise ValueError(
+                f"verdict memo field has the wrong type: {error}"
+            ) from error
