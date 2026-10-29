@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import logging
 from functools import partial
 from typing import Callable, Protocol
@@ -41,13 +43,37 @@ from cutracer.service.session import (
     record_report_publication_failed,
     record_report_published,
     record_triage_decision,
-    SessionEffect,
+    resume_session,
     Transition,
 )
 from cutracer.service.storage import DurableSessionStore, StoreConflict
 from cutracer.service.triage import TriagePolicy
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def session_admission_digest(
+    unit: WorkUnit,
+    *,
+    budget: SessionBudget,
+    campaign_policy: InitialCampaignPolicy,
+    max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS,
+    shared_sanitizer_results: tuple[SanitizerSweepResult, ...] = (),
+) -> str:
+    payload = {
+        "unit": unit.to_dict(),
+        "budget": budget.to_dict(),
+        "sanitizer_tools": list(campaign_policy.sanitizer_tools),
+        "stress_options": campaign_policy.stress_options.to_dict(),
+        "enable_stress": campaign_policy.enable_stress,
+        "max_kernels": max_kernels,
+        "shared_sanitizer_results": [
+            result.to_dict() for result in shared_sanitizer_results
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,6 +137,7 @@ class DistributedCoordinator:
         reports: DistributedReportSink,
         guard_policy: ExperimentGuardPolicy | None = None,
         triage_policy: TriagePolicy | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._mast = mast
@@ -118,6 +145,7 @@ class DistributedCoordinator:
         self._reports = reports
         self._guard = guard_policy or ExperimentGuardPolicy()
         self._triage = triage_policy or TriagePolicy()
+        self._before_dispatch = before_dispatch
 
     def _dispatch(self, transition: Transition) -> AnalysisSession:
         session = transition.session
@@ -137,6 +165,8 @@ class DistributedCoordinator:
                 "CREATE_CHILD_SESSIONS must be the only effect in a transition"
             )
         for effect in transition.effects:
+            if self._before_dispatch is not None:
+                self._before_dispatch()
             if effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
                 self._mast.submit(
                     session.session_id,
@@ -193,6 +223,8 @@ class DistributedCoordinator:
         child_ids = []
         failures: list[str] = []
         for unit in pin_discovered_work_units(parent.unit, manifest.kernels):
+            if self._before_dispatch is not None:
+                self._before_dispatch()
             child_id = discovery_child_session_id(parent.session_id, unit)
             try:
                 self.start(
@@ -258,57 +290,48 @@ class DistributedCoordinator:
         max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS,
         shared_sanitizer_results: tuple[SanitizerSweepResult, ...] = (),
     ) -> AnalysisSession:
+        policy = campaign_policy or InitialCampaignPolicy()
+        resolved_budget = budget or SessionBudget()
+        admission_digest = session_admission_digest(
+            unit,
+            budget=resolved_budget,
+            campaign_policy=policy,
+            max_kernels=max_kernels,
+            shared_sanitizer_results=shared_sanitizer_results,
+        )
         transition = (
             create_discovery_session(
                 session_id,
                 unit,
-                budget=budget,
-                campaign_policy=campaign_policy,
+                budget=resolved_budget,
+                campaign_policy=policy,
                 max_kernels=max_kernels,
             )
             if unit.kernel is None
             else create_session(
                 session_id,
                 unit,
-                budget=budget,
-                campaign_policy=campaign_policy,
+                budget=resolved_budget,
+                campaign_policy=policy,
                 shared_sanitizer_results=shared_sanitizer_results,
             )
         )
         transition.session.state_revision = 1
+        transition.session.admission_input_digest = admission_digest
         try:
             self._store.create(transition.session)
         except StoreConflict:
+            existing = self._store.load(session_id)
+            if existing.admission_input_digest != admission_digest:
+                raise ValueError(
+                    "session ID is already bound to different or legacy inputs; "
+                    "use explicit resume for a legacy session"
+                ) from None
             return self.resume(session_id)
         return self._dispatch(transition)
 
     def resume(self, session_id: str) -> AnalysisSession:
-        session = self._store.load(session_id)
-        if session.status in (
-            SessionStatus.WAITING_INITIAL,
-            SessionStatus.WAITING_FOLLOWUP,
-        ):
-            effect = SessionEffect(
-                EffectKind.SUBMIT_EXPERIMENTS,
-                tuple(session.pending_experiments),
-            )
-        elif session.status == SessionStatus.WAITING_TRIAGE:
-            effect = SessionEffect(EffectKind.RUN_TRIAGE)
-        elif session.status == SessionStatus.WAITING_REASONER:
-            effect = SessionEffect(EffectKind.RUN_REASONER)
-        elif session.status == SessionStatus.WAITING_CHILDREN:
-            effect = SessionEffect(EffectKind.CREATE_CHILD_SESSIONS)
-        elif session.report_publication == ReportPublicationStatus.PENDING:
-            effect = SessionEffect(EffectKind.PUBLISH_REPORT)
-        elif session.status in (
-            SessionStatus.COMPLETED,
-            SessionStatus.INCONCLUSIVE,
-            SessionStatus.FAILED,
-        ):
-            return session
-        else:
-            raise ValueError(f"cannot resume session in state: {session.status}")
-        return self._dispatch(Transition(session, (effect,)))
+        return self._dispatch(resume_session(self._store.load(session_id)))
 
     def on_experiment_result(
         self, session_id: str, result: ExperimentResult
