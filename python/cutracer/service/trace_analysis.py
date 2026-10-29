@@ -11,9 +11,19 @@ import os
 import tempfile
 from itertools import islice, zip_longest
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
 
-from cutracer.analyze.fb.common.findings import AnalysisResult, Finding
 from cutracer.service.artifacts import local_artifact
 from cutracer.service.contracts import (
     ExecutionStatus,
@@ -23,6 +33,10 @@ from cutracer.service.contracts import (
     TraceAnalysisSeverity,
     TraceDetectorSummary,
 )
+
+if TYPE_CHECKING:
+    # The OSS export has no fb/ packages, and the CLI imports this module there.
+    from cutracer.analyze.fb.common.findings import AnalysisResult, Finding
 
 MAX_COMPACT_FINDINGS = 32
 MAX_CAPTURE_INSTRUCTIONS = 32
