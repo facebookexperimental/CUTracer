@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Mapping
 from enum import Enum
 
 from cutracer.service.catalog_adapters import CatalogWorkUnit
@@ -30,6 +32,64 @@ class AdmissionDisposition(str, Enum):
 class BudgetConstraint(str, Enum):
     RUN_CAP = "run_cap"
     GPU_SECONDS = "gpu_seconds"
+
+
+class CampaignMode(str, Enum):
+    SCHEDULED = "scheduled"
+    ON_DEMAND = "on_demand"
+
+
+class CampaignTool(str, Enum):
+    MEMCHECK = "memcheck"
+    RACECHECK = "racecheck"
+    INITCHECK = "initcheck"
+    SYNCCHECK = "synccheck"
+    RANDOM_DELAY_STRESS = "random_delay_stress"
+
+
+class CadenceDisposition(str, Enum):
+    DUE = "due"
+    NOT_DUE = "not_due"
+    NOT_APPLICABLE = "not_applicable"
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolCadence:
+    tool: CampaignTool
+    cadence_days: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.cadence_days, bool)
+            or not isinstance(self.cadence_days, int)
+            or self.cadence_days <= 0
+        ):
+            raise ValueError("tool cadence must be a positive integer")
+
+
+@dataclasses.dataclass(frozen=True)
+class CadenceDecision:
+    target: CatalogWorkUnit
+    tool: CampaignTool
+    disposition: CadenceDisposition
+    effective_cadence_days: int | None
+    last_completed_at: datetime.datetime | None
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolCadencePlan:
+    mode: CampaignMode
+    as_of: datetime.datetime
+    decisions: tuple[CadenceDecision, ...]
+
+    def due_tools(self, unit_id: str) -> tuple[CampaignTool, ...]:
+        return tuple(
+            decision.tool
+            for decision in self.decisions
+            if decision.target.unit.unit_id == unit_id
+            and decision.disposition == CadenceDisposition.DUE
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,6 +322,83 @@ def apply_campaign_budget(
             )
         )
     return AdmissionPlan(budget, tuple(decisions))
+
+
+def _cadence_disposition(
+    target: CatalogWorkUnit,
+    cadence: ToolCadence,
+    *,
+    mode: CampaignMode,
+    as_of: datetime.datetime,
+    last_completed_at: datetime.datetime | None,
+) -> tuple[CadenceDisposition, str, int | None]:
+    if last_completed_at is not None and last_completed_at > as_of:
+        raise ValueError("tool completion time must not be in the future")
+    if cadence.tool == CampaignTool.RANDOM_DELAY_STRESS and target.unit.oracle is None:
+        return (
+            CadenceDisposition.NOT_APPLICABLE,
+            "random-delay stress requires an oracle",
+            None,
+        )
+    effective_days = max(target.cadence_days, cadence.cadence_days)
+    if mode == CampaignMode.ON_DEMAND:
+        return (
+            CadenceDisposition.DUE,
+            "on-demand campaigns bypass cadence",
+            effective_days,
+        )
+    if last_completed_at is None:
+        return (
+            CadenceDisposition.DUE,
+            "tool has no prior successful run",
+            effective_days,
+        )
+    elapsed = as_of - last_completed_at
+    if elapsed >= datetime.timedelta(days=effective_days):
+        return CadenceDisposition.DUE, "tool cadence has elapsed", effective_days
+    return CadenceDisposition.NOT_DUE, "tool cadence has not elapsed", effective_days
+
+
+def plan_tool_cadence(
+    targets: tuple[CatalogWorkUnit, ...],
+    cadences: tuple[ToolCadence, ...],
+    *,
+    mode: CampaignMode,
+    as_of: datetime.datetime,
+    last_completed: Mapping[tuple[str, CampaignTool], datetime.datetime],
+) -> ToolCadencePlan:
+    if as_of.tzinfo is None:
+        raise ValueError("campaign as_of must be timezone-aware")
+    unit_ids = [target.unit.unit_id for target in targets]
+    if len(unit_ids) != len(set(unit_ids)):
+        raise ValueError("cadence targets must have unique unit ids")
+    tools = [cadence.tool for cadence in cadences]
+    if len(tools) != len(set(tools)):
+        raise ValueError("tool cadences must be unique")
+    decisions: list[CadenceDecision] = []
+    for target in sorted(targets, key=lambda item: item.unit.unit_id):
+        for cadence in cadences:
+            completed_at = last_completed.get((target.unit.unit_id, cadence.tool))
+            if completed_at is not None and completed_at.tzinfo is None:
+                raise ValueError("tool completion time must be timezone-aware")
+            disposition, reason, effective_days = _cadence_disposition(
+                target,
+                cadence,
+                mode=mode,
+                as_of=as_of,
+                last_completed_at=completed_at,
+            )
+            decisions.append(
+                CadenceDecision(
+                    target=target,
+                    tool=cadence.tool,
+                    disposition=disposition,
+                    effective_cadence_days=effective_days,
+                    last_completed_at=completed_at,
+                    reason=reason,
+                )
+            )
+    return ToolCadencePlan(mode, as_of, tuple(decisions))
 
 
 def assign_catalog_shards(
