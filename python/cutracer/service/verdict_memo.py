@@ -29,6 +29,18 @@ def _canonical_digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def validate_runtime_versions(versions: tuple[tuple[str, str], ...]) -> None:
+    names = tuple(name for name, _version in versions)
+    if (
+        not versions
+        or versions != tuple(sorted(versions))
+        or len(versions) != len(set(versions))
+        or len(names) != len(set(names))
+        or any(not name.strip() or not version.strip() for name, version in versions)
+    ):
+        raise ValueError("runtime versions must be non-empty, sorted, and unique")
+
+
 def suppression_policy_digest(
     policy: SuppressionPolicy, *, today: str | None = None
 ) -> str:
@@ -86,18 +98,7 @@ class CompleteVerdictKey:
             sorted(set(self.evidence_tools))
         ):
             raise ValueError("evidence tools must be non-empty, sorted, and unique")
-        if not self.runtime_versions or self.runtime_versions != tuple(
-            sorted(set(self.runtime_versions))
-        ):
-            raise ValueError("runtime versions must be non-empty, sorted, and unique")
-        runtime_names = tuple(name for name, _version in self.runtime_versions)
-        if len(runtime_names) != len(set(runtime_names)):
-            raise ValueError("runtime version names must be unique")
-        if any(
-            not name.strip() or not version.strip()
-            for name, version in self.runtime_versions
-        ):
-            raise ValueError("runtime version names and values must not be empty")
+        validate_runtime_versions(self.runtime_versions)
 
     @classmethod
     def for_unit(

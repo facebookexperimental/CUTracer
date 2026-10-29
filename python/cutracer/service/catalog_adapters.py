@@ -66,6 +66,7 @@ def _unit_id(
             "entry_id": entry.entry_id,
             "env": dict(entry.env),
             "kernel_filters": list(entry.kernel_filters),
+            "kernel": None if entry.kernel is None else entry.kernel.to_dict(),
             "oracle": None if entry.oracle is None else entry.oracle.to_dict(),
             "selector_index": selector_index,
             "source_revision": entry.source_revision,
@@ -134,6 +135,7 @@ class PytestCatalogAdapter:
                     arch=arch,
                     source_revision=entry.source_revision,
                     oracle=entry.oracle,
+                    kernel=entry.kernel,
                     env=dict(entry.env),
                     kernel_filters=list(entry.kernel_filters),
                 )
@@ -239,6 +241,7 @@ class TritonbenchCatalogAdapter:
                     arch=arch,
                     source_revision=entry.source_revision,
                     oracle=entry.oracle,
+                    kernel=entry.kernel,
                     env=dict(entry.env),
                     kernel_filters=list(entry.kernel_filters),
                 )

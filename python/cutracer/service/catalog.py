@@ -10,7 +10,7 @@ import re
 from enum import Enum
 from typing import Any, Mapping
 
-from cutracer.service.contracts import OracleSpec
+from cutracer.service.contracts import KernelId, OracleSpec
 
 
 WORKLOAD_CATALOG_SCHEMA_VERSION = 1
@@ -87,6 +87,7 @@ class WorkloadCatalogEntry:
     extra_args: tuple[str, ...] = ()
     env: tuple[tuple[str, str], ...] = ()
     oracle: OracleSpec | None = None
+    kernel: KernelId | None = None
     kernel_filters: tuple[str, ...] = ()
     sampling: CatalogSamplingPolicy = CatalogSamplingPolicy()
     cadence_days: int = 1
@@ -122,6 +123,10 @@ class WorkloadCatalogEntry:
             raise ValueError(
                 "catalog kernel filters must be nonempty, unique, and comma-free"
             )
+        if self.kernel is not None and (
+            not self.kernel.name.strip() or not self.kernel.cubin_hash.strip()
+        ):
+            raise ValueError("catalog pinned kernel identity must not be empty")
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in (self.cadence_days, self.estimated_gpu_seconds)
@@ -148,6 +153,7 @@ class WorkloadCatalogEntry:
             "extra_args": list(self.extra_args),
             "env": dict(self.env),
             "oracle": None if self.oracle is None else self.oracle.to_dict(),
+            "kernel": None if self.kernel is None else self.kernel.to_dict(),
             "kernel_filters": list(self.kernel_filters),
             "sampling": self.sampling.to_dict(),
             "cadence_days": self.cadence_days,
@@ -158,6 +164,7 @@ class WorkloadCatalogEntry:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> WorkloadCatalogEntry:
         oracle = payload.get("oracle")
+        kernel = payload.get("kernel")
         environment = payload.get("env", {})
         if not isinstance(environment, Mapping):
             raise ValueError("catalog entry env must be an object")
@@ -168,6 +175,8 @@ class WorkloadCatalogEntry:
             raise ValueError("catalog entry env values must be strings")
         if oracle is not None and not isinstance(oracle, Mapping):
             raise ValueError("catalog entry oracle must be an object or null")
+        if kernel is not None and not isinstance(kernel, Mapping):
+            raise ValueError("catalog entry kernel must be an object or null")
         sampling = payload.get("sampling", {})
         if not isinstance(sampling, Mapping):
             raise ValueError("catalog entry sampling must be an object")
@@ -189,6 +198,7 @@ class WorkloadCatalogEntry:
                 sorted((str(key), str(value)) for key, value in environment.items())
             ),
             oracle=None if oracle is None else OracleSpec.from_dict(dict(oracle)),
+            kernel=None if kernel is None else KernelId.from_dict(dict(kernel)),
             kernel_filters=_strings(
                 {"kernel_filters": payload.get("kernel_filters", [])},
                 "kernel_filters",
