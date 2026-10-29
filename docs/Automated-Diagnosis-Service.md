@@ -85,3 +85,6 @@ adapter, not a second execution mode in the GPU experiment APIs.
 All portable artifacts use `ArtifactRef`. Local paths are materialized only in
 the local adapter; distributed producers must upload them and replace the URI
 before sending a completion event.
+
+Deployment dashboards, SLO definitions, alert thresholds, and recovery steps
+are documented in the internal Automated Diagnosis Operations runbook.
