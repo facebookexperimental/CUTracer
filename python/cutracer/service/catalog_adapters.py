@@ -137,10 +137,120 @@ class PytestCatalogAdapter:
         return tuple(targets)
 
 
+_TRITONBENCH_FORBIDDEN_OPTIONS = frozenset(
+    {
+        "--bypass-fail",
+        "--metrics",
+        "--num-inputs",
+        "--op",
+        "--rep",
+        "--repcnt",
+        "--test-only",
+        "--warmup",
+    }
+)
+
+
+def _option_name(argument: str) -> str:
+    return argument.partition("=")[0]
+
+
+def _tritonbench_argv(
+    entry: WorkloadCatalogEntry,
+    selector: str,
+    target_argv: tuple[str, ...],
+) -> list[str]:
+    forbidden = [
+        argument
+        for argument in entry.extra_args
+        if _option_name(argument) in _TRITONBENCH_FORBIDDEN_OPTIONS
+    ]
+    if forbidden:
+        raise ValueError(
+            "tritonbench catalog extra_args override guarded options: "
+            f"{', '.join(forbidden)}"
+        )
+    return [
+        *target_argv,
+        "--",
+        "--op",
+        selector,
+        "--metrics",
+        "accuracy",
+        "--num-inputs",
+        "1",
+        "--test-only",
+        "--isolate",
+        *entry.extra_args,
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class TritonbenchCatalogAdapter:
+    target_argv: tuple[str, ...] = (
+        "buck2",
+        "--client-metadata",
+        "id=cutracer_service",
+        "run",
+        "@mode/opt",
+        "fbcode//pytorch/tritonbench:run",
+    )
+
+    def __post_init__(self) -> None:
+        if not self.target_argv or any(not item.strip() for item in self.target_argv):
+            raise ValueError("tritonbench adapter command must not be empty")
+
+    def expand(
+        self,
+        entry: WorkloadCatalogEntry,
+        *,
+        catalog_revision: str,
+    ) -> tuple[CatalogWorkUnit, ...]:
+        if entry.adapter != CatalogAdapter.TRITONBENCH:
+            raise ValueError(
+                f"catalog entry {entry.entry_id!r} is not a tritonbench entry"
+            )
+        targets: list[CatalogWorkUnit] = []
+        for selector_index, selector in enumerate(entry.selectors):
+            for arch in entry.architectures:
+                argv = _tritonbench_argv(entry, selector, self.target_argv)
+                unit = WorkUnit(
+                    unit_id=_unit_id(entry, argv, arch, selector_index),
+                    argv=argv,
+                    workload=entry.adapter.value,
+                    test_id=selector,
+                    cwd=entry.cwd,
+                    arch=arch,
+                    source_revision=entry.source_revision,
+                    oracle=entry.oracle,
+                    env=dict(entry.env),
+                )
+                targets.append(
+                    CatalogWorkUnit(
+                        catalog_revision=catalog_revision,
+                        entry_id=entry.entry_id,
+                        selector_index=selector_index,
+                        kernel_filters=entry.kernel_filters,
+                        sampling=entry.sampling,
+                        cadence_days=entry.cadence_days,
+                        estimated_gpu_seconds=entry.estimated_gpu_seconds,
+                        unit=unit,
+                    )
+                )
+        return tuple(targets)
+
+
 def pytest_catalog_adapters() -> dict[CatalogAdapter, WorkloadCatalogAdapter]:
     return {
         kind: PytestCatalogAdapter(kind)
         for kind in (CatalogAdapter.TRITON_PYTEST, CatalogAdapter.TLX_PYTEST)
+    }
+
+
+def default_catalog_adapters() -> dict[CatalogAdapter, WorkloadCatalogAdapter]:
+    return {
+        **pytest_catalog_adapters(),
+        CatalogAdapter.TRITONBENCH: TritonbenchCatalogAdapter(),
     }
 
 
@@ -149,7 +259,7 @@ def expand_workload_catalog(
     *,
     adapters: Mapping[CatalogAdapter, WorkloadCatalogAdapter] | None = None,
 ) -> tuple[CatalogWorkUnit, ...]:
-    resolved_adapters = pytest_catalog_adapters() if adapters is None else adapters
+    resolved_adapters = default_catalog_adapters() if adapters is None else adapters
     targets: list[CatalogWorkUnit] = []
     for entry in catalog.entries:
         if not entry.enabled:
