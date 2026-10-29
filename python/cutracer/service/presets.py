@@ -59,7 +59,10 @@ class DiagnosisPresetRegistry:
     schema_version: int = PRESET_REGISTRY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != PRESET_REGISTRY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != PRESET_REGISTRY_SCHEMA_VERSION
+        ):
             raise ValueError(
                 f"unsupported preset registry schema_version: {self.schema_version}"
             )
@@ -75,13 +78,12 @@ class DiagnosisPresetRegistry:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> DiagnosisPresetRegistry:
-        version = int(payload.get("schema_version", 0))
         entries = payload.get("presets")
         if not isinstance(entries, list):
             raise ValueError("diagnosis preset registry requires a presets array")
         return cls(
             presets=tuple(DiagnosisPreset.from_dict(item) for item in entries),
-            schema_version=version,
+            schema_version=payload.get("schema_version", 0),
         )
 
 

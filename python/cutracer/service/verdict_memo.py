@@ -83,7 +83,10 @@ class CompleteVerdictKey:
     schema_version: int = VERDICT_MEMO_KEY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != VERDICT_MEMO_KEY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != VERDICT_MEMO_KEY_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported verdict memo key schema version")
         scalar_fields = (
             self.cubin_hash,
@@ -168,7 +171,7 @@ class CompleteVerdictKey:
         ):
             raise ValueError("verdict memo runtime_versions must contain string pairs")
         return cls(
-            schema_version=int(payload["schema_version"]),
+            schema_version=payload["schema_version"],
             cubin_hash=str(payload["cubin_hash"]),
             arch=str(payload["arch"]),
             evidence_tools=tuple(evidence_tools),
@@ -191,7 +194,10 @@ class CompleteVerdictMemo:
     schema_version: int = VERDICT_MEMO_RECORD_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != VERDICT_MEMO_RECORD_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != VERDICT_MEMO_RECORD_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported verdict memo record schema version")
         if not self.source_session_id.strip() or self.source_state_revision <= 0:
             raise ValueError("verdict memo requires a persisted source session")
@@ -265,7 +271,7 @@ class CompleteVerdictMemo:
             if not isinstance(key, dict):
                 raise ValueError("verdict memo key must be an object")
             return cls(
-                schema_version=int(payload["schema_version"]),
+                schema_version=payload["schema_version"],
                 key=CompleteVerdictKey.from_dict(key),
                 source_session_id=str(payload["source_session_id"]),
                 source_state_revision=int(payload["source_state_revision"]),

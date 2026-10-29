@@ -616,17 +616,9 @@ def _project_artifact_content(
         target_size,
         truncated=True,
     )
-    if (
-        marked is None
-        and _fit_artifact_content(
-            document,
-            index,
-            content,
-            final_status,
-            target_size,
-        )
-        is None
-    ):
+    if marked is None:
+        # If the truncation marker cannot fit, omit the content instead of
+        # returning a partial value without its required marker.
         entry.clear()
         entry.update(original)
 

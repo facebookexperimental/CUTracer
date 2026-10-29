@@ -2501,7 +2501,10 @@ class ExperimentEnvelope:
     schema_version: int = EXPERIMENT_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != EXPERIMENT_ENVELOPE_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != EXPERIMENT_ENVELOPE_SCHEMA_VERSION
+        ):
             raise ValueError(
                 f"unsupported ExperimentEnvelope schema_version: {self.schema_version}"
             )
@@ -2552,14 +2555,13 @@ class ExperimentEnvelope:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExperimentEnvelope":
-        version = int(d.get("schema_version", 0))
         return cls(
             session_id=d["session_id"],
             experiment_id=d["experiment_id"],
             analyzed_state_revision=d["analyzed_state_revision"],
             dispatch_key=d["dispatch_key"],
             result=experiment_result_from_dict(d["result"]),
-            schema_version=version,
+            schema_version=d.get("schema_version", 0),
         )
 
     @classmethod

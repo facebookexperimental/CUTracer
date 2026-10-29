@@ -157,7 +157,10 @@ class FileSessionStore(ManagedSessionStore):
             raise StoreUnavailable(
                 f"invalid file-store session payload: {error}"
             ) from error
-        if session.state_revision != int(record.get("state_revision", -1)):
+        revision = record.get("state_revision")
+        if type(revision) is not int or revision < 0:
+            raise StoreUnavailable("file-store session revision metadata is invalid")
+        if session.state_revision != revision:
             raise StoreUnavailable(
                 "file-store session revision metadata is inconsistent"
             )
