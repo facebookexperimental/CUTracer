@@ -7,6 +7,7 @@
 #ifndef INSTR_CATEGORY_H
 #define INSTR_CATEGORY_H
 
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -94,7 +95,10 @@ static const std::vector<InstrCategoryPattern> INSTR_CATEGORY_PATTERNS = {
 
     // SYNC (Synchronization) instructions
     {"WARPGROUP.DEPBAR", InstrCategory::SYNC, "Warpgroup dependency barrier"},
-    // Add more SYNC patterns here as needed
+    {"SYNCS.", InstrCategory::SYNC, "Memory barrier synchronization"},
+    {"BAR.SYNC", InstrCategory::SYNC, "Named barrier synchronization"},
+    {"BAR.ARV", InstrCategory::SYNC, "Named barrier arrival"},
+    {"DEPBAR.", InstrCategory::SYNC, "Asynchronous dependency barrier"},
 };
 
 /**
