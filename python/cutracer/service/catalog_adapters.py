@@ -30,6 +30,18 @@ class CatalogWorkUnit:
     estimated_gpu_seconds: int
     unit: WorkUnit
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "catalog_revision": self.catalog_revision,
+            "entry_id": self.entry_id,
+            "selector_index": self.selector_index,
+            "kernel_filters": sorted(self.kernel_filters),
+            "sampling": self.sampling.to_dict(),
+            "cadence_days": self.cadence_days,
+            "estimated_gpu_seconds": self.estimated_gpu_seconds,
+            "unit": self.unit.to_dict(),
+        }
+
 
 class WorkloadCatalogAdapter(Protocol):
     def expand(
