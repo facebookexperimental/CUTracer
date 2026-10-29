@@ -239,6 +239,8 @@ def run_local_session(
     active_reasoner = reasoner or ClaudeReasoner()
     active_guard = guard_policy or ExperimentGuardPolicy()
     active_triage = triage_policy or TriagePolicy()
+    if store is not None:
+        store.save(current)
     steps = 0
     while effects:
         steps += 1
