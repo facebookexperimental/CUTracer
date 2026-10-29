@@ -20,7 +20,7 @@ from cutracer.service.contracts import (
     SessionStatus,
     WorkUnit,
 )
-from cutracer.service.kernel_discovery import (
+from cutracer.service.discovery_plan import (
     discovery_child_session_id,
     pin_discovered_work_units,
 )
