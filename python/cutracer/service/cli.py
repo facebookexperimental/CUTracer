@@ -31,6 +31,7 @@ from cutracer.service.runner import (
     LocalExperimentExecutor,
     LocalRuntimeConfig,
     run_local_session,
+    SessionFailedError,
 )
 from cutracer.service.suppression import load_suppression_policy, SuppressionPolicy
 from cutracer.service.triage import TriagePolicy
@@ -379,6 +380,8 @@ def _run_local_from_cli(
     except PartialDiagnosisError as error:
         if out is None:
             click.echo(error.report.to_json(indent=2))
+        raise click.ClickException(str(error)) from error
+    except SessionFailedError as error:
         raise click.ClickException(str(error)) from error
     if out is None:
         click.echo(report.to_json(indent=2))

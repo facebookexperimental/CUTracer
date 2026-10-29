@@ -19,6 +19,14 @@ from cutracer.service.cli import (
     diagnose_resume_command,
     diagnose_status_command,
 )
+from cutracer.service.run_cli import (
+    diagnose_run_advance_command,
+    diagnose_run_command,
+    diagnose_run_result_command,
+    diagnose_run_resume_command,
+    diagnose_run_status_command,
+    diagnose_submit_command,
+)
 from cutracer.shared_vars import is_fbcode
 from cutracer.stress.cli import stress_command
 from cutracer.validation.cli import compare_command, validate_command
@@ -66,6 +74,12 @@ main.add_command(compute_sanitizer_command)
 main.add_command(diagnose_command)
 main.add_command(diagnose_resume_command)
 main.add_command(diagnose_status_command)
+main.add_command(diagnose_run_command)
+main.add_command(diagnose_submit_command)
+main.add_command(diagnose_run_resume_command)
+main.add_command(diagnose_run_advance_command)
+main.add_command(diagnose_run_status_command)
+main.add_command(diagnose_run_result_command)
 main.add_command(query_command)
 main.add_command(reduce_command)
 main.add_command(sass_command)
