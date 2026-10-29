@@ -16,6 +16,7 @@ from cutracer.service.contracts import (
     Confidence,
     CrossValidation,
     DecisionKind,
+    DEFAULT_MAX_DISCOVERED_KERNELS,
     EvidenceBundle,
     EvidenceSufficiency,
     ExecutionStatus,
@@ -25,6 +26,9 @@ from cutracer.service.contracts import (
     ExperimentResult,
     ExperimentSpec,
     ExplainReport,
+    KernelDiscoveryOptions,
+    KernelDiscoveryOutcome,
+    KernelDiscoveryResult,
     KernelId,
     RaceClass,
     ReduceExperimentResult,
@@ -65,6 +69,7 @@ from cutracer.service.triage import initial_evidence_requires_inconclusive
 
 class EffectKind(str, Enum):
     SUBMIT_EXPERIMENTS = "submit_experiments"
+    CREATE_CHILD_SESSIONS = "create_child_sessions"
     RUN_TRIAGE = "run_triage"
     RUN_REASONER = "run_reasoner"
     PUBLISH_REPORT = "publish_report"
@@ -128,6 +133,7 @@ def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
 
 def _evidence_results(evidence: EvidenceBundle) -> List[ExperimentResult]:
     results: List[ExperimentResult] = []
+    results.extend(evidence.discovery)
     results.extend(evidence.sanitizer)
     results.extend(evidence.stress)
     results.extend(evidence.traces)
@@ -722,6 +728,10 @@ def _validate_result_against_spec(
         )
     expected_type_matches = (
         (
+            spec.kind == ExperimentKind.KERNEL_DISCOVERY
+            and isinstance(result, KernelDiscoveryResult)
+        )
+        or (
             spec.kind == ExperimentKind.COMPUTE_SANITIZER
             and isinstance(result, SanitizerSweepResult)
         )
@@ -744,7 +754,9 @@ def _validate_result_against_spec(
         )
 
     _validate_provenance(spec, result)
-    if isinstance(result, SanitizerSweepResult):
+    if isinstance(result, KernelDiscoveryResult):
+        _validate_discovery_result(spec, result)
+    elif isinstance(result, SanitizerSweepResult):
         _validate_sanitizer_result(spec, result)
     elif isinstance(result, StressTestResult):
         _validate_stress_result(spec, result)
@@ -775,7 +787,9 @@ def _experiment_record(
 ) -> ExperimentRecord:
     outcome = ""
     completeness = ""
-    if isinstance(result, SanitizerSweepResult):
+    if isinstance(result, KernelDiscoveryResult):
+        outcome = result.outcome.value
+    elif isinstance(result, SanitizerSweepResult):
         outcome = result.outcome.value
         completeness = result.completeness.value
     elif isinstance(result, StressTestResult):
@@ -797,6 +811,36 @@ def _experiment_record(
         outcome=outcome,
         completeness=completeness,
     )
+
+
+def _validate_discovery_result(
+    spec: ExperimentSpec,
+    result: KernelDiscoveryResult,
+) -> None:
+    if result.outcome != KernelDiscoveryOutcome.DISCOVERED:
+        return
+    manifest = result.discovery
+    if manifest is None:
+        _reject_result(
+            "discovery_result_inconsistent",
+            "successful discovery has no manifest",
+        )
+    if (
+        manifest.target_unit_id != spec.unit.unit_id
+        or manifest.source_revision != spec.unit.source_revision
+        or manifest.arch != spec.unit.arch
+        or list(manifest.kernel_filters) != spec.unit.kernel_filters
+    ):
+        _reject_result(
+            "discovery_context_mismatch",
+            "kernel discovery manifest differs from the pending WorkUnit",
+        )
+    assert spec.discovery is not None
+    if len(manifest.kernels) > spec.discovery.max_kernels:
+        _reject_result(
+            "discovery_result_inconsistent",
+            "kernel discovery result exceeds the requested fanout limit",
+        )
 
 
 def _triage_report(session: AnalysisSession, decision: TriageDecision) -> ExplainReport:
@@ -879,6 +923,11 @@ def create_session(
     shared_sanitizer_results: Sequence[SanitizerSweepResult] = (),
 ) -> Transition:
     kernel = unit.kernel
+    if kernel is None or not kernel.name.strip() or not kernel.cubin_hash.strip():
+        raise ValueError(
+            "analysis session requires a kernel-pinned WorkUnit; run kernel "
+            "discovery before creating the session"
+        )
     policy = campaign_policy or InitialCampaignPolicy()
     plan = policy.plan(session_id, unit)
     active_budget = budget or SessionBudget()
@@ -931,6 +980,81 @@ def create_session(
     else:
         effects = (SessionEffect(kind=EffectKind.RUN_TRIAGE),)
     return Transition(session=session, effects=effects)
+
+
+def create_discovery_session(
+    session_id: str,
+    unit: WorkUnit,
+    *,
+    budget: Optional[SessionBudget] = None,
+    campaign_policy: Optional[InitialCampaignPolicy] = None,
+    max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS,
+) -> Transition:
+    """Create the parent session that discovers kernels before diagnosis."""
+    if unit.kernel is not None:
+        raise ValueError("kernel discovery session requires an unpinned WorkUnit")
+    policy = campaign_policy or InitialCampaignPolicy()
+    discovery = KernelDiscoveryOptions(max_kernels=max_kernels)
+    discovery_experiment = ExperimentSpec(
+        experiment_id=f"{session_id}-kernel-discovery",
+        session_id=session_id,
+        phase=ExperimentPhase.INITIAL,
+        kind=ExperimentKind.KERNEL_DISCOVERY,
+        unit=unit,
+        discovery=discovery,
+    )
+    campaign = policy.plan(session_id, unit)
+    target_scoped = tuple(
+        spec
+        for spec in campaign.experiments
+        if spec.kind == ExperimentKind.COMPUTE_SANITIZER
+        and spec.sanitizer_tool is not None
+        and is_target_scoped_sanitizer(spec.sanitizer_tool)
+    )
+    experiments = (discovery_experiment, *target_scoped)
+    active_budget = budget or SessionBudget()
+    if len(experiments) > active_budget.max_experiments:
+        session = AnalysisSession(
+            session_id=session_id,
+            unit=unit,
+            status=SessionStatus.WAITING_TRIAGE,
+            evidence=EvidenceBundle(),
+            budget=active_budget,
+            discovery_plan=discovery,
+            child_sanitizer_tools=list(policy.sanitizer_tools),
+            child_enable_stress=policy.enable_stress,
+            child_stress_options=policy.stress_options,
+        )
+        return _terminate_inconclusive(
+            session,
+            "discovery experiment budget exhausted: "
+            f"required={len(experiments)}, limit={active_budget.max_experiments}",
+        )
+    session = AnalysisSession(
+        session_id=session_id,
+        unit=unit,
+        status=SessionStatus.WAITING_INITIAL,
+        evidence=EvidenceBundle(),
+        budget=active_budget,
+        pending_experiments=list(experiments),
+        experiment_fingerprints=[
+            experiment_spec_fingerprint(spec) for spec in experiments
+        ],
+        submitted_experiments=len(experiments),
+        discovery_plan=discovery,
+        child_sanitizer_tools=list(policy.sanitizer_tools),
+        child_enable_stress=policy.enable_stress,
+        child_stress_options=policy.stress_options,
+    )
+    return Transition(
+        session=session,
+        effects=(
+            SessionEffect(
+                kind=EffectKind.SUBMIT_EXPERIMENTS,
+                experiments=experiments,
+            ),
+        ),
+    )
 
 
 def record_experiment_result(
@@ -986,6 +1110,25 @@ def record_experiment_result(
     updated.experiment_history.append(_experiment_record(spec, result))
     if updated.pending_experiments:
         return Transition(session=updated, effects=())
+    if updated.discovery_plan is not None:
+        discovery_results = updated.evidence.discovery
+        if len(discovery_results) != 1:
+            _reject_result(
+                "session_state_corrupt",
+                "discovery parent must contain exactly one discovery result",
+            )
+        discovery_result = discovery_results[0]
+        if discovery_result.outcome != KernelDiscoveryOutcome.DISCOVERED:
+            updated.status = SessionStatus.FAILED
+            updated.termination_reason = (
+                discovery_result.error or discovery_result.outcome.value
+            )
+            return Transition(session=updated, effects=())
+        updated.status = SessionStatus.WAITING_CHILDREN
+        return Transition(
+            session=updated,
+            effects=(SessionEffect(kind=EffectKind.CREATE_CHILD_SESSIONS),),
+        )
     if spec.phase == ExperimentPhase.INITIAL:
         # Completeness, correlation, suppression, and baseline all run before
         # the reasoner is ever entered; the reasoner is for evidence that
@@ -1000,6 +1143,33 @@ def record_experiment_result(
         session=updated,
         effects=(SessionEffect(kind=EffectKind.RUN_REASONER),),
     )
+
+
+def record_discovery_children_started(
+    session: AnalysisSession,
+    child_session_ids: List[str],
+) -> Transition:
+    """Commit the complete set of child sessions after idempotent fanout."""
+    if len(child_session_ids) != len(set(child_session_ids)):
+        raise ValueError("discovery child session IDs must be unique")
+    if session.status == SessionStatus.COMPLETED:
+        if set(session.child_session_ids) == set(child_session_ids):
+            return Transition(session=session, effects=())
+        raise ValueError("completed discovery session has different child sessions")
+    if session.status != SessionStatus.WAITING_CHILDREN:
+        raise ValueError(f"cannot record discovery children in state: {session.status}")
+    discovery = session.evidence.discovery
+    if len(discovery) != 1 or discovery[0].discovery is None:
+        raise ValueError("discovery parent has no successful manifest")
+    if len(child_session_ids) != len(discovery[0].discovery.kernels):
+        raise ValueError("discovery child session count does not match manifest")
+    updated = _clone(session)
+    updated.child_session_ids = list(child_session_ids)
+    updated.status = SessionStatus.COMPLETED
+    updated.termination_reason = (
+        f"created {len(child_session_ids)} kernel-pinned analysis sessions"
+    )
+    return Transition(session=updated, effects=())
 
 
 def record_triage_decision(
@@ -1296,6 +1466,29 @@ def record_report_published(session: AnalysisSession) -> Transition:
         )
     updated = _clone(session)
     updated.report_publication = ReportPublicationStatus.PUBLISHED
+    updated.report_publication_error = ""
+    return Transition(session=updated, effects=())
+
+
+def record_report_publication_failed(
+    session: AnalysisSession,
+    reason: str,
+) -> Transition:
+    """Stop delivery retries while preserving the completed diagnosis."""
+    normalized = reason.strip()
+    if not normalized:
+        raise ValueError("report publication failure requires a reason")
+    if session.status not in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
+        raise ValueError(f"cannot fail report publication in state: {session.status}")
+    if session.report_publication == ReportPublicationStatus.FAILED:
+        return Transition(session=session, effects=())
+    if session.report_publication != ReportPublicationStatus.PENDING:
+        raise ValueError(
+            f"report is not pending publication: {session.report_publication}"
+        )
+    updated = _clone(session)
+    updated.report_publication = ReportPublicationStatus.FAILED
+    updated.report_publication_error = normalized[:_MAX_TERMINATION_REASON_LENGTH]
     return Transition(session=updated, effects=())
 
 

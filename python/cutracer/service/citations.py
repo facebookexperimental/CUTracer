@@ -15,6 +15,11 @@ from cutracer.service.contracts import ArtifactRef, EvidenceBundle
 def evidence_artifact_refs(evidence: EvidenceBundle) -> list[ArtifactRef]:
     """Enumerate citable typed artifacts, not arbitrary strings in evidence."""
     refs: list[ArtifactRef] = []
+    for discovery in evidence.discovery:
+        if discovery.manifest_artifact is not None:
+            refs.append(discovery.manifest_artifact)
+        if discovery.discovery is not None:
+            refs.extend(discovery.discovery.event_artifacts)
     refs.extend(
         sanitizer.log for sanitizer in evidence.sanitizer if sanitizer.log is not None
     )

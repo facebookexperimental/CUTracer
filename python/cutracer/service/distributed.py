@@ -9,24 +9,34 @@ from typing import Callable, Protocol
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
+    DEFAULT_MAX_DISCOVERED_KERNELS,
     ExperimentEnvelope,
     ExperimentResult,
     ExperimentSpec,
     ReportPublicationStatus,
+    SanitizerSweepResult,
     SessionBudget,
     SessionReport,
     SessionStatus,
     WorkUnit,
 )
+from cutracer.service.kernel_discovery import (
+    discovery_child_session_id,
+    pin_discovered_work_units,
+)
 from cutracer.service.policy import ExperimentGuardPolicy, InitialCampaignPolicy
+from cutracer.service.sanitizer_results import is_target_scoped_sanitizer
 from cutracer.service.session import (
     build_session_report,
+    create_discovery_session,
     create_session,
     EffectKind,
     ExperimentResultValidationError,
     record_analysis_decision,
+    record_discovery_children_started,
     record_experiment_result,
     record_infrastructure_failure,
+    record_report_publication_failed,
     record_report_published,
     record_triage_decision,
     SessionEffect,
@@ -52,6 +62,12 @@ class ReasoningCallbackResult:
 
 @dataclasses.dataclass(frozen=True)
 class InfrastructureFailureResult:
+    session: AnalysisSession
+    accepted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class ReportPublicationFailureResult:
     session: AnalysisSession
     accepted: bool
 
@@ -110,6 +126,14 @@ class DistributedCoordinator:
         )
         if pending_triage and len(transition.effects) != 1:
             raise ValueError("RUN_TRIAGE must be the only effect in a transition")
+        pending_children = any(
+            effect.kind == EffectKind.CREATE_CHILD_SESSIONS
+            for effect in transition.effects
+        )
+        if pending_children and len(transition.effects) != 1:
+            raise ValueError(
+                "CREATE_CHILD_SESSIONS must be the only effect in a transition"
+            )
         for effect in transition.effects:
             if effect.kind == EffectKind.SUBMIT_EXPERIMENTS:
                 self._mast.submit(
@@ -121,6 +145,8 @@ class DistributedCoordinator:
                 # Pure computation with no remote effect: resolved after the
                 # loop and committed through its own CAS round.
                 continue
+            elif effect.kind == EffectKind.CREATE_CHILD_SESSIONS:
+                session = self._create_discovery_children(session)
             elif effect.kind == EffectKind.RUN_REASONER:
                 self._sandcastle.submit_reasoning_turn(
                     session.session_id, session.state_revision
@@ -136,6 +162,54 @@ class DistributedCoordinator:
                 self._record_triage_if_pending,
             )
         return session
+
+    def _create_discovery_children(
+        self,
+        parent: AnalysisSession,
+    ) -> AnalysisSession:
+        if len(parent.evidence.discovery) != 1:
+            raise ValueError("discovery parent must contain exactly one result")
+        manifest = parent.evidence.discovery[0].discovery
+        if manifest is None:
+            raise ValueError("discovery parent has no successful manifest")
+        stress_options = parent.child_stress_options
+        if stress_options is None:
+            raise ValueError("discovery parent has no child stress policy")
+        policy = InitialCampaignPolicy(
+            sanitizer_tools=tuple(parent.child_sanitizer_tools),
+            stress_options=stress_options,
+            enable_stress=parent.child_enable_stress,
+        )
+        shared_sanitizer_results = tuple(
+            result
+            for result in parent.evidence.sanitizer
+            if is_target_scoped_sanitizer(result.tool)
+        )
+        child_ids = []
+        failures: list[str] = []
+        for unit in pin_discovered_work_units(parent.unit, manifest.kernels):
+            child_id = discovery_child_session_id(parent.session_id, unit)
+            try:
+                self.start(
+                    child_id,
+                    unit,
+                    budget=parent.budget,
+                    campaign_policy=policy,
+                    shared_sanitizer_results=shared_sanitizer_results,
+                )
+            except Exception as exc:
+                failures.append(f"{child_id}: {exc}")
+                continue
+            child_ids.append(child_id)
+        if failures:
+            raise RuntimeError(
+                "discovery fanout failed for "
+                f"{len(failures)} child sessions: " + "; ".join(failures)
+            )
+        return self._apply(
+            parent.session_id,
+            lambda current: record_discovery_children_started(current, child_ids),
+        )
 
     def _record_triage_if_pending(self, current: AnalysisSession) -> Transition:
         if current.status != SessionStatus.WAITING_TRIAGE:
@@ -176,12 +250,25 @@ class DistributedCoordinator:
         *,
         budget: SessionBudget | None = None,
         campaign_policy: InitialCampaignPolicy | None = None,
+        max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS,
+        shared_sanitizer_results: tuple[SanitizerSweepResult, ...] = (),
     ) -> AnalysisSession:
-        transition = create_session(
-            session_id,
-            unit,
-            budget=budget,
-            campaign_policy=campaign_policy,
+        transition = (
+            create_discovery_session(
+                session_id,
+                unit,
+                budget=budget,
+                campaign_policy=campaign_policy,
+                max_kernels=max_kernels,
+            )
+            if unit.kernel is None
+            else create_session(
+                session_id,
+                unit,
+                budget=budget,
+                campaign_policy=campaign_policy,
+                shared_sanitizer_results=shared_sanitizer_results,
+            )
         )
         transition.session.state_revision = 1
         try:
@@ -204,9 +291,15 @@ class DistributedCoordinator:
             effect = SessionEffect(EffectKind.RUN_TRIAGE)
         elif session.status == SessionStatus.WAITING_REASONER:
             effect = SessionEffect(EffectKind.RUN_REASONER)
+        elif session.status == SessionStatus.WAITING_CHILDREN:
+            effect = SessionEffect(EffectKind.CREATE_CHILD_SESSIONS)
         elif session.report_publication == ReportPublicationStatus.PENDING:
             effect = SessionEffect(EffectKind.PUBLISH_REPORT)
-        elif session.status in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
+        elif session.status in (
+            SessionStatus.COMPLETED,
+            SessionStatus.INCONCLUSIVE,
+            SessionStatus.FAILED,
+        ):
             return session
         else:
             raise ValueError(f"cannot resume session in state: {session.status}")
@@ -293,3 +386,24 @@ class DistributedCoordinator:
 
         session = self._apply(session_id, apply_failure)
         return InfrastructureFailureResult(session=session, accepted=accepted)
+
+    def on_report_publication_failure(
+        self,
+        session_id: str,
+        state_revision: int,
+        reason: str,
+    ) -> ReportPublicationFailureResult:
+        accepted = False
+
+        def apply_failure(session: AnalysisSession) -> Transition:
+            nonlocal accepted
+            accepted = (
+                session.state_revision == state_revision
+                and session.report_publication == ReportPublicationStatus.PENDING
+            )
+            if not accepted:
+                return Transition(session, ())
+            return record_report_publication_failed(session, reason)
+
+        session = self._apply(session_id, apply_failure)
+        return ReportPublicationFailureResult(session=session, accepted=accepted)

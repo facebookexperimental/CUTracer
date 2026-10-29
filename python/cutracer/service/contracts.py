@@ -528,6 +528,7 @@ class ReportPublicationStatus(str, Enum):
     NOT_READY = "not_ready"
     PENDING = "pending"
     PUBLISHED = "published"
+    FAILED = "failed"
 
 
 _MAX_RANDOM_DELAY_NS = (1 << 32) - 2
@@ -2741,7 +2742,7 @@ class ExperimentRecord:
         )
 
 
-ANALYSIS_SESSION_SCHEMA_VERSION = 5
+ANALYSIS_SESSION_SCHEMA_VERSION = 7
 _MIN_ANALYSIS_SESSION_SCHEMA_VERSION = 3
 
 
@@ -2770,6 +2771,7 @@ class AnalysisSession:
     child_session_ids: List[str] = dataclasses.field(default_factory=list)
     termination_reason: str = ""
     report_publication: ReportPublicationStatus = ReportPublicationStatus.NOT_READY
+    report_publication_error: str = ""
     state_revision: int = 0
     schema_version: int = ANALYSIS_SESSION_SCHEMA_VERSION
 
@@ -2816,6 +2818,7 @@ class AnalysisSession:
             "child_session_ids": list(self.child_session_ids),
             "termination_reason": self.termination_reason,
             "report_publication": self.report_publication.value,
+            "report_publication_error": self.report_publication_error,
             "state_revision": self.state_revision,
         }
 
@@ -2873,6 +2876,7 @@ class AnalysisSession:
             child_session_ids=list(d.get("child_session_ids", [])),
             termination_reason=d.get("termination_reason", ""),
             report_publication=ReportPublicationStatus(publication),
+            report_publication_error=d.get("report_publication_error", ""),
             state_revision=int(d.get("state_revision", 0)),
             schema_version=max(version, ANALYSIS_SESSION_SCHEMA_VERSION),
         )

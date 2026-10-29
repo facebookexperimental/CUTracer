@@ -210,13 +210,24 @@ class InitialCampaignPolicy:
 
     sanitizer_tools: tuple[str, ...] = ("racecheck",)
     stress_options: StressOptions = dataclasses.field(default_factory=StressOptions)
+    enable_stress: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enable_stress, bool):
+            raise ValueError("enable_stress must be boolean")
+        if not isinstance(self.sanitizer_tools, tuple) or any(
+            not isinstance(tool, str) for tool in self.sanitizer_tools
+        ):
+            raise ValueError("sanitizer_tools must be a tuple of strings")
         unknown = sorted(set(self.sanitizer_tools) - set(DEFAULT_LOCAL_SANITIZER_TOOLS))
         if unknown:
             raise ValueError(f"unsupported sanitizer tools: {', '.join(unknown)}")
         if len(self.sanitizer_tools) != len(set(self.sanitizer_tools)):
             raise ValueError("sanitizer tools must not contain duplicates")
+        if not self.sanitizer_tools and not self.enable_stress:
+            raise ValueError(
+                "initial campaign must enable at least one evidence source"
+            )
 
     def plan(self, session_id: str, unit: WorkUnit) -> CampaignPlan:
         specs: List[ExperimentSpec] = []
@@ -244,7 +255,7 @@ class InitialCampaignPolicy:
             0,
             ExperimentKind.RANDOM_DELAY_STRESS,
         )
-        if unit.oracle is not None:
+        if self.enable_stress and unit.oracle is not None:
             specs.append(
                 ExperimentSpec(
                     experiment_id=stress_id,
@@ -256,7 +267,7 @@ class InitialCampaignPolicy:
                 )
             )
             skipped = ()
-        else:
+        elif self.enable_stress:
             skipped = (
                 StressTestResult(
                     experiment_id=stress_id,
@@ -275,6 +286,8 @@ class InitialCampaignPolicy:
                     completeness=ResultCompleteness.SKIPPED,
                 ),
             )
+        else:
+            skipped = ()
         return CampaignPlan(experiments=tuple(specs), skipped_results=skipped)
 
 
