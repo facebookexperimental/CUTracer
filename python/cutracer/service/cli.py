@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
+import hashlib
 import importlib
+import json
 import os
 import tempfile
 import uuid
@@ -13,11 +16,17 @@ import click
 from cutracer.runner import resolve_cutracer_so
 from cutracer.service.artifacts import local_artifact, runtime_identity_is_missing
 from cutracer.service.baseline import FileBaselineStore
-from cutracer.service.contracts import SessionReport, WorkUnit
+from cutracer.service.contracts import (
+    DEFAULT_MAX_DISCOVERED_KERNELS,
+    DiagnosisReport,
+    SessionReport,
+    WorkUnit,
+)
+from cutracer.service.kernel_discovery import discover_work_units, KernelDiscoveryError
+from cutracer.service.local_workflow import PartialDiagnosisError, run_local_diagnosis
 from cutracer.service.policy import DEFAULT_LOCAL_SANITIZER_TOOLS, InitialCampaignPolicy
 from cutracer.service.runner import (
     FileReportSink,
-    FileSessionStore,
     LocalExperimentExecutor,
     LocalRuntimeConfig,
     run_local_session,
@@ -34,6 +43,24 @@ class _JsonOutput(Protocol):
 
 
 DistributedFn = Callable[..., _JsonOutput]
+_COMMAND_MODE_KEY = "cutracer_diagnose_command_mode"
+
+
+@dataclasses.dataclass(frozen=True)
+class _LocalDiagnosisContext:
+    runtime: LocalRuntimeConfig
+    campaign_policy: InitialCampaignPolicy
+    triage_policy: TriagePolicy
+
+
+class _DiagnoseCommand(click.Command):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        try:
+            separator = args.index("--")
+        except ValueError:
+            separator = len(args)
+        ctx.meta[_COMMAND_MODE_KEY] = separator < len(args) - 1
+        return super().parse_args(ctx, args)
 
 
 def _default_baseline_dir() -> str:
@@ -82,12 +109,13 @@ def _distributed_fn(name: str) -> DistributedFn:
 
 
 def _run_distributed_start(
-    target: str,
+    target: WorkUnit,
     *,
     config_path: str,
     session_id: str,
     toolchain_version: str,
     sanitizer_tools: tuple[str, ...],
+    max_kernels: int,
 ) -> _JsonOutput:
     return _distributed_fn("start_distributed_session")(
         target,
@@ -95,6 +123,7 @@ def _run_distributed_start(
         session_id=session_id,
         toolchain_version=toolchain_version,
         sanitizer_tools=sanitizer_tools,
+        max_kernels=max_kernels,
     )
 
 
@@ -179,12 +208,13 @@ def _local_only_options(
 
 
 def _start_distributed_from_cli(
-    target: str,
+    target: WorkUnit,
     *,
     config_path: Optional[str],
     session_id: Optional[str],
     toolchain_version: str,
     sanitizer_tools: tuple[str, ...],
+    max_kernels: int,
     out: Optional[str],
     local_options: dict[str, Optional[str]],
 ) -> None:
@@ -208,12 +238,55 @@ def _start_distributed_from_cli(
         session_id=resolved_session_id,
         toolchain_version=toolchain_version,
         sanitizer_tools=sanitizer_tools,
+        max_kernels=max_kernels,
     )
     _emit_json(session, out)
 
 
+def _write_diagnosis_report(
+    report: SessionReport | DiagnosisReport,
+    out: str,
+) -> None:
+    if isinstance(report, SessionReport):
+        FileReportSink(out).publish(report)
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with click.open_file(out, "w", atomic=True) as output:
+        output.write(report.to_json(indent=2))
+        output.write("\n")
+
+
+def _local_diagnosis_context(
+    *,
+    artifact_dir: str,
+    compute_sanitizer: str | None,
+    cutracer_so: str | None,
+    toolchain_identity: str,
+    sanitizer_tools: tuple[str, ...],
+    baseline_dir: str | None,
+    suppression_policy_path: str | None,
+) -> _LocalDiagnosisContext:
+    resolved_cutracer_so = resolve_cutracer_so(cutracer_so)
+    runtime = LocalRuntimeConfig(
+        out_dir=artifact_dir,
+        cutracer_so=resolved_cutracer_so,
+        compute_sanitizer=compute_sanitizer,
+        cutracer_version=_cutracer_runtime_identity(resolved_cutracer_so),
+        toolchain_version=toolchain_identity,
+    )
+    return _LocalDiagnosisContext(
+        runtime=runtime,
+        campaign_policy=InitialCampaignPolicy(sanitizer_tools=sanitizer_tools),
+        triage_policy=TriagePolicy(
+            baselines=FileBaselineStore(baseline_dir or _default_baseline_dir()),
+            suppression=_load_cli_suppression_policy(suppression_policy_path),
+            today=datetime.date.today().isoformat(),
+        ),
+    )
+
+
 def run_diagnosis(
-    target: str,
+    target: str | WorkUnit,
     *,
     out: Optional[str],
     state: Optional[str],
@@ -225,7 +298,8 @@ def run_diagnosis(
     sanitizer_tools: tuple[str, ...] = DEFAULT_LOCAL_SANITIZER_TOOLS,
     baseline_dir: Optional[str] = None,
     suppression_policy_path: Optional[str] = None,
-) -> SessionReport:
+    max_kernels: int = DEFAULT_MAX_DISCOVERED_KERNELS,
+) -> SessionReport | DiagnosisReport:
     """Load a work unit and drive the shared session loop on this host."""
     toolchain_identity = toolchain_version.strip()
     if runtime_identity_is_missing(toolchain_identity):
@@ -233,46 +307,45 @@ def run_diagnosis(
             "--toolchain-version must identify the immutable target toolchain"
         )
 
-    with open(target) as fh:
-        unit = WorkUnit.from_json(fh)
+    unit = target if isinstance(target, WorkUnit) else _load_work_unit(target)
 
     artifact_dir = out_dir
     if artifact_dir is None:
         artifact_dir = tempfile.mkdtemp(prefix="cutracer_diagnose_")
         click.echo(f"cutracer diagnose: writing artifacts to {artifact_dir}", err=True)
 
-    resolved_cutracer_so = resolve_cutracer_so(cutracer_so)
-
-    executor = LocalExperimentExecutor(
-        LocalRuntimeConfig(
-            out_dir=artifact_dir,
-            cutracer_so=resolved_cutracer_so,
-            compute_sanitizer=compute_sanitizer,
-            cutracer_version=_cutracer_runtime_identity(resolved_cutracer_so),
-            toolchain_version=toolchain_identity,
+    context = _local_diagnosis_context(
+        artifact_dir=artifact_dir,
+        compute_sanitizer=compute_sanitizer,
+        cutracer_so=cutracer_so,
+        toolchain_identity=toolchain_identity,
+        sanitizer_tools=sanitizer_tools,
+        baseline_dir=baseline_dir,
+        suppression_policy_path=suppression_policy_path,
+    )
+    try:
+        report = run_local_diagnosis(
+            unit,
+            runtime=context.runtime,
+            state=state,
+            campaign_policy=context.campaign_policy,
+            triage_policy=context.triage_policy,
+            run_local_fn=run_local_fn,
+            max_kernels=max_kernels,
+            executor_factory=LocalExperimentExecutor,
+            discovery_fn=discover_work_units,
         )
-    )
-    store = None if state is None else FileSessionStore(state)
-    triage_policy = TriagePolicy(
-        baselines=FileBaselineStore(baseline_dir or _default_baseline_dir()),
-        suppression=_load_cli_suppression_policy(suppression_policy_path),
-        today=datetime.date.today().isoformat(),
-    )
-    report = run_local_fn(
-        unit,
-        executor=executor,
-        campaign_policy=InitialCampaignPolicy(sanitizer_tools=sanitizer_tools),
-        triage_policy=triage_policy,
-        sink=None,
-        store=store,
-    )
+    except PartialDiagnosisError as error:
+        if out is not None:
+            _write_diagnosis_report(error.report, out)
+        raise
     if out is not None:
-        FileReportSink(out).publish(report)
+        _write_diagnosis_report(report, out)
     return report
 
 
 def _run_local_from_cli(
-    target: str,
+    target: WorkUnit,
     *,
     out: Optional[str],
     state: Optional[str],
@@ -283,26 +356,110 @@ def _run_local_from_cli(
     sanitizer_tools: tuple[str, ...],
     cutracer_so: Optional[str],
     toolchain_version: str,
+    max_kernels: int,
 ) -> None:
-    report = run_diagnosis(
-        target,
-        out=out,
-        state=state,
-        out_dir=out_dir,
-        compute_sanitizer=compute_sanitizer,
-        cutracer_so=cutracer_so,
-        toolchain_version=toolchain_version,
-        run_local_fn=run_local_session,
-        sanitizer_tools=sanitizer_tools,
-        baseline_dir=baseline_dir,
-        suppression_policy_path=suppression_policy,
-    )
+    try:
+        report = run_diagnosis(
+            target,
+            out=out,
+            state=state,
+            out_dir=out_dir,
+            compute_sanitizer=compute_sanitizer,
+            cutracer_so=cutracer_so,
+            toolchain_version=toolchain_version,
+            run_local_fn=run_local_session,
+            sanitizer_tools=sanitizer_tools,
+            baseline_dir=baseline_dir,
+            suppression_policy_path=suppression_policy,
+            max_kernels=max_kernels,
+        )
+    except KernelDiscoveryError as error:
+        raise click.ClickException(f"kernel discovery failed: {error}") from error
+    except PartialDiagnosisError as error:
+        if out is None:
+            click.echo(error.report.to_json(indent=2))
+        raise click.ClickException(str(error)) from error
     if out is None:
         click.echo(report.to_json(indent=2))
 
 
-@click.command(name="diagnose")
-@click.argument("target", type=click.Path(exists=True, dir_okay=False))
+def _load_work_unit(path: str) -> WorkUnit:
+    try:
+        with open(path, encoding="utf-8") as source:
+            return WorkUnit.from_json(source)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise click.ClickException(
+            f"could not load target {path!r}: {error}"
+        ) from error
+
+
+def _command_work_unit(
+    argv: tuple[str, ...],
+    *,
+    unit_id: Optional[str],
+    arch: Optional[str],
+    source_revision: Optional[str],
+    cwd: Optional[str],
+) -> WorkUnit:
+    if not argv or not argv[0].strip():
+        raise click.UsageError("`-- <cmd>` requires a nonempty command")
+    if arch is None or not arch.strip():
+        raise click.UsageError("`-- <cmd>` requires --arch")
+    revision = "" if source_revision is None else source_revision.strip()
+    if runtime_identity_is_missing(revision):
+        raise click.UsageError("`-- <cmd>` requires an immutable --source-revision")
+    identity = json.dumps(
+        {"arch": arch.strip(), "argv": argv, "cwd": cwd or "", "revision": revision},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    resolved_id = (
+        f"command-{hashlib.sha256(identity).hexdigest()[:16]}"
+        if unit_id is None
+        else unit_id.strip()
+    )
+    if not resolved_id:
+        raise click.UsageError("--unit-id must not be empty")
+    return WorkUnit(
+        unit_id=resolved_id,
+        argv=list(argv),
+        workload="command",
+        test_id=resolved_id,
+        cwd=cwd or "",
+        arch=arch.strip(),
+        source_revision=revision,
+    )
+
+
+def _resolve_work_unit(
+    inputs: tuple[str, ...],
+    *,
+    command_mode: bool,
+    unit_id: Optional[str],
+    arch: Optional[str],
+    source_revision: Optional[str],
+    cwd: Optional[str],
+) -> WorkUnit:
+    if command_mode:
+        return _command_work_unit(
+            inputs,
+            unit_id=unit_id,
+            arch=arch,
+            source_revision=source_revision,
+            cwd=cwd,
+        )
+    if len(inputs) != 1:
+        raise click.UsageError("provide one target JSON or use `-- <cmd>`")
+    command_options = (unit_id, arch, source_revision, cwd)
+    if any(value is not None for value in command_options):
+        raise click.UsageError(
+            "--unit-id, --arch, --source-revision, and --cwd require `-- <cmd>`"
+        )
+    return _load_work_unit(inputs[0])
+
+
+@click.command(name="diagnose", cls=_DiagnoseCommand)
+@click.argument("inputs", nargs=-1, type=click.UNPROCESSED)
 @click.option(
     "--local",
     is_flag=True,
@@ -363,8 +520,25 @@ def _run_local_from_cli(
     required=True,
     help="Immutable identity of the target CUDA/Triton toolchain.",
 )
+@click.option("--unit-id", default=None, help="Stable id for a `-- <cmd>` target.")
+@click.option(
+    "--max-kernels",
+    type=click.IntRange(min=1),
+    default=DEFAULT_MAX_DISCOVERED_KERNELS,
+    show_default=True,
+    help="Maximum discovered kernels to fan out into pinned sessions.",
+)
+@click.option("--arch", default=None, help="GPU architecture for a `-- <cmd>` target.")
+@click.option(
+    "--source-revision",
+    default=None,
+    help="Immutable source revision for a `-- <cmd>` target.",
+)
+@click.option("--cwd", default=None, help="Working directory for a `-- <cmd>` target.")
+@click.pass_context
 def diagnose_command(
-    target: str,
+    ctx: click.Context,
+    inputs: tuple[str, ...],
     local: bool,
     distributed: bool,
     distributed_config: Optional[str],
@@ -378,8 +552,21 @@ def diagnose_command(
     sanitizer_tools: tuple[str, ...],
     cutracer_so: Optional[str],
     toolchain_version: str,
+    unit_id: Optional[str],
+    max_kernels: int,
+    arch: Optional[str],
+    source_revision: Optional[str],
+    cwd: Optional[str],
 ) -> None:
     """Run a bounded sanitizer, stress, trace, and reasoning session."""
+    target = _resolve_work_unit(
+        inputs,
+        command_mode=bool(ctx.meta.get(_COMMAND_MODE_KEY)),
+        unit_id=unit_id,
+        arch=arch,
+        source_revision=source_revision,
+        cwd=cwd,
+    )
     if local and distributed:
         raise click.UsageError("--local and --distributed are mutually exclusive")
     if distributed:
@@ -391,6 +578,7 @@ def diagnose_command(
             session_id=session_id,
             toolchain_version=toolchain_version,
             sanitizer_tools=sanitizer_tools,
+            max_kernels=max_kernels,
             out=out,
             local_options=_local_only_options(
                 state,
@@ -415,6 +603,7 @@ def diagnose_command(
         compute_sanitizer=compute_sanitizer,
         cutracer_so=cutracer_so,
         toolchain_version=toolchain_version,
+        max_kernels=max_kernels,
         sanitizer_tools=sanitizer_tools,
         baseline_dir=baseline_dir,
         suppression_policy=suppression_policy,

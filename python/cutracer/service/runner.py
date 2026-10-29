@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import uuid
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, Sequence
 
 from cutracer.service.contracts import (
     AnalysisDecision,
@@ -13,6 +13,7 @@ from cutracer.service.contracts import (
     ExperimentKind,
     ExperimentResult,
     ExperimentSpec,
+    SanitizerSweepResult,
     SessionBudget,
     SessionReport,
     WorkUnit,
@@ -217,6 +218,7 @@ def run_local_session(
     session_id: Optional[str] = None,
     budget: Optional[SessionBudget] = None,
     campaign_policy: Optional[InitialCampaignPolicy] = None,
+    shared_sanitizer_results: Sequence[SanitizerSweepResult] = (),
     guard_policy: Optional[ExperimentGuardPolicy] = None,
     triage_policy: Optional[TriagePolicy] = None,
     store: Optional[SessionStore] = None,
@@ -230,6 +232,7 @@ def run_local_session(
         unit,
         budget=budget,
         campaign_policy=active_campaign,
+        shared_sanitizer_results=shared_sanitizer_results,
     )
     current = transition.session
     effects = list(transition.effects)
