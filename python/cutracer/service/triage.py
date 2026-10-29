@@ -14,13 +14,16 @@ from cutracer.service.contracts import (
     AnalysisSession,
     BaselineVerdict,
     EvidenceBundle,
+    EvidenceSufficiency,
     ExecutionStatus,
     FindingRecord,
     parse_ymd_date,
+    ReportPublicationStatus,
     ResultCompleteness,
     SanitizerSweepResult,
     ScopeId,
     ScopeTriageSnapshot,
+    SessionStatus,
     SuppressionAuditEntry,
     TriageDecision,
     TriageOutcome,
@@ -233,7 +236,6 @@ class TriagePolicy:
             scope_completeness = completeness.get(tool, ResultCompleteness.UNKNOWN)
             scope = ScopeId(test_family=family, tool=tool)
             keys = by_scope.get(tool, [])
-            baseline_recorded = False
             if self._baselines is None:
                 verdict = BaselineVerdict.NOT_EVALUATED
                 observed = tuple(sorted(set(keys)))
@@ -249,22 +251,6 @@ class TriagePolicy:
                 new = diff.new_keys
                 resolved = diff.resolved_keys
                 unchanged = diff.unchanged_keys
-            if (
-                record_baselines
-                and self._baselines is not None
-                and self._record_baselines
-                and self._today is not None
-            ):
-                recorded = baseline_from_scope(
-                    scope,
-                    keys,
-                    is_complete=scope_completeness == ResultCompleteness.COMPLETE,
-                    source_revision=session.unit.source_revision,
-                    recorded_on=self._today,
-                )
-                if recorded is not None:
-                    self._baselines.record(recorded)
-                    baseline_recorded = True
             scopes.append(
                 ScopeTriageSnapshot(
                     scope=scope,
@@ -274,7 +260,6 @@ class TriagePolicy:
                     new_keys=new,
                     resolved_keys=resolved,
                     unchanged_keys=unchanged,
-                    baseline_recorded=baseline_recorded,
                 )
             )
 
@@ -296,6 +281,38 @@ class TriagePolicy:
             ),
         )
 
+    def record_published_baselines(self, session: AnalysisSession) -> None:
+        """Advance deduplication only after a sufficient report was delivered.
+
+        The drivers call this outside their state reducer, after publication
+        and before acknowledging it in the session checkpoint. A retry can
+        repeat these writes, but can never consume an unreported finding.
+        The triage snapshot remains the evidence observed before publication.
+        """
+        if (
+            self._baselines is None
+            or not self._record_baselines
+            or self._today is None
+            or session.status != SessionStatus.COMPLETED
+            or session.report_publication != ReportPublicationStatus.PUBLISHED
+            or session.report is None
+            or session.report.evidence_sufficiency != EvidenceSufficiency.SUFFICIENT
+            or session.triage is None
+            or session.triage.outcome == TriageOutcome.INCONCLUSIVE
+            or session.triage.snapshot is None
+        ):
+            return
+        for scope in session.triage.snapshot.scopes:
+            recorded = baseline_from_scope(
+                scope.scope,
+                (*scope.observed_keys, *scope.new_keys, *scope.unchanged_keys),
+                is_complete=scope.completeness == ResultCompleteness.COMPLETE,
+                source_revision=session.unit.source_revision,
+                recorded_on=self._today,
+            )
+            if recorded is not None:
+                self._baselines.record(recorded)
+
     def decide(self, session: AnalysisSession) -> TriageDecision:
         triage = correlate_evidence(
             session.unit.unit_id,
@@ -313,6 +330,22 @@ class TriagePolicy:
         snapshot = self._triage_snapshot(session, triage)
 
         if not triage.should_analyze:
+            unproven = [
+                scope.scope.key
+                for scope in snapshot.scopes
+                if scope.completeness != ResultCompleteness.COMPLETE
+            ]
+            if any(
+                not result.has_trustworthy_non_reproduction
+                for result in session.evidence.stress
+            ):
+                unproven.append("random-delay stress")
+            if unproven:
+                return TriageDecision(
+                    outcome=TriageOutcome.INCONCLUSIVE,
+                    reason=f"scope coverage unproven: {', '.join(sorted(set(unproven)))}",
+                    snapshot=snapshot,
+                )
             suppressed = len(triage.suppressed.suppressed)
             reason = (
                 f"no actionable findings; {suppressed} suppressed"

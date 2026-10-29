@@ -288,6 +288,7 @@ def _run_effect(
                 current = record_report_publication_failed(current, str(error)).session
             else:
                 current = record_report_published(current).session
+                triage_policy.record_published_baselines(current)
         else:
             # With no sink, run_local_session returns the report to its caller:
             # that return is the delivery, so acknowledge it instead of leaving

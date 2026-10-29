@@ -185,6 +185,8 @@ class DistributedCoordinator:
                 )
             elif effect.kind == EffectKind.PUBLISH_REPORT:
                 artifact = self._reports.publish(build_session_report(session))
+                published = record_report_published(session, artifact=artifact).session
+                self._triage.record_published_baselines(published)
                 session = self._apply(
                     session.session_id,
                     partial(record_report_published, artifact=artifact),
