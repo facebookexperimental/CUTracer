@@ -291,7 +291,7 @@ def apply_campaign_budget(
     decisions: list[AdmissionDecision] = []
     admitted_runs = 0
     admitted_gpu_seconds = 0
-    for target in sorted(targets, key=lambda item: item.unit.unit_id):
+    for target in targets:
         constraints = _budget_constraints(
             target,
             budget,
