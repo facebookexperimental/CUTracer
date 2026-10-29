@@ -25,6 +25,7 @@ from cutracer.service.session import (
     ExperimentResultValidationError,
     record_analysis_decision,
     record_experiment_result,
+    record_infrastructure_failure,
     record_triage_decision,
     SessionEffect,
     Transition,
@@ -32,7 +33,7 @@ from cutracer.service.session import (
 from cutracer.service.storage import DurableSessionStore, StoreConflict
 from cutracer.service.triage import TriagePolicy
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,6 +44,12 @@ class ExperimentCallbackResult:
 
 @dataclasses.dataclass(frozen=True)
 class ReasoningCallbackResult:
+    session: AnalysisSession
+    accepted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class InfrastructureFailureResult:
     session: AnalysisSession
     accepted: bool
 
@@ -255,3 +262,29 @@ class DistributedCoordinator:
             apply_decision,
         )
         return ReasoningCallbackResult(session=session, accepted=accepted)
+
+    def on_infrastructure_failure(
+        self,
+        session_id: str,
+        state_revision: int,
+        reason: str,
+    ) -> InfrastructureFailureResult:
+        accepted = False
+
+        def apply_failure(session: AnalysisSession) -> Transition:
+            nonlocal accepted
+            accepted = (
+                session.state_revision == state_revision
+                and session.status
+                not in (
+                    SessionStatus.COMPLETED,
+                    SessionStatus.INCONCLUSIVE,
+                    SessionStatus.FAILED,
+                )
+            )
+            if not accepted:
+                return Transition(session, ())
+            return record_infrastructure_failure(session, reason)
+
+        session = self._apply(session_id, apply_failure)
+        return InfrastructureFailureResult(session=session, accepted=accepted)

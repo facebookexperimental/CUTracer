@@ -89,8 +89,36 @@ class ExperimentResultValidationError(ValueError):
         super().__init__(f"{code}: {message}")
 
 
+_MAX_TERMINATION_REASON_LENGTH = 2048
+_TERMINAL_STATUSES = frozenset(
+    (
+        SessionStatus.COMPLETED,
+        SessionStatus.INCONCLUSIVE,
+        SessionStatus.FAILED,
+    )
+)
+
+
 def _clone(session: AnalysisSession) -> AnalysisSession:
     return AnalysisSession.from_dict(session.to_dict())
+
+
+def record_infrastructure_failure(
+    session: AnalysisSession,
+    reason: str,
+) -> Transition:
+    """Terminate one active revision without fabricating a diagnosis report."""
+    normalized = reason.strip()
+    if not normalized:
+        raise ValueError("infrastructure failure requires a reason")
+    if session.status in _TERMINAL_STATUSES:
+        return Transition(session=session, effects=())
+    updated = _clone(session)
+    updated.status = SessionStatus.FAILED
+    updated.pending_experiments = []
+    updated.report = None
+    updated.termination_reason = normalized[:_MAX_TERMINATION_REASON_LENGTH]
+    return Transition(session=updated, effects=())
 
 
 def _artifact_refs(evidence: EvidenceBundle) -> List[str]:
