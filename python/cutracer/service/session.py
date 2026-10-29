@@ -13,6 +13,7 @@ from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
     AnalysisTurn,
+    ArtifactRef,
     Confidence,
     CrossValidation,
     DecisionKind,
@@ -103,6 +104,30 @@ _TERMINAL_STATUSES = frozenset(
         SessionStatus.FAILED,
     )
 )
+
+
+def resume_session(session: AnalysisSession) -> Transition:
+    """Derive outstanding effects without mutating accepted session progress."""
+    if session.status in (
+        SessionStatus.WAITING_INITIAL,
+        SessionStatus.WAITING_FOLLOWUP,
+    ):
+        effect = SessionEffect(
+            EffectKind.SUBMIT_EXPERIMENTS, tuple(session.pending_experiments)
+        )
+    elif session.status == SessionStatus.WAITING_TRIAGE:
+        effect = SessionEffect(EffectKind.RUN_TRIAGE)
+    elif session.status == SessionStatus.WAITING_REASONER:
+        effect = SessionEffect(EffectKind.RUN_REASONER)
+    elif session.status == SessionStatus.WAITING_CHILDREN:
+        effect = SessionEffect(EffectKind.CREATE_CHILD_SESSIONS)
+    elif session.report_publication == ReportPublicationStatus.PENDING:
+        effect = SessionEffect(EffectKind.PUBLISH_REPORT)
+    elif session.status in _TERMINAL_STATUSES:
+        return Transition(session, ())
+    else:
+        raise ValueError(f"cannot resume session in state: {session.status}")
+    return Transition(session, (effect,))
 
 
 def _clone(session: AnalysisSession) -> AnalysisSession:
@@ -1452,7 +1477,9 @@ def record_analysis_decision(
     )
 
 
-def record_report_published(session: AnalysisSession) -> Transition:
+def record_report_published(
+    session: AnalysisSession, artifact: ArtifactRef | None = None
+) -> Transition:
     """Acknowledge successful delivery without changing diagnosis semantics."""
     if session.status not in (SessionStatus.COMPLETED, SessionStatus.INCONCLUSIVE):
         raise ValueError(f"cannot publish report in state: {session.status}")
@@ -1467,6 +1494,7 @@ def record_report_published(session: AnalysisSession) -> Transition:
     updated = _clone(session)
     updated.report_publication = ReportPublicationStatus.PUBLISHED
     updated.report_publication_error = ""
+    updated.published_report = artifact
     return Transition(session=updated, effects=())
 
 

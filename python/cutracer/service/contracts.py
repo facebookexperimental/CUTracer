@@ -2819,6 +2819,8 @@ class AnalysisSession:
     report_publication_error: str = ""
     state_revision: int = 0
     schema_version: int = ANALYSIS_SESSION_SCHEMA_VERSION
+    admission_input_digest: Optional[str] = None
+    published_report: Optional[ArtifactRef] = None
 
     @property
     def pending_experiment_ids(self) -> List[str]:
@@ -2834,7 +2836,7 @@ class AnalysisSession:
         return active or self.report_publication == ReportPublicationStatus.PENDING
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "unit": self.unit.to_dict(),
@@ -2866,6 +2868,11 @@ class AnalysisSession:
             "report_publication_error": self.report_publication_error,
             "state_revision": self.state_revision,
         }
+        if self.admission_input_digest is not None:
+            payload["admission_input_digest"] = self.admission_input_digest
+        if self.published_report is not None:
+            payload["published_report"] = self.published_report.to_dict()
+        return payload
 
     def to_json(self, **kwargs: Any) -> str:
         return json.dumps(self.to_dict(), **kwargs)
@@ -2924,6 +2931,12 @@ class AnalysisSession:
             report_publication_error=d.get("report_publication_error", ""),
             state_revision=int(d.get("state_revision", 0)),
             schema_version=max(version, ANALYSIS_SESSION_SCHEMA_VERSION),
+            admission_input_digest=d.get("admission_input_digest"),
+            published_report=(
+                None
+                if d.get("published_report") is None
+                else ArtifactRef.from_dict(d["published_report"])
+            ),
         )
 
     @classmethod

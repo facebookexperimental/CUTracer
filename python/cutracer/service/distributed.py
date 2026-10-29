@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from functools import partial
 from typing import Callable, Protocol
 
 from cutracer.service.contracts import (
     AnalysisDecision,
     AnalysisSession,
+    ArtifactRef,
     DEFAULT_MAX_DISCOVERED_KERNELS,
     ExperimentEnvelope,
     ExperimentResult,
@@ -92,7 +94,7 @@ class SandcastleDispatcher(Protocol):
 class DistributedReportSink(Protocol):
     """Publish by session_id; implementations must be idempotent."""
 
-    def publish(self, report: SessionReport) -> None: ...
+    def publish(self, report: SessionReport) -> ArtifactRef | None: ...
 
 
 class DistributedCoordinator:
@@ -152,8 +154,11 @@ class DistributedCoordinator:
                     session.session_id, session.state_revision
                 )
             elif effect.kind == EffectKind.PUBLISH_REPORT:
-                self._reports.publish(build_session_report(session))
-                session = self._apply(session.session_id, record_report_published)
+                artifact = self._reports.publish(build_session_report(session))
+                session = self._apply(
+                    session.session_id,
+                    partial(record_report_published, artifact=artifact),
+                )
             else:
                 raise ValueError(f"unknown effect kind: {effect.kind}")
         if pending_triage:
