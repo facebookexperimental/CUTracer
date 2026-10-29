@@ -135,6 +135,7 @@ class PytestCatalogAdapter:
                     source_revision=entry.source_revision,
                     oracle=entry.oracle,
                     env=dict(entry.env),
+                    kernel_filters=list(entry.kernel_filters),
                 )
                 targets.append(
                     CatalogWorkUnit(
@@ -239,6 +240,7 @@ class TritonbenchCatalogAdapter:
                     source_revision=entry.source_revision,
                     oracle=entry.oracle,
                     env=dict(entry.env),
+                    kernel_filters=list(entry.kernel_filters),
                 )
                 targets.append(
                     CatalogWorkUnit(

@@ -189,8 +189,9 @@ def _build_reduce_config(
         base_env.update(spec.unit.env)
     else:
         base_env = dict(resolved_base_env)
+    # Reduction must replay the one checksum-pinned kernel from the triggering
+    # config; broad catalog filters are insufficient evidence for this stage.
     kernel = spec.unit.kernel
-    kernel_filter = kernel.name if kernel is not None and kernel.name else None
     return ReduceConfig(
         config_path=input_path,
         output_path=minimal_path,
@@ -199,7 +200,10 @@ def _build_reduce_config(
                 oracle.argv if resolved_oracle_argv is None else resolved_oracle_argv
             ),
             cutracer_so=cutracer_so,
-            kernel_filters=kernel_filter,
+            exact_kernel_name=(
+                None if kernel is None else kernel.mangled_name or kernel.name
+            ),
+            exact_kernel_checksum=None if kernel is None else kernel.cubin_hash,
             delay_warpgroup_id=reduction.triggering_config.warpgroup_id,
             output_dir=out_dir,
             timeout=timeout,

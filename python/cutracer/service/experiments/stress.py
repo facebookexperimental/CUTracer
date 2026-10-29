@@ -664,10 +664,9 @@ def _run_stress_attempt(
         spec.unit.oracle.argv if resolved_oracle_argv is None else resolved_oracle_argv
     )
     cwd = resolved_cwd if resolved_cwd is not None else (spec.unit.cwd or None)
+    kernel = spec.unit.kernel
     kernel_filter = (
-        spec.unit.kernel.name
-        if spec.unit.kernel is not None and spec.unit.kernel.name
-        else None
+        (",".join(spec.unit.kernel_filters) or None) if kernel is None else None
     )
 
     core_resume = _resume_core_result(
@@ -702,6 +701,10 @@ def _run_stress_attempt(
                     spec.unit.oracle.not_interesting_exit_codes
                 ),
                 kernel_filters=kernel_filter,
+                exact_kernel_name=(
+                    None if kernel is None else kernel.mangled_name or kernel.name
+                ),
+                exact_kernel_checksum=None if kernel is None else kernel.cubin_hash,
                 output_dir=attempt_dir,
                 timeout=timeout,
                 cwd=cwd,

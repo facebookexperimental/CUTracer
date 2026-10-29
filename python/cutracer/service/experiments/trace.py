@@ -695,11 +695,6 @@ def _run_trace_capture(
 ) -> subprocess.CompletedProcess[str]:
     assert spec.trace is not None
     selected_kernel = _selected_kernel(spec)
-    kernel_filter = (
-        selected_kernel.name
-        if selected_kernel is not None and selected_kernel.name
-        else None
-    )
     pc_offsets = _trace_pc_offsets(
         spec,
         resolved_config_path=resolved_config_path,
@@ -715,7 +710,19 @@ def _run_trace_capture(
         InstrumentationConfig(
             cutracer_so=cutracer_so,
             instrument=",".join(spec.trace.effective_instrument_modes),
-            kernel_filters=kernel_filter,
+            kernel_filters=(
+                None
+                if selected_kernel is not None
+                else ",".join(spec.unit.kernel_filters) or None
+            ),
+            exact_kernel_name=(
+                None
+                if selected_kernel is None
+                else selected_kernel.mangled_name or selected_kernel.name
+            ),
+            exact_kernel_checksum=(
+                None if selected_kernel is None else selected_kernel.cubin_hash
+            ),
             trace_instr_categories=categories or None,
             trace_launch_id=spec.trace.selector.launch_id,
             trace_warp_mask=_trace_warp_mask(spec),

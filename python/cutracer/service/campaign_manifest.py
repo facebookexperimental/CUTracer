@@ -114,6 +114,21 @@ class PlannedCampaignSession:
     sanitizer_tools: tuple[str, ...]
     enable_stress: bool
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_stress, bool):
+            raise ValueError("planned enable_stress must be boolean")
+        supported = {
+            tool.value
+            for tool in CampaignTool
+            if tool != CampaignTool.RANDOM_DELAY_STRESS
+        }
+        if len(self.sanitizer_tools) != len(set(self.sanitizer_tools)):
+            raise ValueError("planned sanitizer tools must be unique")
+        if set(self.sanitizer_tools) - supported:
+            raise ValueError("planned campaign contains unsupported sanitizer tools")
+        if not self.sanitizer_tools and not self.enable_stress:
+            raise ValueError("planned campaign session requires an evidence source")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "target": self.target.to_dict(),
@@ -138,6 +153,9 @@ class CampaignManifest:
             )
         if not self.catalog_revision.strip() or len(self.catalog_digest) != 64:
             raise ValueError("campaign manifest requires catalog identity")
+        unit_ids = [session.target.unit.unit_id for session in self.sessions]
+        if len(unit_ids) != len(set(unit_ids)):
+            raise ValueError("campaign manifest sessions must have unique unit ids")
 
     def to_dict(self) -> dict[str, object]:
         return {

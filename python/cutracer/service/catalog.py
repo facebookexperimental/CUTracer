@@ -117,9 +117,11 @@ class WorkloadCatalogEntry:
         ):
             raise ValueError("catalog entry cwd must be repository-relative")
         if len(set(self.kernel_filters)) != len(self.kernel_filters) or any(
-            not item.strip() for item in self.kernel_filters
+            not item.strip() or "," in item for item in self.kernel_filters
         ):
-            raise ValueError("catalog kernel filters must be nonempty and unique")
+            raise ValueError(
+                "catalog kernel filters must be nonempty, unique, and comma-free"
+            )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in (self.cadence_days, self.estimated_gpu_seconds)
