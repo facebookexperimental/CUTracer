@@ -288,6 +288,78 @@
     "trace_pc_filter_valid": {
       "type": "boolean",
       "description": "Whether CUTRACER_TRACE_PC_OFFSETS parsed successfully"
+    },
+    "runtime_identity": {
+      "type": "object",
+      "description": "Launch record of the runtime identity manifest (cutracer_runtime_<pid>_<nonce>.ndjson), present when runtime identity is enabled. process, context, module and function are the keys of earlier records in that manifest; launch is the SHA-256 of this object without launch.",
+      "required": [
+        "process",
+        "context",
+        "module",
+        "function",
+        "entry",
+        "cubin_sha256",
+        "launch_id",
+        "kernel_ordinal",
+        "launch",
+        "grid",
+        "block",
+        "cluster_dim",
+        "cluster_dim_source",
+        "stream_handle",
+        "launch_kind",
+        "graph_node_handle",
+        "graph_invocation",
+        "capture_selected",
+        "instrumentation_protocol"
+      ],
+      "properties": {
+        "process": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "context": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "module": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "function": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "entry": {"type": "string", "minLength": 1},
+        "cubin_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "launch_id": {"type": "integer", "minimum": 0},
+        "kernel_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Launch count of this CUBIN and entry in its context before this launch"
+        },
+        "launch": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "grid": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "block": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "cluster_dim": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "cluster_dim_source": {
+          "enum": ["launch_attribute", "required_function_attribute", "unknown"]
+        },
+        "stream_handle": {"type": "integer", "minimum": 0},
+        "launch_kind": {"enum": ["direct", "graph"]},
+        "graph_node_handle": {"type": "integer", "minimum": 0},
+        "graph_invocation": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Graph launch invocation that contains this node launch, or null for direct launches"
+        },
+        "capture_selected": {"type": "boolean"},
+        "instrumentation_protocol": {"enum": ["legacy/v1"]}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

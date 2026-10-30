@@ -147,6 +147,10 @@ struct KernelFuncMetadata {
   int nregs = 0;                // CU_FUNC_ATTRIBUTE_NUM_REGS
   int shmem_static_nbytes = 0;  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
   uint32_t sm_family = 0;       // nvbit_get_sm_family()
+  CUcontext owner_context = nullptr;
+  CUmodule owner_module = nullptr;
+  nlohmann::json runtime_identity;
+  bool runtime_identity_attempted = false;
 
   /// Serialize per-function static attributes to JSON.
   nlohmann::json to_json() const {
@@ -195,6 +199,11 @@ struct CTXstate {
   std::atomic<RecvThreadState> recv_thread_done{RecvThreadState::INIT};
   CaptureCompletionQueue capture_completions;
   std::atomic<bool> channel_failed{false};
+  std::unordered_set<CUfunction> instrumented_launch_roots;
+  // Handles of functions whose module this context unloaded.
+  std::unordered_set<CUfunction> retired_function_handles;
+  // Direct launches with a runtime identity launch record awaiting completion.
+  std::unordered_set<uint64_t> identified_launches;
 
   // Whether the context and the channel need a synchronization at termination.
   // Set to true when a kernel is actually launched (not during stream capture

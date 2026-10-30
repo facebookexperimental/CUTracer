@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -303,6 +305,31 @@ TEST_F(CaptureCompletionTest, GraphRequestPreservesLaunchFailureAfterSuccessfulD
   EXPECT_FALSE(ready[0].kernel_completed);
   EXPECT_TRUE(ready[0].channel_drained);
   EXPECT_EQ(ready[0].error, "cuda_graph_launch_or_flush_failed");
+}
+
+TEST(CaptureCompletionQueueTest, ReceiverWaitNeedsABoundaryAfterTheWaitBegins) {
+  CaptureCompletionQueue queue;
+  queue.request({7, true, true, ""});
+  ASSERT_EQ(queue.take_at_chunk_boundary().size(), 1);
+  queue.finished_chunk_boundary();
+  EXPECT_FALSE(queue.wait_for_receiver(std::chrono::milliseconds(1)));
+}
+
+TEST(CaptureCompletionQueueTest, ReceiverWaitReturnsAfterTheNextFinishedBoundary) {
+  CaptureCompletionQueue queue;
+  std::atomic<bool> returned{false};
+  bool reached = false;
+  std::thread waiter([&] {
+    reached = queue.wait_for_receiver(std::chrono::seconds(60));
+    returned = true;
+  });
+  while (!returned) {
+    queue.take_at_chunk_boundary();
+    queue.finished_chunk_boundary();
+    std::this_thread::yield();
+  }
+  waiter.join();
+  EXPECT_TRUE(reached);
 }
 
 }  // namespace

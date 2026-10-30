@@ -8,6 +8,7 @@
 - Filename: `kernel_<checksum>_iter<idx>_<mangled_name>.{log,ndjson,ndjson.zst,clp}`
 - Purpose: Detailed per-kernel trace output (register, memory, TMA, or opcode records) when relevant instrumentation modes are active.
 - The file extension depends on the trace format selected via `CUTRACER_TRACE_FORMAT` (see below).
+- With the [runtime identity manifest](#runtime-identity-manifest-) enabled, a launch that has a launch record is written to `capture_<launch>.{log,ndjson,ndjson.zst,clp}` instead, where `<launch>` is that record's key.
 
 ## Histogram CSV 📄
 
@@ -74,6 +75,9 @@ Kernel metadata records cluster geometry once per launch as `cluster_dim`,
 `required_function_attribute`, or `unknown`). Direct and CUDA Graph launches
 share this contract.
 
+When the runtime identity manifest is enabled, the kernel metadata header also
+carries `runtime_identity`: the same launch record that the manifest writes.
+
 ### NDJSON Example
 
 ```json
@@ -112,6 +116,48 @@ Mode-specific fields on `kernel_launch`:
 - `full` — embeds the entire callstack inline as `cpu_callstack` (array of
   strings) plus `cpu_callstack_source`.
 - `nostack` — no callstack fields are added.
+
+## Runtime Identity Manifest 🪪
+
+Enabled by `CUTRACER_RUNTIME_IDENTITY=1` (see [Configuration](Configuration.md#runtime-identity-manifest)).
+The manifest records what actually ran, from CUDA and NVBit callbacks, so a
+trace can be bound to the exact binary and launch that produced it.
+
+- Filename: `cutracer_runtime_<pid>_<nonce>.ndjson`, created exclusively
+  under `CUTRACER_OUTPUT_DIR` if set, otherwise the working directory
+- Format: NDJSON with sorted keys. Every line is
+  `{"schema": "cutracer.runtime/v1", "process": <key>, "sequence": <n>, "type": <type>, "data": {...}}`
+- Keys (`process`, `context`, `module`, `function`, `launch`) are SHA-256
+  digests of the identifying record, so equal handles reused by the driver
+  get distinct keys
+
+| `type` value | When emitted | Key fields in `data` |
+|--------------|--------------|----------------------|
+| `"process_start"` | Tool initialization | `pid`, `parent_pid`, `start_ticks`, `boot_id`, `nonce`, `tool_sha256` (SHA-256 of the loaded tool), unauthenticated `run_hint`, `worker_hint`, `rank_hint`, `world_size_hint` |
+| `"context_begin"` / `"context_end"` | CUDA context creation and teardown | `context`, `handle`; `incomplete_launches` at the end |
+| `"module_begin"` / `"module_end"` | Module load, or the first launch from a module loaded before the tool | `module`, `context`, `handle`, `load_observed`, `api` |
+| `"function"` | First launch of a function | `function`, `function_handle`, `entry`, `cubin_sha256` of the dumped CUBIN bytes, `instructions` (`pc`, `bytes`, `opcode_index`, `sass` per instruction), `module_load_observed`, `device_uuid`, `sm_family`, CUDA binary and driver versions |
+| `"launch"` | Every direct launch or graph node launch | `launch`, `launch_id`, `kernel_ordinal`, `grid`, `block`, `cluster_dim`, `cluster_dim_source`, `launch_kind`, `graph_invocation`, `capture_selected` |
+| `"driver_completion"` | The launch's CUDA completion was observed | `launch`, `launch_id`, `context`, `kernel_completed`, `channel_drained`, `trace_footer_required` |
+| `"launch_incomplete"` | A context ended before a launch completed | `launch`, `reason` |
+| `"gap"` | Identity could not be established | `reason` |
+| `"process_end"` | Tool termination | `pending_launches`, `live_contexts`, `has_gaps` |
+
+The manifest contains host and device identifiers (process IDs, boot ID and
+GPU UUID). Driver completion is recorded separately from trace completion: a
+trace is complete only when its own `capture_completion` footer says so.
+
+- A launch made with a CUDA runtime `CUkernel` is recorded under the
+  context's `CUfunction`, the handle NVBit reports for graph nodes.
+- A graph node takes its cluster geometry from graph construction. When one
+  function was captured with different cluster shapes, its graph launches
+  report `cluster_dim_source: "unknown"`.
+- After a module unload, the driver can hand the same `CUfunction` value to a
+  function of a later module. NVBit keeps per-handle state across that reuse,
+  so such a launch runs uninstrumented, gets no trace and no launch record,
+  and the manifest records a `gap`.
+- Every launched function is inspected once per module lifetime, selected or
+  not: its instructions are walked and its CUBIN is dumped.
 
 ## Delay Config JSON 🔀
 

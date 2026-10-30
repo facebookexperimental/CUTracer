@@ -159,6 +159,19 @@ When enabled, CUTracer writes a separate `kernel_events_*.ndjson` file. See
 |----------|------|---------|-------------|
 | `CUTRACER_CHANNEL_RECORDS` | int | `0` (use built-in default) | Number of records the GPU→CPU channel buffer should hold. The on-device buffer size is computed from this value. Increase for high-throughput kernels if you see drops |
 
+### Runtime Identity Manifest
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CUTRACER_RUNTIME_IDENTITY` | string | unset | `1` writes a runtime identity manifest that binds each launch to its process, CUDA context, module, CUBIN bytes and function-relative instruction PCs |
+| `CUTRACER_RUN_ID` | string | unset | Recorded in the manifest as an unauthenticated run hint |
+| `CUTRACER_WORKER_ID` | string | unset | Recorded in the manifest as an unauthenticated worker hint |
+
+The manifest also records `RANK` and `WORLD_SIZE` as unauthenticated hints.
+Instrumented launches get trace files named after their launch record, and the
+trace header carries that record. See
+[Outputs and File Formats](Outputs-and-File-Formats.md#runtime-identity-manifest-).
+
 ### Runtime Safety Limits
 
 These guardrails terminate the run early if a kernel is hung or a trace is
@@ -208,8 +221,11 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_KERNEL_TIMEOUT_S` | Advanced — Runtime Limits |
 | `CUTRACER_NO_DATA_TIMEOUT_S` | Advanced — Runtime Limits |
 | `CUTRACER_OUTPUT_DIR` | Output |
+| `CUTRACER_RUN_ID` | Advanced — Runtime Identity |
+| `CUTRACER_RUNTIME_IDENTITY` | Advanced — Runtime Identity |
 | `CUTRACER_TRACE_FORMAT` | Output |
 | `CUTRACER_TRACE_SIZE_LIMIT_MB` | Advanced — Runtime Limits |
+| `CUTRACER_WORKER_ID` | Advanced — Runtime Identity |
 | `CUTRACER_ZSTD_LEVEL` | Output |
 | `INSTR_BEGIN` | Core |
 | `INSTR_END` | Core |

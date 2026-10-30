@@ -872,6 +872,7 @@ static void finish_requested_captures(CTXstate* state) {
       clear_deadlock_state(state);
     }
   }
+  state->capture_completions.finished_chunk_boundary();
 }
 
 static bool has_capture_writer(CTXstate* state, uint64_t launch_id) {

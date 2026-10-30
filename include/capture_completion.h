@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -42,13 +44,35 @@ class CaptureCompletionQueue {
   // Only the receiver may consume this queue, between complete chunks.
   std::vector<CaptureCompletionRequest> take_at_chunk_boundary() {
     std::lock_guard<std::mutex> lock(mutex_);
+    taken_barrier_ = barrier_;
     std::vector<CaptureCompletionRequest> ready;
     ready.swap(pending_);
     return ready;
   }
 
+  // The receiver calls this after finishing the requests it took.
+  void finished_chunk_boundary() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      finished_barrier_ = taken_barrier_;
+    }
+    boundary_.notify_all();
+  }
+
+  // Waits until the receiver has parsed every chunk it copied before this call
+  // and finished the requests enqueued before it. False after the timeout.
+  bool wait_for_receiver(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto barrier = ++barrier_;
+    return boundary_.wait_for(lock, timeout, [&] { return finished_barrier_ >= barrier; });
+  }
+
  private:
   std::mutex mutex_;
+  std::condition_variable boundary_;
   std::vector<CaptureCompletionRequest> pending_;
   std::vector<uint64_t> graph_launches_;
+  uint64_t barrier_ = 0;
+  uint64_t taken_barrier_ = 0;
+  uint64_t finished_barrier_ = 0;
 };

@@ -168,7 +168,7 @@ $(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC) Makefile
 	$(NVCC) -std=c++17 -DNDEBUG $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # Compilation rule for C++ files
-$(OBJ_DIR)/cubin_identity.o $(OBJ_DIR)/instrumentation_plan.o: $(PICOSHA2_PATH)/picosha2.h
+$(OBJ_DIR)/cubin_identity.o $(OBJ_DIR)/instrumentation_plan.o $(OBJ_DIR)/runtime_identity.o: $(PICOSHA2_PATH)/picosha2.h
 $(OBJS): $(wildcard $(INCLUDE_DIR)/*.h $(INCLUDE_DIR)/fb/*.h)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp

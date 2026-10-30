@@ -263,6 +263,63 @@ class KernelMetadataSchemaTest(unittest.TestCase):
             ):
                 jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
 
+    def test_runtime_identity_launch_record(self):
+        """Test the launch record attached when runtime identity is enabled."""
+        identity = {
+            "process": "1" * 64,
+            "context": "2" * 64,
+            "module": "3" * 64,
+            "function": "4" * 64,
+            "entry": "_Z6kernelPfS_i",
+            "cubin_sha256": "5" * 64,
+            "launch_id": 7,
+            "kernel_ordinal": 0,
+            "launch": "6" * 64,
+            "grid": [128, 1, 1],
+            "block": [256, 1, 1],
+            "cluster_dim": [1, 1, 1],
+            "cluster_dim_source": "unknown",
+            "stream_handle": 0,
+            "launch_kind": "graph",
+            "graph_node_handle": 94196315275016,
+            "graph_invocation": 3,
+            "capture_selected": True,
+            "instrumentation_protocol": "legacy/v1",
+        }
+        record = {
+            "type": "kernel_metadata",
+            "mangled_name": "_Z6kernelPfS_i",
+            "unmangled_name": "kernel(float*, float*, int)",
+            "kernel_checksum": "a1b2c3d4e5f67890",
+            "func_addr": "0x7f1234567890",
+            "nregs": 32,
+            "shmem_static": 0,
+            "grid": [128, 1, 1],
+            "block": [256, 1, 1],
+            "shmem_dynamic": 0,
+        }
+        for fields in ({}, {"launch_kind": "direct", "graph_invocation": None}):
+            with self.subTest(fields=fields):
+                jsonschema.validate(
+                    {**record, "runtime_identity": {**identity, **fields}},
+                    KERNEL_METADATA_SCHEMA,
+                )
+        missing = dict(identity)
+        del missing["launch"]
+        for invalid in (
+            missing,
+            {**identity, "process": "not-a-digest"},
+            {**identity, "launch_kind": "unknown"},
+            {**identity, "handle": 1},
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(jsonschema.ValidationError),
+            ):
+                jsonschema.validate(
+                    {**record, "runtime_identity": invalid}, KERNEL_METADATA_SCHEMA
+                )
+
 
 class DelayConfigSchemaTest(unittest.TestCase):
     """Tests for delay injection configuration schema."""

@@ -12,7 +12,9 @@
 #include <assert.h>
 #include <cxxabi.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <execinfo.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <optional>
 #include <random>
 #include <regex>
@@ -465,8 +468,15 @@ std::map<uint64_t, KernelDimensions> kernel_launch_to_dimensions_map;
 std::unordered_map<CUfunction, ClusterLaunchInfo> g_func_to_observed_cluster;
 pthread_mutex_t g_cluster_obs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// map to store the iteration count for each kernel
-static std::map<CUfunction, uint32_t> kernel_iter_map;
+// Legacy trace names are kernel_<checksum>_iter<n>_<name>. Number launches by
+// that name rather than by CUfunction, so other contexts and reloaded modules
+// cannot overwrite an earlier trace. Callers hold kernel_launch_state_mutex.
+static std::map<std::pair<std::string, std::string>, uint32_t> kernel_iter_map;
+
+static uint32_t next_kernel_iteration(const KernelFuncMetadata& meta, bool selected) {
+  auto& next = kernel_iter_map[{meta.kernel_checksum, meta.mangled_name}];
+  return selected ? next++ : next;
+}
 
 // Per-function static metadata (populated during instrumentation)
 std::unordered_map<CUfunction, KernelFuncMetadata> kernel_metadata_by_func;
@@ -611,6 +621,8 @@ static bool shouldInjectDelayWithPatterns(Instr* instr) {
 
 /* ===== Main Functionality ===== */
 
+#include "runtime_hooks.h"
+
 /**
  * @brief Get or create per-function metadata entry.
  *
@@ -621,7 +633,25 @@ static bool shouldInjectDelayWithPatterns(Instr* instr) {
  */
 static KernelFuncMetadata& get_or_create_kernel_func_metadata(CUfunction func, CUcontext ctx) {
   auto [it, inserted] = kernel_metadata_by_func.emplace(func, KernelFuncMetadata{});
+  if (!inserted && it->second.owner_context != ctx) {
+    it->second = KernelFuncMetadata{};
+    already_instrumented.erase(func);
+    inserted = true;
+  }
   if (inserted) {
+    it->second.owner_context = ctx;
+    // A missing module association remains unavailable to the identity path.
+    const auto module_status = cuFuncGetModule(&it->second.owner_module, func);
+    if (module_status != CUDA_SUCCESS) {
+      it->second.owner_module = nullptr;
+      if (runtime_identity.active()) {
+        runtime_identity_error("cuFuncGetModule failed: " + std::to_string(static_cast<int>(module_status)));
+      }
+    }
+    if (reused_function_handle(ctx, func)) {
+      loprintf("WARNING: CUfunction %p was reused after a module unload in context %p; its launches are not traced\n",
+               (void*)func, (void*)ctx);
+    }
     it->second.unmangled_name = nvbit_get_func_name(ctx, func, false);
     it->second.func_addr = nvbit_get_func_addr(ctx, func);
     CUDA_SAFECALL(cuFuncGetAttribute(&it->second.nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, func));
@@ -645,8 +675,8 @@ static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata
   const std::string temporary = temporary_dir + "/snapshot.cubin";
   // Hash the fresh snapshot before publishing it; a failed dump cannot reuse
   // bytes from an earlier capture.
-  nvbit_dump_cubin(ctx, func, temporary.c_str());
-  const std::string digest = cubin_file_sha256(temporary);
+  const bool dumped = nvbit_dump_cubin(ctx, func, temporary.c_str());
+  const std::string digest = dumped ? cubin_file_sha256(temporary) : "";
   if (digest.empty()) {
     loprintf("ERROR: could not hash dumped cubin %s\n", temporary.c_str());
     unlink(temporary.c_str());
@@ -1251,16 +1281,20 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
 
   CTXstate* ctx_state = ctx_state_map[ctx];
 
-  // Record dynamic cluster geometry for every launch, including stream capture,
-  // so normal traces and graph-node replays can serialize the launch contract.
+  // Graph nodes take their cluster geometry from graph construction. A function
+  // captured with different cluster shapes leaves its graph launches unknown.
   unsigned int dynamic_cluster_x = 0, dynamic_cluster_y = 0, dynamic_cluster_z = 0;
   bool has_dynamic_cluster =
       extract_cluster_dim_from_launch_ex(cbid, params, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
-  if (has_dynamic_cluster) {
-    ClusterLaunchInfo observed =
+  if (has_dynamic_cluster && (stream_capture || build_graph)) {
+    const ClusterLaunchInfo observed =
         resolve_cluster_launch_info(func, true, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
     pthread_mutex_lock(&g_cluster_obs_mutex);
-    g_func_to_observed_cluster[func] = observed;
+    const auto [known, inserted] = g_func_to_observed_cluster.emplace(func, observed);
+    if (!inserted && (known->second.x != observed.x || known->second.y != observed.y || known->second.z != observed.z ||
+                      known->second.source != observed.source)) {
+      known->second = ClusterLaunchInfo{};
+    }
     pthread_mutex_unlock(&g_cluster_obs_mutex);
   }
   ClusterLaunchInfo cluster =
@@ -1274,10 +1308,20 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     CUDA_CHECK_LAST_ERROR();
   }
 
-  const bool should_instrument = !ctx_state->channel_failed && instrument_function_if_needed(ctx, func);
+  // Get or create per-function metadata (basic fields auto-populated on first
+  // access). Its NVBit queries must precede any NVBit control call below.
+  auto& meta = get_or_create_kernel_func_metadata(func, ctx);
+  identify_runtime_function(ctx, func, meta);
+  // A reused handle runs its original code: NVBit's state for it is stale.
+  const bool reused_handle = reused_function_handle(ctx, func);
+  if (reused_handle) nvbit_enable_instrumented(ctx, func, false);
+  const bool should_instrument =
+      !ctx_state->channel_failed && !reused_handle && instrument_function_if_needed(ctx, func);
+  if (should_instrument)
+    ctx_state->instrumented_launch_roots.insert(func);
+  else
+    ctx_state->instrumented_launch_roots.erase(func);
 
-  // Get or create per-function metadata (basic fields auto-populated on first access)
-  const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
   const char* func_name = meta.unmangled_name.c_str();
   uint64_t pc = meta.func_addr;
 
@@ -1286,6 +1330,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   KernelDimensions dims{};
   unsigned int dynamic_shmem = 0;
   uint32_t current_iter = 0;
+  nlohmann::json runtime_launch;
 
   // during stream capture or manual graph build, no kernel is launched, so
   // do not set launch argument, do not print kernel info, do not increase
@@ -1344,11 +1389,25 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     }
     {
       std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
-      current_iter = kernel_iter_map[func];
-      if (should_instrument) kernel_iter_map[func]++;
+      current_iter = next_kernel_iteration(meta, should_instrument);
       kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
       kernel_launch_to_iter_map[kernel_launch_id] = current_iter;
       kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+    }
+
+    uint64_t runtime_stream = 0;
+    if (cbid == API_CUDA_cuLaunchKernelEx_ptsz || cbid == API_CUDA_cuLaunchKernelEx) {
+      runtime_stream = reinterpret_cast<uint64_t>(((cuLaunchKernelEx_params*)params)->config->hStream);
+    } else if (cbid == API_CUDA_cuLaunchKernel || cbid == API_CUDA_cuLaunchKernel_ptsz ||
+               cbid == API_CUDA_cuLaunchCooperativeKernel || cbid == API_CUDA_cuLaunchCooperativeKernel_ptsz) {
+      runtime_stream = reinterpret_cast<uint64_t>(((cuLaunchKernel_params*)params)->hStream);
+    }
+    if (cbid == API_CUDA_cuLaunch || cbid == API_CUDA_cuLaunchGrid || cbid == API_CUDA_cuLaunchGridAsync) {
+      runtime_event([&](auto& ledger) { ledger.gap("legacy_launch_geometry_unavailable"); });
+    } else {
+      runtime_launch = identify_runtime_launch(ctx, func, kernel_launch_id, dims, cluster, runtime_stream, "direct",
+                                               should_instrument);
+      if (!runtime_launch.is_null()) ctx_state->identified_launches.insert(kernel_launch_id);
     }
 
     // Write structured kernel launch event (applies to ALL kernels, not just instrumented)
@@ -1371,9 +1430,11 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     // recv thread never receives any trace data.
     // Create TraceWriter for each kernel launch (per-launch trace files)
     std::string base_filename = generate_kernel_log_basename(ctx, func, current_iter, meta.kernel_checksum);
+    base_filename = runtime_trace_basename(base_filename, runtime_launch);
     const uint64_t current_launch_id = launched_id.value();
     auto metadata = build_kernel_metadata_json(meta, dims, dynamic_shmem, cluster, cpu_callstack, callstack_source,
                                                func, ctx_state, current_launch_id, "direct");
+    if (!runtime_launch.is_null()) metadata["runtime_identity"] = runtime_launch;
 
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
@@ -1422,9 +1483,16 @@ static CaptureDrainResult synchronize_and_drain_capture(CUcontext ctx, CTXstate*
 // the function is only called for non cuda graph launch cases.
 static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
                                 bool launch_succeeded) {
-  const auto [kernel_completed, channel_drained] =
+  const auto completion =
       synchronize_and_drain_capture(ctx, ctx_state, CaptureSyncScope::Device, nullptr, launch_succeeded);
+  const bool kernel_completed = completion.kernel_completed;
+  const bool channel_drained = completion.channel_drained;
   if (launch_id) {
+    if (ctx_state->identified_launches.erase(*launch_id)) {
+      runtime_event([&](auto& ledger) {
+        ledger.complete(reinterpret_cast<uint64_t>(ctx), *launch_id, kernel_completed, channel_drained);
+      });
+    }
     const std::string error = kernel_completed && channel_drained ? "" : "cuda_launch_or_flush_failed";
     ctx_state->capture_completions.request({*launch_id, kernel_completed, channel_drained, error});
     if (!error.empty()) {
@@ -1434,15 +1502,29 @@ static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optiona
   }
 }
 
-static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stream, bool launch_succeeded) {
-  const auto [kernel_completed, channel_drained] =
+static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool launch_succeeded) {
+  const auto completion =
       synchronize_and_drain_capture(ctx, ctx_state, CaptureSyncScope::Stream, stream, launch_succeeded);
+  const bool kernel_completed = completion.kernel_completed;
+  const bool channel_drained = completion.channel_drained;
   const std::string error = kernel_completed && channel_drained ? "" : "cuda_graph_launch_or_flush_failed";
+  finish_runtime_graph(ctx, ctx_state, stream, api, true, kernel_completed, channel_drained);
   ctx_state->capture_completions.request_graph_completion(kernel_completed, channel_drained, error);
   if (!error.empty()) {
     loprintf("ERROR: incomplete graph capture: kernel_completed=%d channel_drained=%d\n", kernel_completed,
              channel_drained);
   }
+}
+
+// CUDA 12+ launch APIs also accept a CUkernel, which the CUDA runtime passes
+// for its registered kernels. NVBit reports graph nodes by the current
+// context's CUfunction, so all per-function tool state uses that handle.
+static CUfunction canonical_launch_function(CUfunction func) {
+  CUmodule module = nullptr;
+  if (!func || cuFuncGetModule(&module, func) != CUDA_ERROR_INVALID_HANDLE) return func;
+  CUfunction resolved = nullptr;
+  if (cuKernelGetFunction(&resolved, reinterpret_cast<CUkernel>(func)) != CUDA_SUCCESS || !resolved) return func;
+  return resolved;
 }
 
 // Reference code from NVIDIA nvbit mem_trace tool
@@ -1475,6 +1557,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
     // Its completion remains incomplete because channel_failed is sticky.
     return exit.launch;
   };
+
+  observe_runtime_module(ctx, is_exit, cbid, name, params, pStatus);
 
   switch (cbid) {
     // Identify all the possible CUDA launch events without stream
@@ -1548,6 +1632,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
         func = p->f;
         hStream = p->hStream;
       }
+      func = canonical_launch_function(func);
 
       if (!is_exit) {
         cudaStreamCaptureStatus streamStatus;
@@ -1571,7 +1656,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
     } break;
     case API_CUDA_cuGraphAddKernelNode: {
       cuGraphAddKernelNode_params* p = (cuGraphAddKernelNode_params*)params;
-      CUfunction func = p->nodeParams->func;
+      CUfunction func = canonical_launch_function(p->nodeParams->func);
 
       if (!is_exit) {
         // cuGraphAddKernelNode_params->nodeParams is the same as
@@ -1585,14 +1670,25 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
       // if we are exiting a cuda graph launch:
       // Wait until the graph is completed using
       // cudaStreamSynchronize()
+      const CUstream stream = cbid == API_CUDA_cuGraphLaunch ? static_cast<cuGraphLaunch_params*>(params)->hStream
+                                                             : static_cast<cuGraphLaunch_ptsz_params*>(params)->hStream;
       if (!is_exit) {
         launch_callback.enter({ctx, cbid, std::nullopt, true});
+        if (runtime_identity.active()) {
+          try {
+            runtime_graph_tracker.begin(reinterpret_cast<uint64_t>(ctx), runtime_stream_key(stream), cbid);
+          } catch (const std::exception& error) {
+            runtime_identity_error(error.what());
+            finish_runtime_graph(ctx, ctx_state, stream, cbid, false, false, false);
+          }
+        }
       } else if (take_pending_launch()) {
-        const CUstream stream = cbid == API_CUDA_cuGraphLaunch
-                                    ? static_cast<cuGraphLaunch_params*>(params)->hStream
-                                    : static_cast<cuGraphLaunch_ptsz_params*>(params)->hStream;
-
-        leave_graph_launch(ctx, ctx_state, stream, pStatus && *pStatus == CUDA_SUCCESS);
+        leave_graph_launch(ctx, ctx_state, stream, cbid, pStatus && *pStatus == CUDA_SUCCESS);
+      } else {
+        // The exit cannot qualify any pending invocation. Retire its evidence
+        // as incomplete without synchronizing an unpaired driver call.
+        finish_runtime_graph(ctx, ctx_state, stream, cbid, false, false, false);
+        ctx_state->capture_completions.request_graph_completion(false, false, "unmatched_graph_exit");
       }
 
     } break;
@@ -1631,6 +1727,7 @@ void nvbit_at_ctx_init(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) == ctx_state_map.end());
   CTXstate* ctx_state = new CTXstate;
   ctx_state_map[ctx] = ctx_state;
+  runtime_event([&](auto& ledger) { ledger.context_begin(reinterpret_cast<uint64_t>(ctx)); });
 
   nvbit_load_tool_module(ctx, (const void*)flush_channel_bin, &ctx_state->tool_module);
   assert(ctx_state->tool_module != nullptr);
@@ -1682,9 +1779,14 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   // (in case there were kernels launched but no data received)
   {
     std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
-    kernel_launch_to_func_map.clear();
-    kernel_launch_to_iter_map.clear();
-    kernel_launch_to_dimensions_map.clear();
+    for (auto it = kernel_launch_to_func_map.begin(); it != kernel_launch_to_func_map.end();) {
+      if (it->second.first == ctx) {
+        kernel_launch_to_iter_map.erase(it->first);
+        kernel_launch_to_dimensions_map.erase(it->first);
+        it = kernel_launch_to_func_map.erase(it);
+      } else
+        ++it;
+    }
   }
 
   if (ctx_state->channel_dev != nullptr) {
@@ -1695,11 +1797,20 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   }
   ctx_state_map.erase(ctx);
   delete ctx_state;
+  forget_runtime_module(ctx, nullptr);
+  runtime_event([&](auto& ledger) { ledger.context_end(reinterpret_cast<uint64_t>(ctx)); });
+  runtime_graph_tracker.clear(reinterpret_cast<uint64_t>(ctx));
 
   // Global cleanup: only when the last context is destroyed.
   // g_kernel_events_writer is shared across all contexts, so we must not
   // delete it while other contexts may still record events.
   if (ctx_state_map.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+      kernel_launch_to_func_map.clear();
+      kernel_launch_to_iter_map.clear();
+      kernel_launch_to_dimensions_map.clear();
+    }
     if (g_kernel_events_writer) {
       g_kernel_events_writer->flush();
       delete g_kernel_events_writer;
@@ -1739,7 +1850,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     has_observed_cluster = true;
   }
   pthread_mutex_unlock(&g_cluster_obs_mutex);
-  if (!has_observed_cluster) {
+  if (!has_observed_cluster || cluster.source == ClusterDimSource::UNKNOWN) {
     cluster = resolve_cluster_launch_info(func);
   }
 
@@ -1767,16 +1878,34 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   // Store kernel dimensions
   KernelDimensions dims = {config.gridDimX,  config.gridDimY,  config.gridDimZ,
                            config.blockDimX, config.blockDimY, config.blockDimZ};
-  const bool instrument_enabled =
-      has_any_instrumentation_enabled() && !ctx_state->channel_failed && matches_exact_kernel_selector(ctx, func);
+  const bool capture_selected = ctx_state->instrumented_launch_roots.count(func) && !ctx_state->channel_failed;
+  const bool instrument_enabled = has_any_instrumentation_enabled() && capture_selected;
+  const KernelFuncMetadata* node_meta = instrument_enabled ? &get_or_create_kernel_func_metadata(func, ctx) : nullptr;
   uint32_t current_iter = 0;
   {
     std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
-    current_iter = kernel_iter_map[func];
-    if (instrument_enabled) kernel_iter_map[func]++;
+    if (node_meta) current_iter = next_kernel_iteration(*node_meta, true);
     kernel_launch_to_func_map[kernel_launch_id] = {ctx, func};
     kernel_launch_to_iter_map[kernel_launch_id] = current_iter;
     kernel_launch_to_dimensions_map[kernel_launch_id] = dims;
+  }
+
+  std::optional<uint64_t> graph_invocation;
+  if (runtime_identity.active()) {
+    graph_invocation = runtime_graph_tracker.current(reinterpret_cast<uint64_t>(ctx), runtime_stream_key(stream));
+  }
+  const auto runtime_launch =
+      identify_runtime_launch(ctx, func, kernel_launch_id, dims, cluster, reinterpret_cast<uint64_t>(stream), "graph",
+                              capture_selected, launch_handle, graph_invocation);
+  if (!runtime_launch.is_null()) {
+    if (!graph_invocation) {
+      runtime_identity_error("graph_node_without_matching_invocation");
+    } else {
+      runtime_event([&](auto&) {
+        runtime_graph_tracker.attach(reinterpret_cast<uint64_t>(ctx), runtime_stream_key(stream), *graph_invocation,
+                                     kernel_launch_id);
+      });
+    }
   }
 
   // Capture the CPU call stack for graph node launches as well
@@ -1794,8 +1923,10 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   if (instrument_enabled) {
     const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
     std::string base_filename = generate_kernel_log_basename(ctx, func, current_iter, meta.kernel_checksum);
+    base_filename = runtime_trace_basename(base_filename, runtime_launch);
     auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cluster, cpu_callstack,
                                                callstack_source, func, ctx_state, kernel_launch_id, "graph");
+    if (!runtime_launch.is_null()) metadata["runtime_identity"] = runtime_launch;
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       auto& writer = create_trace_writer_locked(ctx_state, kernel_launch_id, base_filename, metadata);
@@ -1809,11 +1940,20 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   pthread_mutex_unlock(&mutex);
 }
 
+void nvbit_at_term() {
+  try {
+    runtime_identity.stop();
+  } catch (const std::exception& error) {
+    runtime_identity_error(error.what());
+  }
+}
+
 // Reference code from NVIDIA nvbit mem_trace tool with Meta modifications for
 // env config
 void nvbit_at_init() {
   // Initialize configuration from environment variables
   init_config_from_env();
+  start_runtime_identity();
   // Initialize delay JSON config for export (also loads replay config if specified)
   init_delay_json_config();
   /* set mutex as recursive */
