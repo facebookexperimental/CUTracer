@@ -26,7 +26,9 @@ enum message_type_t {
   MSG_TYPE_MEM_ADDR_ACCESS = 1,
   MSG_TYPE_OPCODE_ONLY = 2,
   MSG_TYPE_MEM_VALUE_ACCESS = 3,  // Memory access with value tracing
-  MSG_TYPE_TMA_ACCESS = 4         // TMA (Tensor Memory Accelerator) access
+  MSG_TYPE_TMA_ACCESS = 4,        // TMA (Tensor Memory Accelerator) access
+  MSG_TYPE_PLAN_OBSERVATION = 5,
+  MSG_TYPE_COUNT
 };
 
 /* Availability of per-lane distributed shared-memory attribution. */
@@ -190,5 +192,7 @@ struct tma_access_t {
 
   uint32_t active_mask;  // Warp-level active lane mask after predicate filtering; 0 is invalid at runtime.
 };
+
+#include "plan_observation.h"
 
 #endif /* COMMON_H */

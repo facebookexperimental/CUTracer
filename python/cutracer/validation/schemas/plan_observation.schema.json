@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/plan_observation.schema.json",
+  "title": "CUTracer Instrumentation Plan Observation",
+  "description": "One warp's register words at an instrumentation-plan point, written for each configuration that selected the warp. Lanes outside valid_mask carry null.",
+  "type": "object",
+  "required": [
+    "type",
+    "version",
+    "canonical_sha256",
+    "launch",
+    "grid_launch_id",
+    "config_index",
+    "config_id",
+    "point_id",
+    "sequence",
+    "cta",
+    "warp",
+    "reached_mask",
+    "executed_mask",
+    "selected_mask",
+    "valid_mask",
+    "registers",
+    "wire_bytes"
+  ],
+  "definitions": {
+    "word": {
+      "type": "string",
+      "pattern": "^0x(0|[1-9a-f][0-9a-f]{0,7})$"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "plan_observation"
+    },
+    "version": {
+      "const": 1,
+      "description": "Device packet version"
+    },
+    "canonical_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical plan"
+    },
+    "launch": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Launch key from the runtime identity manifest"
+    },
+    "grid_launch_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "config_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "config_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "point_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-configuration record ordinal within the launch"
+    },
+    "cta": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "warp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "CTA-local warp index"
+    },
+    "reached_mask": {
+      "$ref": "#/definitions/word",
+      "description": "Lanes that reached the instruction"
+    },
+    "executed_mask": {
+      "$ref": "#/definitions/word",
+      "description": "Reached lanes whose guard predicate was true"
+    },
+    "selected_mask": {
+      "$ref": "#/definitions/word",
+      "description": "Reached lanes selected by the configuration"
+    },
+    "valid_mask": {
+      "$ref": "#/definitions/word",
+      "description": "Selected lanes with captured values: all selected lanes for reached_lanes, executed ones for executed_lanes"
+    },
+    "registers": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^(R|UR|P|UP)(0|[1-9][0-9]*)$"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/word"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "minItems": 32,
+        "maxItems": 32
+      },
+      "description": "Register name to 32 per-lane values"
+    },
+    "wire_bytes": {
+      "const": 2120,
+      "description": "Size of the device packet that carried this record"
+    }
+  },
+  "additionalProperties": false
+}

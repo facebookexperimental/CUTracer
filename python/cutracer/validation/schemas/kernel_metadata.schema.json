@@ -58,73 +58,112 @@
       "description": "SHA256 of the actual dumped cubin bytes, including embedded PTX/debug information."
     },
     "capture_config": {
-      "type": "object",
-      "required": [
-        "version",
-        "grid_launch_id",
-        "launch_kind",
-        "instr_begin",
-        "instr_end",
-        "reg_trace_ipoint",
-        "root_function",
-        "pc_namespace",
-        "root_instruction_count",
-        "reg_trace_instruction_count",
-        "instrumentation_errors"
-      ],
-      "properties": {
-        "version": {
-          "type": "integer",
-          "const": 1
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "version",
+            "grid_launch_id",
+            "launch_kind",
+            "instr_begin",
+            "instr_end",
+            "reg_trace_ipoint",
+            "root_function",
+            "pc_namespace",
+            "root_instruction_count",
+            "reg_trace_instruction_count",
+            "instrumentation_errors"
+          ],
+          "properties": {
+            "version": {
+              "type": "integer",
+              "const": 1
+            },
+            "grid_launch_id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "launch_kind": {
+              "enum": [
+                "direct",
+                "graph",
+                "unknown"
+              ]
+            },
+            "instr_begin": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "instr_end": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "reg_trace_ipoint": {
+              "enum": [
+                "before",
+                "after"
+              ]
+            },
+            "root_function": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pc_namespace": {
+              "const": "root_function_without_executed_calls"
+            },
+            "root_instruction_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reg_trace_instruction_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "instrumentation_errors": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
         },
-        "grid_launch_id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "launch_kind": {
-          "enum": [
-            "direct",
-            "graph",
-            "unknown"
-          ]
-        },
-        "instr_begin": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
-        },
-        "instr_end": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
-        },
-        "reg_trace_ipoint": {
-          "enum": [
-            "before",
-            "after"
-          ]
-        },
-        "root_function": {
-          "type": "string",
-          "minLength": 1
-        },
-        "pc_namespace": {
-          "const": "root_function_without_executed_calls"
-        },
-        "root_instruction_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "reg_trace_instruction_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "instrumentation_errors": {
-          "type": "integer",
-          "minimum": 0
+        {
+          "type": "object",
+          "description": "Instrumentation plan capture; the plan_applied record that follows describes what was instrumented.",
+          "required": [
+            "version",
+            "grid_launch_id",
+            "launch_kind",
+            "protocol",
+            "applied_plan_required"
+          ],
+          "properties": {
+            "version": {
+              "type": "integer",
+              "const": 1
+            },
+            "grid_launch_id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "launch_kind": {
+              "enum": [
+                "direct",
+                "graph",
+                "unknown"
+              ]
+            },
+            "protocol": {
+              "const": "cutracer.plan-runtime/1"
+            },
+            "applied_plan_required": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
+      ]
     },
     "cubin_path": {
       "type": "string",
@@ -291,7 +330,7 @@
     },
     "runtime_identity": {
       "type": "object",
-      "description": "Launch record of the runtime identity manifest (cutracer_runtime_<pid>_<nonce>.ndjson), present when runtime identity is enabled. process, context, module and function are the keys of earlier records in that manifest; launch is the SHA-256 of this object without launch.",
+      "description": "Launch record of the runtime identity manifest (cutracer_runtime_<pid>_<nonce>.ndjson), present when runtime identity is enabled or an instrumentation plan is active. process, context, module and function are the keys of earlier records in that manifest; launch is the SHA-256 of this object without launch.",
       "required": [
         "process",
         "context",
@@ -357,7 +396,7 @@
           "description": "Graph launch invocation that contains this node launch, or null for direct launches"
         },
         "capture_selected": {"type": "boolean"},
-        "instrumentation_protocol": {"enum": ["legacy/v1"]}
+        "instrumentation_protocol": {"enum": ["legacy/v1", "cutracer.plan-runtime/1"]}
       },
       "additionalProperties": false
     }

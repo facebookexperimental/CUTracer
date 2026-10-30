@@ -53,6 +53,10 @@ Each line in an NDJSON trace file is a self-contained JSON object. The `type` fi
 
 All records share common fields: `ctx`, `grid_launch_id`, `cta`, `warp`, `opcode_id`, `pc`, `sass`, `trace_index`, `timestamp`.
 
+[Instrumentation plan](Instrumentation-Plans.md#output) captures contain
+`plan_observation` records instead, between a `plan_applied` record after the
+header and a `plan_capture_completion` record before the footer.
+
 ### `mem_addr_trace` DSM attribution
 
 Current SM90+ captures add these backward-compatible fields:
@@ -141,6 +145,9 @@ trace can be bound to the exact binary and launch that produced it.
 | `"driver_completion"` | The launch's CUDA completion was observed | `launch`, `launch_id`, `context`, `kernel_completed`, `channel_drained`, `trace_footer_required` |
 | `"launch_incomplete"` | A context ended before a launch completed | `launch`, `reason` |
 | `"gap"` | Identity could not be established | `reason` |
+| `"plan_loaded"` | An [instrumentation plan](Instrumentation-Plans.md) was loaded | `plan_id`, `canonical`, `canonical_sha256`, `file_sha256` |
+| `"plan_applied"`, `"plan_capture_completion"` | A plan launch was bound or finished | Same as the trace records of the same name |
+| `"plan_gap"`, `"plan_error"` | A context ended with unfinished plan captures, or plan capture was disabled | `reason` |
 | `"process_end"` | Tool termination | `pending_launches`, `live_contexts`, `has_gaps` |
 
 The manifest contains host and device identifiers (process IDs, boot ID and

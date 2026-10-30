@@ -28,6 +28,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1088,6 +1089,7 @@ void init_context_state(CUcontext ctx) {
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, channel_buffer_size, ctx_state->channel_dev,
                                recv_thread_fun, ctx);
   nvbit_set_tool_thread(ctx_state->channel_host.get_thread_id());
+  if (runtime_plan_requested.load()) apply_runtime_plan([&](auto& plan) { plan.initialize_context(ctx); });
 }
 
 /**
@@ -1120,6 +1122,13 @@ static nlohmann::json build_kernel_metadata_json(const KernelFuncMetadata& meta,
                           {"root_instruction_count", meta.instruction_count},
                           {"reg_trace_instruction_count", meta.reg_trace_instruction_count},
                           {"instrumentation_errors", meta.instrumentation_errors}};
+  if (runtime_plan_requested.load()) {
+    md["capture_config"] = {{"version", 1},
+                            {"grid_launch_id", launch_id},
+                            {"launch_kind", launch_kind},
+                            {"protocol", "cutracer.plan-runtime/1"},
+                            {"applied_plan_required", true}};
+  }
   md["grid"] = {dims.gridDimX, dims.gridDimY, dims.gridDimZ};
   md["block"] = {dims.blockDimX, dims.blockDimY, dims.blockDimZ};
   md["shmem_dynamic"] = dynamic_shmem;
@@ -1275,6 +1284,13 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
                                 nvbit_api_cuda_t cbid, void* params, bool stream_capture = false,
                                 bool build_graph = false) {
   launched_id.reset();
+  if (runtime_plan_requested.load() &&
+      (cbid == API_CUDA_cuLaunch || cbid == API_CUDA_cuLaunchGrid || cbid == API_CUDA_cuLaunchGridAsync)) {
+    runtime_plan_error("Plan capture does not support legacy launch geometry APIs");
+    nvbit_set_at_launch(ctx, func, 0);
+    nvbit_enable_instrumented(ctx, func, false);
+    return false;
+  }
   // Capture the CPU call stack early, before synchronization, so it reflects
   // the actual application call site that triggered this kernel launch.
   auto [cpu_callstack, callstack_source] = capture_cpu_callstack();
@@ -1315,8 +1331,12 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   // A reused handle runs its original code: NVBit's state for it is stale.
   const bool reused_handle = reused_function_handle(ctx, func);
   if (reused_handle) nvbit_enable_instrumented(ctx, func, false);
-  const bool should_instrument =
-      !ctx_state->channel_failed && !reused_handle && instrument_function_if_needed(ctx, func);
+  bool should_instrument =
+      !ctx_state->channel_failed && !reused_handle &&
+      (runtime_plan_requested.load() ? apply_runtime_plan([&](auto& plan) {
+        return plan.prepare(ctx, func, meta.runtime_identity, reinterpret_cast<uint64_t>(ctx_state->channel_dev));
+      })
+                                     : instrument_function_if_needed(ctx, func));
   if (should_instrument)
     ctx_state->instrumented_launch_roots.insert(func);
   else
@@ -1331,6 +1351,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   unsigned int dynamic_shmem = 0;
   uint32_t current_iter = 0;
   nlohmann::json runtime_launch;
+  nlohmann::json plan_applied;
 
   // during stream capture or manual graph build, no kernel is launched, so
   // do not set launch argument, do not print kernel info, do not increase
@@ -1339,7 +1360,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     /* set kernel launch id at launch time */
     const uint64_t kernel_launch_id = global_kernel_launch_id.fetch_add(1, std::memory_order_relaxed);
     launched_id = kernel_launch_id;
-    nvbit_set_at_launch(ctx, func, (uint64_t)kernel_launch_id);
+    nvbit_set_at_launch(ctx, func, runtime_plan_requested.load() ? 0 : kernel_launch_id);
 
     if (cbid == API_CUDA_cuLaunchKernelEx_ptsz || cbid == API_CUDA_cuLaunchKernelEx) {
       cuLaunchKernelEx_params* p = (cuLaunchKernelEx_params*)params;
@@ -1409,6 +1430,14 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
                                                should_instrument);
       if (!runtime_launch.is_null()) ctx_state->identified_launches.insert(kernel_launch_id);
     }
+    if (runtime_plan_requested.load() && should_instrument) {
+      plan_applied = apply_runtime_plan([&](auto& plan) { return plan.launch(ctx, func, runtime_launch); });
+      if (plan_applied.is_null()) {
+        should_instrument = false;
+        ctx_state->instrumented_launch_roots.erase(func);
+        nvbit_set_at_launch(ctx, func, 0);
+      }
+    }
 
     // Write structured kernel launch event (applies to ALL kernels, not just instrumented)
     if (kernel_events_mode != KernelEventsMode::DISABLED) {
@@ -1440,7 +1469,8 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       ctx_state->kernel_start_time = time(nullptr);
       ctx_state->last_data_received_time = 0;
-      create_trace_writer_locked(ctx_state, current_launch_id, base_filename, metadata);
+      auto& writer = create_trace_writer_locked(ctx_state, current_launch_id, base_filename, metadata);
+      if (!plan_applied.is_null()) writer.write_metadata(plan_applied);
     }
 
     loprintf_v("Created TraceWriter for launch_id %lu, mode %d, file: %s\n", current_launch_id, trace_format,
@@ -1448,6 +1478,12 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   }
 
   nvbit_enable_instrumented(ctx, func, should_instrument);
+  if (runtime_plan_requested.load() && should_instrument && !stream_capture && !build_graph) {
+    // Let NVBit finish preparing the instrumented launch: a launch on a
+    // non-blocking stream can otherwise start without the plan's instrumentation.
+    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+  }
   return should_instrument;
 }
 
@@ -1493,6 +1529,9 @@ static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optiona
         ledger.complete(reinterpret_cast<uint64_t>(ctx), *launch_id, kernel_completed, channel_drained);
       });
     }
+    if (runtime_plan_requested.load()) {
+      apply_runtime_plan([&](auto& plan) { plan.device_complete(ctx, *launch_id, kernel_completed, channel_drained); });
+    }
     const std::string error = kernel_completed && channel_drained ? "" : "cuda_launch_or_flush_failed";
     ctx_state->capture_completions.request({*launch_id, kernel_completed, channel_drained, error});
     if (!error.empty()) {
@@ -1509,7 +1548,8 @@ static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stre
   const bool channel_drained = completion.channel_drained;
   const std::string error = kernel_completed && channel_drained ? "" : "cuda_graph_launch_or_flush_failed";
   finish_runtime_graph(ctx, ctx_state, stream, api, true, kernel_completed, channel_drained);
-  ctx_state->capture_completions.request_graph_completion(kernel_completed, channel_drained, error);
+  if (!runtime_plan_requested.load())
+    ctx_state->capture_completions.request_graph_completion(kernel_completed, channel_drained, error);
   if (!error.empty()) {
     loprintf("ERROR: incomplete graph capture: kernel_completed=%d channel_drained=%d\n", kernel_completed,
              channel_drained);
@@ -1688,12 +1728,15 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
         // The exit cannot qualify any pending invocation. Retire its evidence
         // as incomplete without synchronizing an unpaired driver call.
         finish_runtime_graph(ctx, ctx_state, stream, cbid, false, false, false);
-        ctx_state->capture_completions.request_graph_completion(false, false, "unmatched_graph_exit");
+        if (!runtime_plan_requested.load())
+          ctx_state->capture_completions.request_graph_completion(false, false, "unmatched_graph_exit");
       }
 
     } break;
     case API_CUDA_cuGraphLaunchWithArguments: {
       if (!is_exit) {
+        if (runtime_plan_requested.load())
+          runtime_plan_error("Plan capture does not support cuGraphLaunchWithArguments");
         launch_callback.enter({ctx, cbid, std::nullopt, true});
         // Graph node admission also checks this flag. Do not consume graph
         // completion IDs owned by an enclosing supported launch on this exit.
@@ -1767,6 +1810,8 @@ void nvbit_at_ctx_term(CUcontext ctx) {
     for (auto& [launch_id, writer] : ctx_state->trace_writers) {
       if (writer) {
         loprintf_v("Cleaning up remaining writer for launch_id %lu\n", launch_id);
+        if (runtime_plan_requested.load())
+          apply_runtime_plan([&, id = launch_id, trace = writer](auto& plan) { plan.finish_trace(ctx, id, *trace); });
         writer->finish(launch_id, false, false);
         delete writer;
       }
@@ -1798,6 +1843,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   ctx_state_map.erase(ctx);
   delete ctx_state;
   forget_runtime_module(ctx, nullptr);
+  if (runtime_plan_requested.load()) apply_runtime_plan([&](auto& plan) { plan.destroy_context(ctx); });
   runtime_event([&](auto& ledger) { ledger.context_end(reinterpret_cast<uint64_t>(ctx)); });
   runtime_graph_tracker.clear(reinterpret_cast<uint64_t>(ctx));
 
@@ -1838,7 +1884,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   CTXstate* ctx_state = ctx_state_map[ctx];
 
   const uint64_t kernel_launch_id = global_kernel_launch_id.fetch_add(1, std::memory_order_relaxed);
-  nvbit_set_at_launch(ctx, func, kernel_launch_id, stream, launch_handle);
+  nvbit_set_at_launch(ctx, func, runtime_plan_requested.load() ? 0 : kernel_launch_id, stream, launch_handle);
   nvbit_get_func_config(ctx, func, &config);
 
   ClusterLaunchInfo cluster;
@@ -1878,8 +1924,14 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   // Store kernel dimensions
   KernelDimensions dims = {config.gridDimX,  config.gridDimY,  config.gridDimZ,
                            config.blockDimX, config.blockDimY, config.blockDimZ};
-  const bool capture_selected = ctx_state->instrumented_launch_roots.count(func) && !ctx_state->channel_failed;
-  const bool instrument_enabled = has_any_instrumentation_enabled() && capture_selected;
+  bool capture_selected = ctx_state->instrumented_launch_roots.count(func) && !ctx_state->channel_failed;
+  if (runtime_plan_requested.load()) {
+    apply_runtime_plan([&](auto& plan) { plan.validate_graph_function(ctx, func); });
+    auto plan = cutracer::current_runtime_plan();
+    capture_selected = capture_selected && plan && !plan->disabled();
+  }
+  const bool instrument_enabled =
+      (runtime_plan_requested.load() || has_any_instrumentation_enabled()) && capture_selected;
   const KernelFuncMetadata* node_meta = instrument_enabled ? &get_or_create_kernel_func_metadata(func, ctx) : nullptr;
   uint32_t current_iter = 0;
   {
@@ -1918,9 +1970,18 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
                               cpu_callstack, callstack_source);
   }
 
+  nlohmann::json plan_applied;
+  if (runtime_plan_requested.load() && capture_selected) {
+    plan_applied = apply_runtime_plan([&](auto& plan) { return plan.launch(ctx, func, runtime_launch); });
+    if (plan_applied.is_null()) {
+      capture_selected = false;
+      nvbit_set_at_launch(ctx, func, 0, stream, launch_handle);
+    }
+  }
+
   // Create TraceWriter for this graph node launch only if instrumentation is enabled
   // Otherwise, trace files would be empty (no data to write)
-  if (instrument_enabled) {
+  if ((runtime_plan_requested.load() || has_any_instrumentation_enabled()) && capture_selected) {
     const auto& meta = get_or_create_kernel_func_metadata(func, ctx);
     std::string base_filename = generate_kernel_log_basename(ctx, func, current_iter, meta.kernel_checksum);
     base_filename = runtime_trace_basename(base_filename, runtime_launch);
@@ -1930,8 +1991,12 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       auto& writer = create_trace_writer_locked(ctx_state, kernel_launch_id, base_filename, metadata);
-      writer.mark_capture_error("graph_launch_completion_unverified");
-      ctx_state->capture_completions.register_graph_launch(kernel_launch_id);
+      if (runtime_plan_requested.load()) {
+        writer.write_metadata(plan_applied);
+      } else {
+        writer.mark_capture_error("graph_launch_completion_unverified");
+        ctx_state->capture_completions.register_graph_launch(kernel_launch_id);
+      }
     }
 
     loprintf_v("Created TraceWriter for graph node launch_id %lu, file: %s\n", kernel_launch_id, base_filename.c_str());
@@ -1941,6 +2006,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
 }
 
 void nvbit_at_term() {
+  cutracer::publish_runtime_plan({});
   try {
     runtime_identity.stop();
   } catch (const std::exception& error) {
@@ -1953,7 +2019,7 @@ void nvbit_at_term() {
 void nvbit_at_init() {
   // Initialize configuration from environment variables
   init_config_from_env();
-  start_runtime_identity();
+  init_runtime_observation();
   // Initialize delay JSON config for export (also loads replay config if specified)
   init_delay_json_config();
   /* set mutex as recursive */

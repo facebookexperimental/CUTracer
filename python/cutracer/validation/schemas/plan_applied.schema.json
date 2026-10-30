@@ -1,0 +1,389 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/plan_applied.schema.json",
+  "title": "CUTracer Instrumentation Plan Application",
+  "description": "Written after the kernel_metadata header of a plan capture: the configurations bound to this launch and the instruction bytes actually instrumented.",
+  "type": "object",
+  "required": [
+    "type",
+    "schema",
+    "canonical_sha256",
+    "file_sha256",
+    "launch",
+    "launch_id",
+    "runtime_identity",
+    "backend",
+    "packet_version",
+    "packet_bytes",
+    "budget_accounting",
+    "configs"
+  ],
+  "definitions": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pc": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{1,16}$",
+      "description": "Function-relative byte offset"
+    },
+    "register": {
+      "type": "string",
+      "pattern": "^(R|UR|P|UP)(0|[1-9][0-9]*)$"
+    },
+    "phase": {
+      "enum": ["before", "after"]
+    },
+    "predicate_policy": {
+      "enum": ["executed_lanes", "reached_lanes"]
+    },
+    "selection": {
+      "oneOf": [
+        {
+          "const": "all"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/count"
+          },
+          "minItems": 1
+        }
+      ]
+    },
+    "observation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "registers"],
+          "properties": {
+            "kind": {
+              "const": "reg_trace"
+            },
+            "registers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/register"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "mref"],
+          "properties": {
+            "kind": {
+              "enum": ["mem_addr_trace", "mem_value_trace"]
+            },
+            "mref": {
+              "$ref": "#/definitions/count"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "delay_ns"],
+          "properties": {
+            "kind": {
+              "const": "random_delay"
+            },
+            "delay_ns": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "enum": ["opcode_only", "tma_trace"]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "description": "The configuration as written in the canonical plan",
+      "required": ["config_id", "requests", "launches", "capture", "budget", "points"],
+      "properties": {
+        "config_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "launches": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["mode"],
+              "properties": {
+                "mode": {
+                  "const": "all"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["mode", "indices"],
+              "properties": {
+                "mode": {
+                  "const": "per_context_kernel_ordinal"
+                },
+                "indices": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/count"
+                  },
+                  "minItems": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "capture": {
+          "type": "object",
+          "required": ["ctas", "warps", "lanes"],
+          "properties": {
+            "ctas": {
+              "oneOf": [
+                {
+                  "const": "all"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/definitions/count"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3
+                  },
+                  "minItems": 1
+                }
+              ]
+            },
+            "warps": {
+              "$ref": "#/definitions/selection"
+            },
+            "lanes": {
+              "$ref": "#/definitions/selection"
+            }
+          },
+          "additionalProperties": false
+        },
+        "budget": {
+          "type": "object",
+          "required": ["max_records", "max_bytes", "on_limit"],
+          "properties": {
+            "max_records": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "on_limit": {
+              "const": "mark_incomplete"
+            }
+          },
+          "additionalProperties": false
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["function", "pc", "expected_bytes", "phase", "predicate_policy", "observations"],
+            "properties": {
+              "function": {
+                "type": "string",
+                "minLength": 1
+              },
+              "pc": {
+                "$ref": "#/definitions/pc"
+              },
+              "expected_bytes": {
+                "type": "string",
+                "pattern": "^([0-9a-f]{2}){8,32}$"
+              },
+              "phase": {
+                "$ref": "#/definitions/phase"
+              },
+              "predicate_policy": {
+                "$ref": "#/definitions/predicate_policy"
+              },
+              "observations": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/definitions/observation"
+                },
+                "minItems": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "plan_applied"
+    },
+    "schema": {
+      "const": "cutracer.plan-applied/v1"
+    },
+    "canonical_sha256": {
+      "$ref": "#/definitions/sha256"
+    },
+    "file_sha256": {
+      "$ref": "#/definitions/sha256"
+    },
+    "launch": {
+      "$ref": "#/definitions/sha256"
+    },
+    "launch_id": {
+      "$ref": "#/definitions/count"
+    },
+    "runtime_identity": {
+      "type": "object",
+      "required": ["launch", "launch_id", "entry", "cubin_sha256"],
+      "description": "The launch record, identical to kernel_metadata.runtime_identity"
+    },
+    "backend": {
+      "const": "cutracer.plan-runtime/1"
+    },
+    "packet_version": {
+      "const": 1
+    },
+    "packet_bytes": {
+      "const": 2120
+    },
+    "budget_accounting": {
+      "const": "device_packet_and_json_record_bytes"
+    },
+    "configs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "config_index",
+          "config_id",
+          "requests",
+          "selected",
+          "gap",
+          "expected_entry_warps",
+          "configuration",
+          "actual_points"
+        ],
+        "properties": {
+          "config_index": {
+            "$ref": "#/definitions/count"
+          },
+          "config_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "requests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "selected": {
+            "type": "boolean",
+            "description": "The launch selector chose this launch and the configuration has no gap"
+          },
+          "gap": {
+            "type": "string",
+            "description": "Unsupported capability when the plan reports gaps instead of failing, otherwise empty"
+          },
+          "expected_entry_warps": {
+            "$ref": "#/definitions/count"
+          },
+          "configuration": {
+            "$ref": "#/definitions/configuration"
+          },
+          "actual_points": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "point_id",
+                "function",
+                "pc",
+                "expected_bytes",
+                "phase",
+                "predicate_policy",
+                "registers",
+                "entry_marker"
+              ],
+              "properties": {
+                "point_id": {
+                  "$ref": "#/definitions/count"
+                },
+                "function": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pc": {
+                  "$ref": "#/definitions/pc"
+                },
+                "expected_bytes": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$",
+                  "description": "Bytes of the loaded instruction"
+                },
+                "phase": {
+                  "$ref": "#/definitions/phase"
+                },
+                "predicate_policy": {
+                  "$ref": "#/definitions/predicate_policy"
+                },
+                "registers": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/register"
+                  }
+                },
+                "entry_marker": {
+                  "type": "boolean",
+                  "description": "The runtime-added entry point that counts warps entering the kernel"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

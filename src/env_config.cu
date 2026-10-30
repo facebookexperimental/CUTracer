@@ -153,6 +153,7 @@ uint32_t trace_size_limit_mb;
  */
 static size_t compute_max_record_size() {
   size_t max_size = 0;
+  if (getenv("CUTRACER_INSTRUMENTATION_PLAN")) max_size = sizeof(plan_observation_t);
 
   if (is_instrument_type_enabled(InstrumentType::REG_TRACE)) {
     max_size = std::max(max_size, sizeof(reg_info_t));

@@ -168,9 +168,18 @@ When enabled, CUTracer writes a separate `kernel_events_*.ndjson` file. See
 | `CUTRACER_WORKER_ID` | string | unset | Recorded in the manifest as an unauthenticated worker hint |
 
 The manifest also records `RANK` and `WORLD_SIZE` as unauthenticated hints.
+An instrumentation plan enables the manifest automatically.
 Instrumented launches get trace files named after their launch record, and the
 trace header carries that record. See
 [Outputs and File Formats](Outputs-and-File-Formats.md#runtime-identity-manifest-).
+
+### Instrumentation Plans
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CUTRACER_INSTRUMENTATION_PLAN` | path | unset | Capture register values at the exact instructions, launches, CTAs, warps and lanes named by a plan file. Excludes the instruction selection variables above |
+
+See [Instrumentation Plans](Instrumentation-Plans.md) for the file format and outputs.
 
 ### Runtime Safety Limits
 
@@ -214,6 +223,7 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_DELAY_NS` | Delay Injection |
 | `CUTRACER_DUMP_CUBIN` | Debug |
 | `CUTRACER_INSTR_CATEGORIES` | Instruction Category Filtering |
+| `CUTRACER_INSTRUMENTATION_PLAN` | Advanced — Instrumentation Plans |
 | `CUTRACER_INSTRUMENT` | Core |
 | `CUTRACER_INSTRUMENT_IPOINT` | Advanced — IPOINT |
 | `CUTRACER_INSTRUMENT_IPOINT_UNIFORM` | Advanced — IPOINT |

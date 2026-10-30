@@ -97,11 +97,11 @@ endif
 LIBS=-L$(NVBIT_PATH) -lnvbit $(ZSTD_LIB) -lpthread -ldl
 NVCC_PATH=-L $(subst bin/nvcc,lib64,$(shell which nvcc | tr -s /))
 
-# Identify inject_funcs.cu specifically
-INJECT_FUNCS_SRC := $(SRC_DIR)/inject_funcs.cu
-INJECT_FUNCS_OBJ := $(OBJ_DIR)/inject_funcs.o
+# Injected device functions (inject_funcs*.cu) need NVBit patching flags
+INJECT_FUNCS_SRC := $(wildcard $(SRC_DIR)/inject_funcs*.cu)
+INJECT_FUNCS_OBJ := $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.o,$(INJECT_FUNCS_SRC))
 
-# Source files (excluding inject_funcs.cu)
+# Source files (excluding inject_funcs*.cu)
 CU_SRCS := $(filter-out $(INJECT_FUNCS_SRC),$(wildcard $(SRC_DIR)/*.cu))
 CPP_SRCS := $(wildcard $(SRC_DIR)/*.cpp)
 
@@ -164,7 +164,7 @@ $(REGULAR_OBJS): $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu $(TOOL_FUNC_BIN2CS)
 # which NVBit cannot resolve in injected code. Keep NDEBUG local to injection
 # units so assertions in regular tool code remain enabled. Depend on Makefile
 # so changes to injection flags also invalidate existing objects.
-$(INJECT_FUNCS_OBJ): $(INJECT_FUNCS_SRC) Makefile
+$(INJECT_FUNCS_OBJ): $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu Makefile
 	$(NVCC) -std=c++17 -DNDEBUG $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Wno-deprecated-gpu-targets -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 # Compilation rule for C++ files

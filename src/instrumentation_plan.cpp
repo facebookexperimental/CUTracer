@@ -437,16 +437,19 @@ Kernel kernel(const Json& j, size_t& config_count, size_t& point_count) {
   return result;
 }
 
-bool policy(const Json& j) {
+Policy policy(const Json& j) {
   keys(j, {"unmatched_kernel", "unsupported_request", "identity_mismatch", "conflicts"});
   constant(j.at("unmatched_kernel"), "skip");
-  constant(j.at("identity_mismatch"), "error");
   constant(j.at("conflicts"), "error");
   const auto unsupported = text(j.at("unsupported_request"));
   if (unsupported != "error" && unsupported != "report_gap") {
     fail("unknown unsupported request policy");
   }
-  return unsupported == "report_gap";
+  const auto mismatch = text(j.at("identity_mismatch"));
+  if (mismatch != "error" && mismatch != "skip") {
+    fail("unknown identity mismatch policy");
+  }
+  return {unsupported == "report_gap", mismatch == "skip"};
 }
 
 Json parse_json(const std::string& bytes, size_t& nodes) {
@@ -602,10 +605,10 @@ Json to_json(const Kernel& kernel) {
           {"configs", configs}};
 }
 
-CanonicalPlan::CanonicalPlan(std::string id, bool report_gap, std::vector<Kernel> kernels, Json canonical,
+CanonicalPlan::CanonicalPlan(std::string id, Policy flags, std::vector<Kernel> kernels, Json canonical,
                              std::string source_sha256)
     : id_(std::move(id)),
-      report_gap_(report_gap),
+      policy_(flags),
       kernels_(std::move(kernels)),
       canonical_(std::move(canonical)),
       canonical_sha256_(picosha2::hash256_hex_string(canonical_.dump(-1, ' ', true))),
@@ -626,7 +629,7 @@ CanonicalPlan PlanLoader::parse(const std::string& bytes) {
     Json header;
     std::vector<Kernel> kernels;
     size_t config_count = 0, point_count = 0;
-    bool report_gap = false;
+    Policy plan_policy;
     for (const auto& doc : docs) {
       if (!doc.is_object() || !doc.contains("schema")) {
         fail("plan needs schema");
@@ -644,11 +647,11 @@ CanonicalPlan PlanLoader::parse(const std::string& bytes) {
         fail("unknown schema version");
       }
       const auto candidate_id = text(doc.at("plan_id"));
-      const bool candidate_policy = policy(doc.at("policy"));
+      const auto candidate_policy = policy(doc.at("policy"));
       if (id.empty()) {
         id = candidate_id;
         header = doc.at("policy");
-        report_gap = candidate_policy;
+        plan_policy = candidate_policy;
       } else if (id != candidate_id || header != doc.at("policy")) {
         fail("inconsistent NDJSON plan ID or policy");
       }
@@ -666,7 +669,7 @@ CanonicalPlan PlanLoader::parse(const std::string& bytes) {
       serialized.push_back(to_json(k));
     }
     Json canonical{{"schema", kSchema}, {"plan_id", id}, {"policy", header}, {"kernels", serialized}};
-    return CanonicalPlan(std::move(id), report_gap, std::move(kernels), std::move(canonical),
+    return CanonicalPlan(std::move(id), plan_policy, std::move(kernels), std::move(canonical),
                          picosha2::hash256_hex_string(bytes));
   } catch (const Json::exception& error) {
     fail(std::string("invalid JSON: ") + error.what());

@@ -4,13 +4,16 @@
  */
 #pragma once
 
-// Included once after shared callback state and launch geometry declarations.
+// NVBit callback implementation details. Included once after the shared tool
+// state and launch geometry definitions in cutracer.cu.
+#include "plan_runtime.h"
 #include "runtime_identity.h"
 
 static KernelFuncMetadata& get_or_create_kernel_func_metadata(CUfunction func, CUcontext ctx);
 static void dump_kernel_cubin(CUcontext ctx, CUfunction func, KernelFuncMetadata& meta);
 
 static cutracer::RuntimeIdentitySession runtime_identity;
+static std::atomic<bool> runtime_plan_requested{false};
 static cutracer::RuntimeGraphTracker runtime_graph_tracker;
 
 static void runtime_identity_error(const std::string& reason) {
@@ -37,6 +40,32 @@ static void runtime_event(F&& callback) {
 static bool reused_function_handle(CUcontext ctx, CUfunction func) {
   const auto state = ctx_state_map.find(ctx);
   return state != ctx_state_map.end() && state->second && state->second->retired_function_handles.count(func);
+}
+
+static void runtime_plan_error(const std::string& reason) {
+  if (auto plan = cutracer::current_runtime_plan()) {
+    try {
+      plan->disable(reason);
+    } catch (const std::exception& error) {
+      loprintf("ERROR: could not finalize plan failure: %s\n", error.what());
+    }
+  }
+  runtime_event([&](auto& ledger) { ledger.plan_event("plan_error", {{"reason", reason}}); });
+  fprintf(stderr, "CUTracer: instrumentation plan disabled: %s\n", reason.c_str());
+  fflush(stderr);
+}
+
+template <class F>
+static auto apply_runtime_plan(F&& callback) -> decltype(callback(std::declval<cutracer::PlanRuntime&>())) {
+  using Result = decltype(callback(std::declval<cutracer::PlanRuntime&>()));
+  if (auto plan = cutracer::current_runtime_plan()) {
+    try {
+      return callback(*plan);
+    } catch (const std::exception& error) {
+      runtime_plan_error(error.what());
+    }
+  }
+  if constexpr (!std::is_void_v<Result>) return Result{};
 }
 
 static void identify_runtime_function(CUcontext ctx, CUfunction func, KernelFuncMetadata& meta) {
@@ -130,7 +159,7 @@ static nlohmann::json identify_runtime_launch(CUcontext ctx, CUfunction func, ui
          {"graph_node_handle", graph_handle},
          {"graph_invocation", graph_invocation ? nlohmann::json(*graph_invocation) : nlohmann::json(nullptr)},
          {"capture_selected", selected},
-         {"instrumentation_protocol", "legacy/v1"}});
+         {"instrumentation_protocol", runtime_plan_requested.load() ? "cutracer.plan-runtime/1" : "legacy/v1"}});
   });
   return result;
 }
@@ -149,14 +178,14 @@ static void forget_runtime_module(CUcontext ctx, CUmodule module) {
   const auto owned = [&](const KernelFuncMetadata& meta) {
     return meta.owner_context == ctx && (!module || meta.owner_module == module);
   };
-  if (std::none_of(kernel_metadata_by_func.begin(), kernel_metadata_by_func.end(),
-                   [&](const auto& entry) { return owned(entry.second); })) {
-    return;
-  }
+  const bool traced = std::any_of(kernel_metadata_by_func.begin(), kernel_metadata_by_func.end(),
+                                  [&](const auto& entry) { return owned(entry.second); });
   // Context teardown passes no module and has already stopped the receiver.
   const auto state_it = ctx_state_map.find(ctx);
   CTXstate* const state = state_it == ctx_state_map.end() ? nullptr : state_it->second;
-  wait_for_receiver_boundary(state);
+  if (traced) wait_for_receiver_boundary(state);
+  if (runtime_plan_requested.load()) apply_runtime_plan([&](auto& plan) { plan.forget_module(ctx, module); });
+  if (!traced) return;
   // Driver unload has completed. Retire cached metadata along with the real
   // module lifetime so a reused CUfunction cannot inherit the previous binary.
   for (auto it = kernel_metadata_by_func.begin(); it != kernel_metadata_by_func.end();) {
@@ -201,6 +230,12 @@ static void finish_runtime_graph(CUcontext ctx, CTXstate* ctx_state, CUstream st
                       kernel_completed && exit.matched && !ctx_state->channel_failed,
                       channel_drained && exit.matched && !ctx_state->channel_failed);
     });
+    if (runtime_plan_requested.load()) {
+      const bool done = kernel_completed && exit.matched && !ctx_state->channel_failed;
+      const bool drained = channel_drained && exit.matched && !ctx_state->channel_failed;
+      apply_runtime_plan([&](auto& plan) { plan.device_complete(ctx, id, done, drained); });
+      ctx_state->capture_completions.request({id, done, drained, done && drained ? "" : "graph_completion_unverified"});
+    }
   }
 }
 
@@ -242,7 +277,8 @@ static void observe_runtime_module(CUcontext ctx, int is_exit, nvbit_api_cuda_t 
 
 static void start_runtime_identity() {
   const char* enabled = std::getenv("CUTRACER_RUNTIME_IDENTITY");
-  if (!enabled || std::string(enabled) != "1") return;
+  // A plan binds every capture to its launch record, so it implies the manifest.
+  if ((!enabled || std::string(enabled) != "1") && !std::getenv("CUTRACER_INSTRUMENTATION_PLAN")) return;
   try {
     Dl_info info{};
     if (!dladdr(reinterpret_cast<void*>(&nvbit_at_init), &info) || !info.dli_fname) {
@@ -276,3 +312,33 @@ static void start_runtime_identity() {
   }
 }
 
+static void init_runtime_observation() {
+  start_runtime_identity();
+  if (const auto* path = std::getenv("CUTRACER_INSTRUMENTATION_PLAN")) {
+    runtime_plan_requested.store(true);
+    try {
+      if (!runtime_identity.active()) {
+        throw std::runtime_error("Plan capture requires runtime identity");
+      }
+      for (const char* option :
+           {"CUTRACER_INSTRUMENT", "CUTRACER_ANALYSIS", "KERNEL_FILTERS", "INSTR_BEGIN", "INSTR_END",
+            "CUTRACER_INSTR_CATEGORIES", "CUTRACER_INSTRUMENT_IPOINT", "CUTRACER_INSTRUMENT_IPOINT_UNIFORM"}) {
+        const auto* value = std::getenv(option);
+        if (value && *value) {
+          throw std::runtime_error(std::string("Plan capture cannot combine legacy selection or analysis: ") + option);
+        }
+      }
+      if (trace_format != 1 && trace_format != 2) {
+        throw std::runtime_error("Plan capture requires NDJSON trace format 1 or 2");
+      }
+      cutracer::publish_runtime_plan(std::make_shared<cutracer::PlanRuntime>(
+          cutracer::plan::PlanLoader::load(path), output_dir, [](const std::string& type, nlohmann::json data) {
+            if (!runtime_identity.event([&](auto& ledger) { ledger.plan_event(type, std::move(data)); })) {
+              throw cutracer::plan::PlanError("Runtime identity session ended");
+            }
+          }));
+    } catch (const std::exception& error) {
+      runtime_plan_error(error.what());
+    }
+  }
+}

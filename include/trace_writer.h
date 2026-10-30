@@ -270,6 +270,8 @@ class TraceWriter {
    * flush can still fail; only a completion record confirms the capture.
    */
   bool write_trace(const TraceRecord& record);
+  // Append one already serialized JSON record; the caller supplies no newline.
+  bool write_encoded_record(const std::string& record);
 
   /**
    * @brief Write a metadata JSON object as the first line(s) of the trace file.

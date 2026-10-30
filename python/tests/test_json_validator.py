@@ -21,6 +21,7 @@ from tests.test_base import (
     BaseValidationTest,
     INVALID_SCHEMA_NDJSON,
     INVALID_SYNTAX_NDJSON,
+    PLAN_CAPTURE_NDJSON,
     REG_TRACE_NDJSON,
     REG_TRACE_NDJSON_RECORD_COUNT,
     REG_TRACE_NDJSON_ZST,
@@ -92,6 +93,12 @@ class JsonValidatorTest(BaseValidationTest):
         self.assertFalse(result["valid"])
         self.assertEqual(result["record_count"], 1)
         self.assertIn("channel_drained", result["errors"][0])
+
+    def test_plan_capture_counts_only_observations(self) -> None:
+        result = validate_json_trace(PLAN_CAPTURE_NDJSON)
+        self.assertTrue(result["valid"], result["errors"])
+        self.assertEqual(result["message_type"], "plan_observation")
+        self.assertEqual(result["record_count"], 4)
 
     def test_valid_json_with_an_unsupported_record_is_not_a_valid_trace(self) -> None:
         for record in ({"type": "unknown"}, 42):

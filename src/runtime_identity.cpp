@@ -384,6 +384,20 @@ void RuntimeIdentityLedger::gap(const std::string& reason) {
   emit("gap", {{"reason", reason}});
 }
 
+void RuntimeIdentityLedger::plan_event(const std::string& type, Json data) {
+  static const std::set<std::string> types = {"plan_loaded", "plan_applied", "plan_capture_completion", "plan_gap",
+                                              "plan_error"};
+  if (!types.count(type)) {
+    throw std::invalid_argument("Unknown plan runtime event");
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  live();
+  if (type == "plan_gap" || type == "plan_error") {
+    gap_ = true;
+  }
+  emit(type, std::move(data));
+}
+
 void RuntimeIdentityLedger::finish() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (finished_) return;

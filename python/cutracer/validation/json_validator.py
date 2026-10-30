@@ -42,7 +42,12 @@ class _JsonSyntaxSummary:
             self.type_error = self.type_error or "JSON trace record must be an object"
             return
         message_type = record.get("type")
-        if message_type in ("kernel_metadata", "capture_completion"):
+        if message_type in (
+            "kernel_metadata",
+            "capture_completion",
+            "plan_applied",
+            "plan_capture_completion",
+        ):
             self.metadata_count += 1
         elif not isinstance(message_type, str) or message_type not in SCHEMAS_BY_TYPE:
             self.type_error = (

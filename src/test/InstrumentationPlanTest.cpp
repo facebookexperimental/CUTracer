@@ -103,6 +103,20 @@ TEST_F(InstrumentationPlanTest, TypedSelectorsAndIdentity) {
   EXPECT_EQ(plan.canonical()["kernels"][0]["configs"][0]["points"][0]["pc"], "0x10");
 }
 
+TEST_F(InstrumentationPlanTest, IdentityMismatchPolicyIsErrorOrSkip) {
+  const auto strict = PlanLoader::parse(example().dump());
+  EXPECT_FALSE(strict.skip_identity_mismatch());
+  auto j = example();
+  j["policy"]["identity_mismatch"] = "skip";
+  const auto skip = PlanLoader::parse(j.dump());
+  EXPECT_TRUE(skip.skip_identity_mismatch());
+  EXPECT_TRUE(skip.report_unsupported_as_gap());
+  EXPECT_EQ(skip.canonical()["policy"]["identity_mismatch"], "skip");
+  EXPECT_NE(skip.canonical_sha256(), strict.canonical_sha256());
+  j["policy"]["identity_mismatch"] = "ignore";
+  EXPECT_THROW(PlanLoader::parse(j.dump()), PlanError);
+}
+
 TEST_F(InstrumentationPlanTest, JsonNdjsonAndReorderingHaveSameCanonicalIdentity) {
   auto j = example();
   auto second = j["kernels"][0];

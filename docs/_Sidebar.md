@@ -7,6 +7,7 @@
 ### 📚 Reference
 - [Configuration](Configuration.md)
 - [Instrumentation Modes](Instrumentation-Modes.md)
+- [Instrumentation Plans](Instrumentation-Plans.md)
 - [Outputs and File Formats](Outputs-and-File-Formats.md)
 - [API and Data Structures](API-and-Data-Structures.md)
 

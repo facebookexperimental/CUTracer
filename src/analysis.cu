@@ -27,6 +27,7 @@
 #include "env_config.h"
 #include "instrument.h"
 #include "log.h"
+#include "plan_runtime.h"
 #include "trace_writer.h"
 #include "utils/channel.hpp"
 #include "warp_status.h"
@@ -347,6 +348,8 @@ static uint64_t get_kernel_launch_id(const message_header_t* header) {
       return ((const mem_value_access_t*)header)->kernel_launch_id;
     case MSG_TYPE_TMA_ACCESS:
       return ((const tma_access_t*)header)->kernel_launch_id;
+    case MSG_TYPE_PLAN_OBSERVATION:
+      return ((const plan_observation_t*)header)->kernel_launch_id;
     default:
       return 0;  // Invalid/unknown message type - no kernel ID available
   }
@@ -364,6 +367,8 @@ static size_t get_message_size(message_type_t type) {
       return sizeof(mem_value_access_t);
     case MSG_TYPE_TMA_ACCESS:
       return sizeof(tma_access_t);
+    case MSG_TYPE_PLAN_OBSERVATION:
+      return sizeof(plan_observation_t);
     default:
       return 0;
   }
@@ -847,7 +852,7 @@ static void mark_dropped_record(CTXstate* state, uint64_t launch_id, const std::
   }
 }
 
-static void finish_requested_captures(CTXstate* state) {
+static void finish_requested_captures(CUcontext ctx, CTXstate* state) {
   for (const auto& request : state->capture_completions.take_at_chunk_boundary()) {
     std::unique_lock<std::shared_mutex> lock(state->writers_mutex);
     const auto writer = state->trace_writers.find(request.launch_id);
@@ -862,6 +867,13 @@ static void finish_requested_captures(CTXstate* state) {
     }
     if (!request.channel_drained) {
       writer->second->mark_capture_error("channel_drain_unverified");
+    }
+    if (auto plan = cutracer::current_runtime_plan()) {
+      try {
+        plan->finish_trace(ctx, request.launch_id, *writer->second);
+      } catch (const std::exception& error) {
+        writer->second->mark_capture_error(std::string("plan_completion_error: ") + error.what());
+      }
     }
     writer->second->finish(request.launch_id, request.kernel_completed, request.channel_drained);
     delete writer->second;
@@ -899,6 +911,9 @@ void* recv_thread_fun(void* args) {
 
   // Used to detect when a new kernel begins.
   uint64_t last_seen_kernel_launch_id = UINT64_MAX;  // Initial invalid value
+  // A plan may send nothing before its kernel ends, so its kernel timeout
+  // counts from the launch of a captured kernel instead of its first data.
+  const bool plan_capture = cutracer::current_runtime_plan() != nullptr;
 
   // Timer for periodic TraceWriter flush (ensures data reaches disk
   // even when json_buffer_ hasn't hit the 1MB threshold, e.g. during kernel hang).
@@ -909,7 +924,7 @@ void* recv_thread_fun(void* args) {
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     // NVBit flush waits for recv() to copy and acknowledge its final chunk.
     // Consume requests here, after fully parsing the preceding copied chunk.
-    finish_requested_captures(ctx_state);
+    finish_requested_captures(ctx, ctx_state);
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, channel_buffer_size);
 
     if (num_recv_bytes > 0) {
@@ -931,7 +946,7 @@ void* recv_thread_fun(void* args) {
         message_header_t* header = (message_header_t*)&recv_buffer[num_processed_bytes];
         int32_t raw_type;
         memcpy(&raw_type, header, sizeof(raw_type));
-        if (raw_type < MSG_TYPE_REG_INFO || raw_type > MSG_TYPE_TMA_ACCESS) {
+        if (raw_type < MSG_TYPE_REG_INFO || raw_type >= MSG_TYPE_COUNT) {
           loprintf("ERROR: unknown channel message type %d at offset %u/%u\n", raw_type, num_processed_bytes,
                    num_recv_bytes);
           mark_channel_failure(ctx_state, "unknown_channel_message");
@@ -959,6 +974,19 @@ void* recv_thread_fun(void* args) {
                      raw_type);
           }
           mark_channel_failure(ctx_state, "record_without_capture_writer");
+          num_processed_bytes += message_size;
+          continue;
+        }
+        if (message_type == MSG_TYPE_PLAN_OBSERVATION) {
+          try {
+            auto plan = cutracer::current_runtime_plan();
+            if (!plan) throw std::runtime_error("plan packet without a loaded plan");
+            std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+            plan->consume(ctx, *reinterpret_cast<const plan_observation_t*>(header),
+                          *ctx_state->trace_writers.at(current_launch_id));
+          } catch (const std::exception& error) {
+            mark_channel_failure(ctx_state, std::string("plan_packet_error: ") + error.what());
+          }
           num_processed_bytes += message_size;
           continue;
         }
@@ -1293,7 +1321,7 @@ void* recv_thread_fun(void* args) {
     }
 
     // Resource protection (independent, always active when configured)
-    if (kernel_timeout_s > 0 && last_seen_kernel_launch_id != UINT64_MAX) {
+    if (kernel_timeout_s > 0 && (plan_capture || last_seen_kernel_launch_id != UINT64_MAX)) {
       check_kernel_timeout(ctx_state, last_seen_kernel_launch_id);
     }
     // No-data timeout: does NOT require last_seen_kernel_launch_id because
@@ -1307,7 +1335,7 @@ void* recv_thread_fun(void* args) {
     }
   }
 
-  finish_requested_captures(ctx_state);
+  finish_requested_captures(ctx, ctx_state);
 
   // Dump data for the very last kernel if it exists.
   if (last_seen_kernel_launch_id != UINT64_MAX) {

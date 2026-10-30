@@ -83,6 +83,11 @@ struct Kernel {
   std::vector<Config> configs;
 };
 
+struct Policy {
+  bool report_unsupported_as_gap = false;
+  bool skip_identity_mismatch = false;
+};
+
 // Parsing is transactional. Only a completely validated canonical plan can be
 // published, and runtime consumers get a const view. Parsing does not certify
 // that any observation is supported or applied by an instrumentation backend.
@@ -93,7 +98,12 @@ class CanonicalPlan {
   }
 
   bool report_unsupported_as_gap() const {
-    return report_gap_;
+    return policy_.report_unsupported_as_gap;
+  }
+
+  // A launch of a planned entry from another binary is left uninstrumented.
+  bool skip_identity_mismatch() const {
+    return policy_.skip_identity_mismatch;
   }
 
   const std::vector<Kernel>& kernels() const {
@@ -114,10 +124,10 @@ class CanonicalPlan {
 
  private:
   friend class PlanLoader;
-  CanonicalPlan(std::string id, bool report_gap, std::vector<Kernel> kernels, nlohmann::json canonical,
+  CanonicalPlan(std::string id, Policy flags, std::vector<Kernel> kernels, nlohmann::json canonical,
                 std::string source_sha256);
   std::string id_;
-  bool report_gap_;
+  Policy policy_;
   std::vector<Kernel> kernels_;
   nlohmann::json canonical_;
   std::string canonical_sha256_;

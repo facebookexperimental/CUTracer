@@ -1,0 +1,168 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/facebookexperimental/CUTracer/schemas/plan_capture_completion.schema.json",
+  "title": "CUTracer Instrumentation Plan Capture Completion",
+  "description": "Per-configuration accounting written before the capture_completion footer of a plan capture. complete is true only when every selected configuration received, accounted for and wrote every device record.",
+  "type": "object",
+  "required": [
+    "type",
+    "schema",
+    "canonical_sha256",
+    "launch",
+    "grid_launch_id",
+    "kernel_completed",
+    "channel_drained",
+    "counters_available",
+    "complete",
+    "configs",
+    "trace_footer_required"
+  ],
+  "definitions": {
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "plan_capture_completion"
+    },
+    "schema": {
+      "const": "cutracer.plan-completion/v1"
+    },
+    "canonical_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "launch": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "grid_launch_id": {
+      "$ref": "#/definitions/count"
+    },
+    "kernel_completed": {
+      "type": "boolean"
+    },
+    "channel_drained": {
+      "type": "boolean"
+    },
+    "counters_available": {
+      "type": "boolean",
+      "description": "Device counters were read after verified CUDA completion and channel drain"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "configs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "config_index",
+          "config_id",
+          "status",
+          "error",
+          "selected",
+          "expected_entry_warps",
+          "entry_warps",
+          "attempted_records",
+          "device_records",
+          "device_dropped",
+          "attempted_bytes",
+          "device_bytes",
+          "received_records",
+          "written_records",
+          "json_bytes"
+        ],
+        "properties": {
+          "config_index": {
+            "$ref": "#/definitions/count"
+          },
+          "config_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "enum": ["complete", "incomplete", "not_selected"]
+          },
+          "error": {
+            "type": "string",
+            "description": "Empty unless the configuration hit a gap, a budget or an integrity error, or selected no thread of the launch (no_selected_warps_in_launch)"
+          },
+          "selected": {
+            "type": "boolean"
+          },
+          "expected_entry_warps": {
+            "$ref": "#/definitions/count"
+          },
+          "entry_warps": {
+            "$ref": "#/definitions/count"
+          },
+          "attempted_records": {
+            "$ref": "#/definitions/count"
+          },
+          "device_records": {
+            "$ref": "#/definitions/count"
+          },
+          "device_dropped": {
+            "$ref": "#/definitions/count"
+          },
+          "attempted_bytes": {
+            "$ref": "#/definitions/count"
+          },
+          "device_bytes": {
+            "$ref": "#/definitions/count"
+          },
+          "received_records": {
+            "$ref": "#/definitions/count"
+          },
+          "written_records": {
+            "$ref": "#/definitions/count"
+          },
+          "json_bytes": {
+            "$ref": "#/definitions/count"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "trace_footer_required": {
+      "const": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "complete": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kernel_completed": {
+            "const": true
+          },
+          "channel_drained": {
+            "const": true
+          },
+          "counters_available": {
+            "const": true
+          },
+          "configs": {
+            "items": {
+              "properties": {
+                "status": {
+                  "enum": ["complete", "not_selected"]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

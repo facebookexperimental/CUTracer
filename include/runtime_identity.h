@@ -82,6 +82,7 @@ class RuntimeIdentityLedger {
   Json launch(uint64_t context, uint64_t function, uint64_t launch_id, Json attributes);
   void complete(uint64_t context, uint64_t launch_id, bool kernel_completed, bool channel_drained);
   void gap(const std::string& reason);
+  void plan_event(const std::string& type, Json data);
   void finish();
 
   const std::string& process_key() const {

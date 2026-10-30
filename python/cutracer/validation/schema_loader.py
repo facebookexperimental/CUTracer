@@ -16,6 +16,8 @@ Schema files are located in the 'schemas/' subdirectory:
 - tma_trace.schema.json: Schema for MSG_TYPE_TMA_ACCESS records
 - opcode_only.schema.json: Schema for opcode-only trace records
 - cuda_gdb_opcode_only.schema.json: Schema for cuda-gdb opcode_only records
+- plan_applied.schema.json, plan_observation.schema.json and
+  plan_capture_completion.schema.json: Schemas for instrumentation plan captures
 """
 
 from __future__ import annotations
@@ -78,6 +80,9 @@ DEBUGGER_OPCODE_ONLY_SCHEMA: dict[str, Any] = _load_schema("cuda_gdb_opcode_only
 DELAY_CONFIG_SCHEMA: dict[str, Any] = _load_schema("delay_config")
 KERNEL_METADATA_SCHEMA: dict[str, Any] = _load_schema("kernel_metadata")
 CAPTURE_COMPLETION_SCHEMA: dict[str, Any] = _load_schema("capture_completion")
+PLAN_APPLIED_SCHEMA: dict[str, Any] = _load_schema("plan_applied")
+PLAN_OBSERVATION_SCHEMA: dict[str, Any] = _load_schema("plan_observation")
+PLAN_CAPTURE_COMPLETION_SCHEMA: dict[str, Any] = _load_schema("plan_capture_completion")
 
 # Mapping from type field to schema (for trace records with "type" field).
 # Keys are the exact `type` strings emitted by the C++ writer
@@ -93,4 +98,7 @@ SCHEMAS_BY_TYPE: dict[str, dict[str, Any]] = {
     "opcode_only": OPCODE_ONLY_SCHEMA,
     "kernel_metadata": KERNEL_METADATA_SCHEMA,
     "capture_completion": CAPTURE_COMPLETION_SCHEMA,
+    "plan_applied": PLAN_APPLIED_SCHEMA,
+    "plan_observation": PLAN_OBSERVATION_SCHEMA,
+    "plan_capture_completion": PLAN_CAPTURE_COMPLETION_SCHEMA,
 }

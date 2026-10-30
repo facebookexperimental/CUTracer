@@ -71,6 +71,36 @@ TEST_F(CaptureCompletionTest, FinishedCaptureWritesCompletionAfterRecords) {
   EXPECT_EQ(rows.back(), expected);
 }
 
+TEST_F(CaptureCompletionTest, EncodedRecordsCountPayloadsButNotMetadata) {
+  TraceWriter writer(path("encoded"), 2, 64);
+  writer.write_metadata({{"type", "test_metadata"}});
+  const nlohmann::json payload = {{"type", "test_record"}, {"value", 0}};
+  const auto encoded = payload.dump();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(writer.write_encoded_record(encoded));
+  }
+  writer.write_metadata({{"type", "test_metadata"}});
+  writer.finish(0, true, true);
+  const auto rows = records("encoded");
+  ASSERT_EQ(rows.size(), 6);
+  EXPECT_EQ(rows[1], payload);
+  EXPECT_EQ(rows.back()["trace_records_written"], 3);
+  EXPECT_EQ(rows.back()["status"], "complete");
+  EXPECT_FALSE(writer.write_encoded_record(encoded));
+}
+
+TEST_F(CaptureCompletionTest, DisabledEncodedWriterCannotPublishSuccessfulCapture) {
+  TraceWriter writer(path("encoded_disabled"), 2);
+  ASSERT_TRUE(writer.write_encoded_record(R"({"type":"test_record"})"));
+  writer.disable();
+  EXPECT_FALSE(writer.write_encoded_record(R"({"type":"test_record"})"));
+  writer.finish(3, true, true);
+  const auto footer = records("encoded_disabled").back();
+  EXPECT_EQ(footer["status"], "incomplete");
+  EXPECT_EQ(footer["dropped_records"], 1);
+  EXPECT_EQ(footer["trace_records_written"], 1);
+}
+
 TEST_F(CaptureCompletionTest, ClosingWithoutVerifiedCompletionHasNoCompleteFooter) {
   {
     TraceWriter writer(path("unfinished"), 2);

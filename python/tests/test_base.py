@@ -20,6 +20,7 @@ REG_TRACE_LOG = EXAMPLE_INPUTS_DIR / "reg_trace_sample.log"
 KERNEL_EVENTS_NDJSON = EXAMPLE_INPUTS_DIR / "kernel_events_sample.ndjson"
 INVALID_SYNTAX_NDJSON = EXAMPLE_INPUTS_DIR / "invalid_syntax.ndjson"
 INVALID_SCHEMA_NDJSON = EXAMPLE_INPUTS_DIR / "invalid_schema.ndjson"
+PLAN_CAPTURE_NDJSON = EXAMPLE_INPUTS_DIR / "plan_capture_sample.ndjson"
 RACECHECK_CLEAN = EXAMPLE_INPUTS_DIR / "racecheck_clean.txt"
 RACECHECK_HAZARD = EXAMPLE_INPUTS_DIR / "racecheck_hazard.txt"
 

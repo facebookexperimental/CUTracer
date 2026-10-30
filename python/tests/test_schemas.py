@@ -17,7 +17,7 @@ from cutracer.validation.schema_loader import (
     REG_INFO_SCHEMA,
     SCHEMAS_BY_TYPE,
 )
-from tests.test_base import REG_TRACE_NDJSON
+from tests.test_base import PLAN_CAPTURE_NDJSON, REG_TRACE_NDJSON
 
 
 class SchemaTest(unittest.TestCase):
@@ -370,6 +370,72 @@ class DelayConfigSchemaTest(unittest.TestCase):
         }
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(invalid_config, DELAY_CONFIG_SCHEMA)
+
+
+def plan_capture():
+    """One launch of an instrumentation plan capture, in file order."""
+    with PLAN_CAPTURE_NDJSON.open() as source:
+        return [json.loads(line) for line in source]
+
+
+def plan_record(kind):
+    """The first record of a type in the plan capture; observations carry R5."""
+    return next(
+        r
+        for r in plan_capture()
+        if r["type"] == kind and (kind != "plan_observation" or r["registers"])
+    )
+
+
+class PlanCaptureSchemaTest(unittest.TestCase):
+    """Tests for the records of an instrumentation plan capture."""
+
+    def assert_invalid(self, record):
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(record, SCHEMAS_BY_TYPE[record["type"]])
+
+    def test_plan_capture_records_pass(self):
+        for record in plan_capture():
+            with self.subTest(type=record["type"]):
+                jsonschema.validate(record, SCHEMAS_BY_TYPE[record["type"]])
+
+    def test_plan_header_does_not_mix_with_legacy_capture_config(self):
+        header = plan_capture()[0]
+        header["capture_config"]["instr_begin"] = 0
+        self.assert_invalid(header)
+        header = plan_capture()[0]
+        header["capture_config"]["applied_plan_required"] = False
+        self.assert_invalid(header)
+
+    def test_plan_observation_lanes_and_words(self):
+        observation = plan_record("plan_observation")
+        for registers in (
+            {"R5": ["0x2a"] * 31},
+            {"R5": ["0x2A"] + [None] * 31},
+            {"R5": ["0x100000000"] + [None] * 31},
+            {"X5": [None] * 32},
+        ):
+            with self.subTest(registers=registers):
+                self.assert_invalid({**observation, "registers": registers})
+        self.assert_invalid({**observation, "selected_mask": "0x09"})
+
+    def test_complete_plan_capture_needs_complete_configs(self):
+        completion = plan_record("plan_capture_completion")
+        completion["configs"][0]["status"] = "incomplete"
+        self.assert_invalid(completion)
+        completion["complete"] = False
+        jsonschema.validate(completion, SCHEMAS_BY_TYPE["plan_capture_completion"])
+        completion = plan_record("plan_capture_completion")
+        completion["counters_available"] = False
+        self.assert_invalid(completion)
+
+    def test_plan_applied_rejects_unknown_observations(self):
+        applied = plan_record("plan_applied")
+        point = applied["configs"][0]["configuration"]["points"][0]
+        point["observations"] = [{"kind": "reg_trace", "registers": []}]
+        self.assert_invalid(applied)
+        point["observations"] = [{"kind": "branch_trace"}]
+        self.assert_invalid(applied)
 
 
 if __name__ == "__main__":

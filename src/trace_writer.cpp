@@ -149,6 +149,22 @@ void TraceWriter::write_metadata(const nlohmann::json& metadata) {
   json_buffer_ += metadata.dump() + "\n";
 }
 
+bool TraceWriter::write_encoded_record(const std::string& record) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (finished_ || !is_enabled() || trace_mode_ == TraceMode::TEXT) {
+    ++dropped_records_;
+    capture_errors_.insert("record_write_rejected");
+    return false;
+  }
+  json_buffer_ += record;
+  json_buffer_ += '\n';
+  ++buffered_trace_records_;
+  if (json_buffer_.size() >= buffer_threshold_) {
+    flush_locked();
+  }
+  return enabled_;
+}
+
 bool TraceWriter::write_trace(const TraceRecord& record) {
   std::lock_guard<std::mutex> lk(mu_);
   if (finished_) {

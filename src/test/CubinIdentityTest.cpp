@@ -6,7 +6,10 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 
 #include "TemporaryDirectoryTest.h"
@@ -15,6 +18,30 @@
 namespace {
 
 class CubinIdentityTest : public cutracer::test::TemporaryDirectoryTest {};
+
+// ELF64 little-endian header of an EM_CUDA executable with the sm_100a flag word.
+std::string sm100a_cubin(uint32_t flags = 0x0a006402) {
+  std::string bytes(128, '\0');
+  bytes.replace(0, 7,
+                std::string("\x7f"
+                            "ELF\x02\x01\x01",
+                            7));
+  bytes[7] = 65;
+  bytes[8] = 8;
+  const auto put = [&](size_t offset, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) {
+      bytes[offset + i] = static_cast<char>(value >> (8 * i));
+    }
+  };
+  put(16, 0x00be0002);
+  put(48, flags);
+  return bytes;
+}
+
+void write_file(const std::string& path, const std::string& bytes) {
+  std::ofstream file(path, std::ios::binary);
+  file << bytes;
+}
 
 TEST_F(CubinIdentityTest, CubinIdentityUsesFileBytes) {
   {
@@ -79,6 +106,34 @@ TEST_F(CubinIdentityTest, MillionByteStandardVector) {
     ASSERT_TRUE(file.good());
   }
   EXPECT_EQ(cubin_file_sha256(path("cubin")), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+TEST_F(CubinIdentityTest, DumpedCubinNamesResolveAgainstTheOutputDirectory) {
+  EXPECT_EQ(cubin_artifact_path("", "kernel.cubin"), "kernel.cubin");
+  EXPECT_EQ(cubin_artifact_path("traces", "kernel.cubin"), "traces/kernel.cubin");
+  EXPECT_EQ(cubin_artifact_path("traces/", "kernel.cubin"), "traces/kernel.cubin");
+  EXPECT_EQ(cubin_artifact_path("traces", "/data/kernel.cubin"), "/data/kernel.cubin");
+}
+
+TEST_F(CubinIdentityTest, PlanTargetReadsTheCubinUnderTheOutputDirectory) {
+  ASSERT_TRUE(std::filesystem::create_directory(path("traces")));
+  const std::string name = "plan-target-test.cubin";
+  write_file(path("traces/" + name), sm100a_cubin());
+  const auto sha256 = cubin_file_sha256(path("traces/" + name));
+  EXPECT_EQ(plan_cubin_target(cubin_artifact_path(path("traces"), name), sha256, 100), "sm_100a");
+  // The recorded name alone is relative to the trace directory, not the working directory.
+  EXPECT_THROW(plan_cubin_target(name, sha256, 100), std::runtime_error);
+}
+
+TEST_F(CubinIdentityTest, PlanTargetRejectsChangedBytesAndUnqualifiedTargets) {
+  write_file(path("kernel.cubin"), sm100a_cubin());
+  const auto sha256 = cubin_file_sha256(path("kernel.cubin"));
+  EXPECT_THROW(plan_cubin_target(path("kernel.cubin"), std::string(64, '0'), 100), std::runtime_error);
+  EXPECT_THROW(plan_cubin_target(path("kernel.cubin"), sha256, 90), std::runtime_error);
+  write_file(path("other.cubin"), sm100a_cubin(0x005a0502));
+  EXPECT_THROW(plan_cubin_target(path("other.cubin"), cubin_file_sha256(path("other.cubin")), 100), std::runtime_error);
+  write_file(path("short.cubin"), sm100a_cubin().substr(0, 63));
+  EXPECT_THROW(plan_cubin_target(path("short.cubin"), cubin_file_sha256(path("short.cubin")), 100), std::runtime_error);
 }
 
 }  // namespace
