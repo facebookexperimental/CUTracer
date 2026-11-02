@@ -79,7 +79,9 @@ TEST_F(RuntimeIdentityTest, CaptureFailuresRetireWithTheirModuleAndContext) {
   bool fail = true;
   auto capture = [&]() -> Json {
     ++attempts;
-    if (fail) throw std::runtime_error("cubin unavailable");
+    if (fail) {
+      throw std::runtime_error("cubin unavailable");
+    }
     return function_attributes();
   };
   EXPECT_THROW(ledger.capture_function(1, 2, 3, capture), std::runtime_error);
@@ -102,7 +104,9 @@ TEST_F(RuntimeIdentityTest, CaptureFailuresRetireWithTheirModuleAndContext) {
 TEST(RuntimeFunctionCaptureTest, FailedPublicationDoesNotYieldACachedIdentity) {
   bool fail = true;
   RuntimeIdentityLedger ledger(Json{{"pid", 123}}, [&](const auto& record) {
-    if (fail && record.at("type") == "function") throw std::runtime_error("sink failed");
+    if (fail && record.at("type") == "function") {
+      throw std::runtime_error("sink failed");
+    }
   });
   ledger.context_begin(1);
   int attempts = 0;
@@ -120,7 +124,9 @@ TEST(RuntimeFunctionCaptureTest, FailedPublicationDoesNotYieldACachedIdentity) {
 TEST(RuntimeFunctionCaptureTest, FailedDirectPublicationLeavesTheFunctionUnavailable) {
   bool fail = true;
   RuntimeIdentityLedger ledger(Json{{"pid", 123}}, [&](const auto& record) {
-    if (fail && record.at("type") == "function") throw std::runtime_error("sink failed");
+    if (fail && record.at("type") == "function") {
+      throw std::runtime_error("sink failed");
+    }
   });
   ledger.context_begin(1);
   EXPECT_THROW(ledger.function(1, 2, 3, function_attributes()), std::runtime_error);
@@ -163,7 +169,9 @@ TEST(RuntimeIdentityRetirementTest, FailedEndRecordsStillRetireTheirLifetimes) {
     ledger.module_load(1, 2, "cuModuleLoadData");
     ledger.capture_function(1, 2, 3, [] { return function_attributes('a'); });
     ledger.launch(1, 3, 0, Json::object());
-    if (failed != "launch_incomplete") ledger.complete(1, 0, true, true);
+    if (failed != "launch_incomplete") {
+      ledger.complete(1, 0, true, true);
+    }
     fail = true;
     if (failed == "module_end") {
       EXPECT_THROW(ledger.module_unload(1, 2), std::runtime_error);
@@ -186,7 +194,9 @@ TEST(RuntimeIdentityRetirementTest, UnpublishedLaunchIsNeverPending) {
   bool fail = false;
   std::vector<Json> events;
   RuntimeIdentityLedger ledger(Json{{"pid", 123}}, [&](const Json& record) {
-    if (fail && record.at("type") == "launch") throw std::runtime_error("sink failed");
+    if (fail && record.at("type") == "launch") {
+      throw std::runtime_error("sink failed");
+    }
     events.push_back(record);
   });
   ledger.context_begin(1);
@@ -343,11 +353,15 @@ TEST_F(RuntimeIdentityTest, ConcurrentCallbacksDoNotReuseSequenceOrLifetimes) {
       ledger.context_end(i);
     });
   }
-  for (auto& thread : threads) thread.join();
+  for (auto& thread : threads) {
+    thread.join();
+  }
   std::set<std::string> contexts;
   for (size_t i = 0; i < events.size(); ++i) {
     EXPECT_EQ(events[i]["sequence"], i);
-    if (events[i]["type"] == "context_begin") contexts.insert(events[i]["data"]["context"].get<std::string>());
+    if (events[i]["type"] == "context_begin") {
+      contexts.insert(events[i]["data"]["context"].get<std::string>());
+    }
   }
   EXPECT_EQ(contexts.size(), 8);
 }
@@ -355,7 +369,9 @@ TEST_F(RuntimeIdentityTest, ConcurrentCallbacksDoNotReuseSequenceOrLifetimes) {
 TEST_F(RuntimeIdentityTest, FailedSinkCannotProduceSuccessFooter) {
   int calls = 0;
   RuntimeIdentityLedger broken(Json::object(), [&](const Json&) {
-    if (++calls > 1) throw std::runtime_error("write failed");
+    if (++calls > 1) {
+      throw std::runtime_error("write failed");
+    }
   });
   EXPECT_THROW(broken.context_begin(1), std::runtime_error);
   EXPECT_THROW(broken.finish(), std::runtime_error);
@@ -364,7 +380,9 @@ TEST_F(RuntimeIdentityTest, FailedSinkCannotProduceSuccessFooter) {
 TEST_F(RuntimeIdentityTest, TransientCompletionWriteFailureRemainsVisible) {
   bool fail = false;
   RuntimeIdentityLedger transient(Json::object(), [&](const Json& record) {
-    if (fail) throw std::runtime_error("transient sink failure");
+    if (fail) {
+      throw std::runtime_error("transient sink failure");
+    }
     events.push_back(record);
   });
   transient.context_begin(1);
@@ -419,7 +437,9 @@ TEST(RuntimeGraphTrackerTest, MismatchedStreamOrApiRetiresAllUncertainFramesOnly
 
 TEST(RuntimeGraphTrackerTest, UnmatchedExitAndExcessiveMissingExitsCannotGrowWithoutBound) {
   cutracer::RuntimeGraphTracker tracker;
-  for (size_t depth = 0; depth < cutracer::RuntimeGraphTracker::kMaxDepth; ++depth) tracker.begin(1, 10, 1);
+  for (size_t depth = 0; depth < cutracer::RuntimeGraphTracker::kMaxDepth; ++depth) {
+    tracker.begin(1, 10, 1);
+  }
   EXPECT_THROW(tracker.begin(1, 10, 1), std::logic_error);
   const auto exit = tracker.take(1, 10, 1, false);
   EXPECT_FALSE(exit.matched);
@@ -472,7 +492,9 @@ TEST(RuntimeIdentitySessionTest, FailedFinalWriteStillClosesTheSession) {
   cutracer::RuntimeIdentitySession session;
   bool fail = false;
   session.start({{"pid", 123}, {"nonce", "owner"}}, [&](const Json&) {
-    if (fail) throw std::runtime_error("write failed");
+    if (fail) {
+      throw std::runtime_error("write failed");
+    }
   });
   fail = true;
   EXPECT_THROW(session.stop(), std::runtime_error);

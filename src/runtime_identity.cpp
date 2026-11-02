@@ -16,7 +16,9 @@
 namespace cutracer {
 void RuntimeIdentitySession::start(RuntimeIdentityLedger::Json process, RuntimeIdentityLedger::Sink sink) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (ledger_) throw std::logic_error("Runtime identity session is already active");
+  if (ledger_) {
+    throw std::logic_error("Runtime identity session is already active");
+  }
   ledger_ = std::make_unique<RuntimeIdentityLedger>(std::move(process), std::move(sink));
 }
 
@@ -27,7 +29,9 @@ bool RuntimeIdentitySession::active() {
 
 bool RuntimeIdentitySession::event(const std::function<void(RuntimeIdentityLedger&)>& callback) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!ledger_) return false;
+  if (!ledger_) {
+    return false;
+  }
   callback(*ledger_);
   return true;
 }
@@ -35,7 +39,9 @@ bool RuntimeIdentitySession::event(const std::function<void(RuntimeIdentityLedge
 void RuntimeIdentitySession::stop() {
   std::lock_guard<std::mutex> lock(mutex_);
   auto ledger = std::move(ledger_);
-  if (ledger) ledger->finish();
+  if (ledger) {
+    ledger->finish();
+  }
 }
 
 namespace {
@@ -52,19 +58,24 @@ std::string read_line(const char* path) {
 
 std::string hint(const char* name) {
   const char* value = std::getenv(name);
-  if (!value) return {};
+  if (!value) {
+    return {};
+  }
   std::string result(value);
-  if (result.size() > 1024) throw std::runtime_error("Oversized runtime identity hint");
+  if (result.size() > 1024) {
+    throw std::runtime_error("Oversized runtime identity hint");
+  }
   return result;
 }
 
 template <class Map, class Predicate>
 void erase_where(Map& map, Predicate predicate) {
   for (auto it = map.begin(); it != map.end();) {
-    if (predicate(*it))
+    if (predicate(*it)) {
       it = map.erase(it);
-    else
+    } else {
       ++it;
+    }
   }
 }
 }  // namespace
@@ -75,7 +86,9 @@ uint64_t RuntimeGraphTracker::begin(uint64_t context, uint64_t stream, int api) 
     throw std::logic_error("Invalid or excessive graph contexts");
   }
   auto& frames = frames_[context];
-  if (frames.size() >= kMaxDepth) throw std::logic_error("Graph invocation depth budget exhausted");
+  if (frames.size() >= kMaxDepth) {
+    throw std::logic_error("Graph invocation depth budget exhausted");
+  }
   const auto ordinal = next_++;
   frames.push_back({ordinal, stream, api, {}});
   return ordinal;
@@ -84,14 +97,18 @@ uint64_t RuntimeGraphTracker::begin(uint64_t context, uint64_t stream, int api) 
 std::optional<uint64_t> RuntimeGraphTracker::current(uint64_t context, uint64_t stream) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto it = frames_.find(context);
-  if (it == frames_.end() || it->second.empty() || it->second.back().stream != stream) return std::nullopt;
+  if (it == frames_.end() || it->second.empty() || it->second.back().stream != stream) {
+    return std::nullopt;
+  }
   return it->second.back().ordinal;
 }
 
 void RuntimeGraphTracker::attach(uint64_t context, uint64_t stream, uint64_t ordinal, uint64_t launch) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = frames_.find(context);
-  if (it == frames_.end() || it->second.empty()) throw std::logic_error("Graph node has no invocation");
+  if (it == frames_.end() || it->second.empty()) {
+    throw std::logic_error("Graph node has no invocation");
+  }
   auto& frame = it->second.back();
   if (frame.ordinal != ordinal || frame.stream != stream || frame.launches.size() >= 1000000) {
     throw std::logic_error("Graph node invocation changed or exceeded its launch budget");
@@ -102,16 +119,22 @@ void RuntimeGraphTracker::attach(uint64_t context, uint64_t stream, uint64_t ord
 RuntimeGraphTracker::Exit RuntimeGraphTracker::take(uint64_t context, uint64_t stream, int api, bool entry_matched) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = frames_.find(context);
-  if (it == frames_.end() || it->second.empty()) return {false, {}};
+  if (it == frames_.end() || it->second.empty()) {
+    return {false, {}};
+  }
   auto& frames = it->second;
   if (entry_matched && frames.back().stream == stream && frames.back().api == api) {
     auto launches = std::move(frames.back().launches);
     frames.pop_back();
-    if (frames.empty()) frames_.erase(it);
+    if (frames.empty()) {
+      frames_.erase(it);
+    }
     return {true, std::move(launches)};
   }
   std::vector<uint64_t> incomplete;
-  for (auto& frame : frames) incomplete.insert(incomplete.end(), frame.launches.begin(), frame.launches.end());
+  for (auto& frame : frames) {
+    incomplete.insert(incomplete.end(), frame.launches.begin(), frame.launches.end());
+  }
   frames_.erase(it);
   return {false, std::move(incomplete)};
 }
@@ -129,12 +152,18 @@ Json runtime_process_identity(const std::string& tool_sha256) {
   const auto stat = read_line("/proc/self/stat");
   // comm may contain spaces or ')'. The numeric fields start after its final ')'.
   const auto end = stat.rfind(')');
-  if (end == std::string::npos) throw std::runtime_error("Malformed process stat");
+  if (end == std::string::npos) {
+    throw std::runtime_error("Malformed process stat");
+  }
   std::istringstream fields(stat.substr(end + 1));
   std::string token, start_ticks;
   for (int field = 3; field <= 22; ++field) {
-    if (!(fields >> token)) throw std::runtime_error("Incomplete process stat");
-    if (field == 22) start_ticks = token;
+    if (!(fields >> token)) {
+      throw std::runtime_error("Incomplete process stat");
+    }
+    if (field == 22) {
+      start_ticks = token;
+    }
   }
   return {{"pid", getpid()},
           {"parent_pid", getppid()},
@@ -151,12 +180,16 @@ Json runtime_process_identity(const std::string& tool_sha256) {
 
 RuntimeIdentityLedger::RuntimeIdentityLedger(Json process, Sink sink, RuntimeIdentityLimits limits)
     : sink_(std::move(sink)), limits_(limits), process_key_(runtime_digest(process)) {
-  if (!process.is_object() || !sink_) throw std::invalid_argument("Process object and runtime event sink required");
+  if (!process.is_object() || !sink_) {
+    throw std::invalid_argument("Process object and runtime event sink required");
+  }
   emit("process_start", std::move(process));
 }
 
 void RuntimeIdentityLedger::live() const {
-  if (finished_) throw std::logic_error("Runtime identity ledger is closed");
+  if (finished_) {
+    throw std::logic_error("Runtime identity ledger is closed");
+  }
 }
 
 void RuntimeIdentityLedger::emit(const std::string& type, Json data) {
@@ -177,12 +210,16 @@ void RuntimeIdentityLedger::emit(const std::string& type, Json data) {
 
 RuntimeIdentityLedger::Context& RuntimeIdentityLedger::context(uint64_t handle) {
   const auto it = contexts_.find(handle);
-  if (it == contexts_.end()) throw std::logic_error("Unknown context lifetime");
+  if (it == contexts_.end()) {
+    throw std::logic_error("Unknown context lifetime");
+  }
   return it->second;
 }
 
 void RuntimeIdentityLedger::retire_launch_id(uint64_t launch_id) {
-  if (!limits_.retired_launch_ids || !retired_launch_ids_.insert(launch_id).second) return;
+  if (!limits_.retired_launch_ids || !retired_launch_ids_.insert(launch_id).second) {
+    return;
+  }
   retired_launch_order_.push_back(launch_id);
   if (retired_launch_order_.size() > limits_.retired_launch_ids) {
     retired_launch_ids_.erase(retired_launch_order_.front());
@@ -213,15 +250,18 @@ void RuntimeIdentityLedger::context_end(uint64_t handle) {
       incomplete.push_back(it->second.key);
       retire_launch_id(it->first);
       it = pending_.erase(it);
-    } else
+    } else {
       ++it;
+    }
   }
   const auto in_context = [handle](const auto& entry) { return entry.first.first == handle; };
   erase_where(modules_, in_context);
   erase_where(functions_, in_context);
   erase_where(failed_functions_, in_context);
   contexts_.erase(handle);
-  if (!incomplete.empty()) gap_ = true;
+  if (!incomplete.empty()) {
+    gap_ = true;
+  }
   for (const auto& launch : incomplete) {
     emit("launch_incomplete", {{"launch", launch}, {"reason", "context_ended_before_completion"}});
   }
@@ -230,12 +270,18 @@ void RuntimeIdentityLedger::context_end(uint64_t handle) {
 
 std::string RuntimeIdentityLedger::module_locked(uint64_t ctx, uint64_t module, const std::string& api, bool observed) {
   const auto context_key = context(ctx).key;
-  if (!module) throw std::logic_error("Invalid module lifetime");
+  if (!module) {
+    throw std::logic_error("Invalid module lifetime");
+  }
   if (const auto it = modules_.find({ctx, module}); it != modules_.end()) {
-    if (observed) throw std::logic_error("Module loaded without ending its previous lifetime");
+    if (observed) {
+      throw std::logic_error("Module loaded without ending its previous lifetime");
+    }
     return it->second.key;
   }
-  if (modules_.size() >= limits_.modules) throw std::logic_error("Excessive module lifetimes");
+  if (modules_.size() >= limits_.modules) {
+    throw std::logic_error("Excessive module lifetimes");
+  }
   const auto key =
       runtime_digest(Json{{"context", context_key}, {"module_ordinal", module_counter_++}, {"handle", module}});
   modules_.emplace(HandleKey{ctx, module}, Module{key, observed});
@@ -276,15 +322,21 @@ Json RuntimeIdentityLedger::capture_function(uint64_t ctx, uint64_t module, uint
                                              const std::function<Json()>& capture) {
   std::lock_guard<std::mutex> lock(mutex_);
   live();
-  if (!function || !capture) throw std::invalid_argument("Function handle and capture callback required");
+  if (!function || !capture) {
+    throw std::invalid_argument("Function handle and capture callback required");
+  }
   const auto module_key = module_locked(ctx, module, "first_seen_function", false);
   const auto key = HandleKey{ctx, function};
   if (const auto it = failed_functions_.find(key); it != failed_functions_.end()) {
-    if (it->second != module_key) throw std::logic_error("Live function changed module without unload");
+    if (it->second != module_key) {
+      throw std::logic_error("Live function changed module without unload");
+    }
     return nullptr;
   }
   if (const auto it = functions_.find(key); it != functions_.end()) {
-    if (it->second.at("module") != module_key) throw std::logic_error("Live function changed module without unload");
+    if (it->second.at("module") != module_key) {
+      throw std::logic_error("Live function changed module without unload");
+    }
     return it->second;
   }
   if (functions_.size() + failed_functions_.size() >= limits_.functions) {
@@ -306,7 +358,9 @@ Json RuntimeIdentityLedger::function_locked(uint64_t ctx, uint64_t module, uint6
   }
   const auto module_key = module_locked(ctx, module, "first_seen_function", false);
   const auto key = HandleKey{ctx, function};
-  if (failed_functions_.count(key)) throw std::logic_error("Function identity unavailable until its module ends");
+  if (failed_functions_.count(key)) {
+    throw std::logic_error("Function identity unavailable until its module ends");
+  }
   attributes["process"] = process_key_;
   attributes["context"] = context(ctx).key;
   attributes["module"] = module_key;
@@ -314,7 +368,9 @@ Json RuntimeIdentityLedger::function_locked(uint64_t ctx, uint64_t module, uint6
   attributes["function_handle"] = function;
   attributes["function"] = runtime_digest(attributes);
   if (const auto it = functions_.find(key); it != functions_.end()) {
-    if (it->second != attributes) throw std::logic_error("Live function changed identity without unload");
+    if (it->second != attributes) {
+      throw std::logic_error("Live function changed identity without unload");
+    }
     return it->second;
   }
   if (functions_.size() + failed_functions_.size() >= limits_.functions) {
@@ -335,9 +391,15 @@ Json RuntimeIdentityLedger::launch(uint64_t ctx, uint64_t function, uint64_t id,
   live();
   auto& current = context(ctx);
   const auto fit = functions_.find({ctx, function});
-  if (fit == functions_.end() || !attributes.is_object()) throw std::logic_error("Launch lacks function identity");
-  if (pending_.count(id) || retired_launch_ids_.count(id)) throw std::logic_error("Duplicate launch ID");
-  if (pending_.size() >= limits_.pending_launches) throw std::logic_error("Excessive in-flight launches");
+  if (fit == functions_.end() || !attributes.is_object()) {
+    throw std::logic_error("Launch lacks function identity");
+  }
+  if (pending_.count(id) || retired_launch_ids_.count(id)) {
+    throw std::logic_error("Duplicate launch ID");
+  }
+  if (pending_.size() >= limits_.pending_launches) {
+    throw std::logic_error("Excessive in-flight launches");
+  }
   const bool capture_selected = attributes.value("capture_selected", true);
   const auto& binding = fit->second;
   const auto ordinal_key =
@@ -373,7 +435,9 @@ void RuntimeIdentityLedger::complete(uint64_t ctx, uint64_t id, bool completed, 
                              {"kernel_completed", completed},
                              {"channel_drained", drained},
                              {"trace_footer_required", it->second.capture_selected}});
-  if (!completed || !drained) gap_ = true;
+  if (!completed || !drained) {
+    gap_ = true;
+  }
   retire_launch_id(id);
   pending_.erase(it);
 }
@@ -400,7 +464,9 @@ void RuntimeIdentityLedger::plan_event(const std::string& type, Json data) {
 
 void RuntimeIdentityLedger::finish() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (finished_) return;
+  if (finished_) {
+    return;
+  }
   emit("process_end", {{"pending_launches", pending_.size()},
                        {"live_contexts", contexts_.size()},
                        {"has_gaps", gap_ || !pending_.empty()},
