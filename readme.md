@@ -151,7 +151,7 @@ supported loader before use.
     -   **ndjson** or 2 (default): NDJSON uncompressed (`.ndjson`)
     -   text (or 0): Plain text (`.log`, legacy format, verbose)
     -   zstd (or 1): NDJSON+Zstd compressed (`.ndjson.zst`, ~12x compression, 92% space savings)
-    -   clp (or 3): CLP Archive (`.clp`)
+    -   clp (or 3): CLP Archive (`.clp`); `cutracer query` on it needs `pip install 'cutracer[clp]'` (x86_64 only)
 -   `CUTRACER_ZSTD_LEVEL`: Zstd compression level (1-22, default 9)
     -   Lower values (1-3): Faster compression, slightly larger output
     -   Higher values (19-22): Maximum compression, slower but smallest output

@@ -4,7 +4,9 @@
 Unit tests for query CLI command.
 """
 
+import sys
 import unittest
+from unittest import mock
 
 from click.testing import CliRunner
 from cutracer.cli import main
@@ -98,6 +100,15 @@ class TestQueryCommand(BaseValidationTest):
         result = self.runner.invoke(main, ["query", str(empty_file)])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("No records found", result.output)
+
+    def test_query_clp_without_clp_extra(self):
+        """Test a .clp query without yscope_clp_core points to the clp extra."""
+        clp_file = self.create_temp_file("trace.clp", "")
+        with mock.patch.dict(sys.modules, {"yscope_clp_core": None}):
+            sys.modules.pop("cutracer.query.clp", None)
+            result = self.runner.invoke(main, ["query", str(clp_file)])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("pip install 'cutracer[clp]'", result.output)
 
     def test_analyze_short_options(self):
         """Test analyze with short option names."""

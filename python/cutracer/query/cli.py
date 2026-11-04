@@ -344,7 +344,15 @@ def query_command(
 
     USE_CLP = True if file.name.endswith(".clp") else False
     if USE_CLP:
-        from cutracer.query.clp import TraceReaderCLP
+        try:
+            from cutracer.query.clp import TraceReaderCLP
+        except ModuleNotFoundError as e:
+            if e.name != "yscope_clp_core":
+                raise
+            raise click.ClickException(
+                "Querying a .clp archive needs yscope_clp_core, which is "
+                "x86_64-only: pip install 'cutracer[clp]'"
+            ) from e
 
         reader_cls = TraceReaderCLP
     else:

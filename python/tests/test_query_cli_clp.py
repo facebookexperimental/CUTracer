@@ -6,12 +6,19 @@ Unit tests for query CLI command.
 
 import unittest
 
-import yscope_clp_core
 from click.testing import CliRunner
 from cutracer.cli import main
 from tests.test_base import BaseValidationTest, REG_TRACE_NDJSON
 
+try:
+    import yscope_clp_core
+except ModuleNotFoundError:
+    yscope_clp_core = None
 
+
+@unittest.skipIf(
+    yscope_clp_core is None, "needs yscope_clp_core: pip install 'cutracer[clp]'"
+)
 class TestQueryCommand(BaseValidationTest):
     """Tests for query CLI command."""
 
