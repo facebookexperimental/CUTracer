@@ -21,10 +21,14 @@ dependencies = [
     "zstandard>=0.20.0",
     "tabulate>=0.9.0",
     "tritonparse>=0.4.3",
-    "yscope_clp_core>=0.7.1b2"
 ]
 
 [project.optional-dependencies]
+# Must stay optional: yscope_clp_core ships only x86_64 wheels (no sdist), so
+# requiring it breaks `pip install cutracer` on aarch64 (e.g. GB200/GB300).
+clp = [
+    "yscope_clp_core>=0.7.1b2",
+]
 dev = [
     "mypy>=1.0.0",
     "ufmt==2.9.0",

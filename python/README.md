@@ -26,6 +26,16 @@ cd /path/to/CUTracer/python
 pip install .
 ```
 
+### Optional CLP Support
+
+`cutracer query` on `.clp` archives needs the `clp` extra. Its
+`yscope_clp_core` dependency only ships x86_64 wheels, so the extra cannot be
+installed on aarch64:
+
+```bash
+pip install ".[clp]"
+```
+
 ## Features
 
 ### Trace Validation (Current)

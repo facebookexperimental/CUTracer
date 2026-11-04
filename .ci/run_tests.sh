@@ -103,9 +103,9 @@ elif [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
   # interpreter we use for verification / running tests below.
   python -m pip install pandas
 
-  # Install cutracer Python package in editable mode (includes all dependencies)
+  # Install cutracer in editable mode; test_query_cli_clp.py needs the clp extra.
   echo "📦 Installing cutracer Python package..."
-  python -m pip install -e "$PROJECT_ROOT/python"
+  python -m pip install -e "$PROJECT_ROOT/python[clp]"
 else
   echo "⚠️ Conda activation script not found, skipping."
 fi

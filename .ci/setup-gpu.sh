@@ -84,13 +84,14 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
 echo "::endgroup::"
 
 # ─────────────────────────────────────────────────────────────────────
-# 3. cutracer Python package + pandas (used by run_tests.sh).
+# 3. cutracer Python package (with the clp extra that test_query_cli_clp.py
+#    needs) + pandas (used by run_tests.sh).
 #    With SKIP_CONDA=1, run_tests.sh skips its own pip block, so we
 #    have to install here.
 # ─────────────────────────────────────────────────────────────────────
 echo "::group::uv pip install"
 uv pip install pandas
-uv pip install -e "$PROJECT_ROOT/python"
+uv pip install -e "$PROJECT_ROOT/python[clp]"
 echo "::endgroup::"
 
 # ─────────────────────────────────────────────────────────────────────
