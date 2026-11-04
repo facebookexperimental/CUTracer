@@ -571,7 +571,6 @@ _CUTRACER_OPTIONS = [
     ),
     click.option(
         "--kernel-filters",
-        "--kernel-filter",
         "-k",
         default=None,
         help="Comma-separated kernel name substring filters",
