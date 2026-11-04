@@ -12,7 +12,7 @@ CUDA_HOME ?= /usr/local/cuda
 
 # Test executables
 TESTS = test_instr_category test_kernel_types test_cubin_identity test_capture_completion \
-        test_cuda_callback_guard test_delay_config_file
+        test_cuda_callback_guard test_delay_config_file test_kernel_trace_name
 
 .PHONY: all clean test
 
@@ -38,6 +38,9 @@ test_capture_completion: ../../src/test/CaptureCompletionTest.cpp ../../src/trac
 		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -lzstd -o $@
 
 test_cuda_callback_guard: ../../src/test/CudaCallbackGuardTest.cpp ../../include/cuda_callback_guard.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) $< $(LDFLAGS) $(GTEST_LIBS) -o $@
+
+test_kernel_trace_name: ../../src/test/KernelTraceNameTest.cpp ../../include/kernel_trace_name.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) $< $(LDFLAGS) $(GTEST_LIBS) -o $@
 
 test_delay_config_file: ../../src/test/DelayConfigFileTest.cpp ../../src/delay_config_file.cpp \

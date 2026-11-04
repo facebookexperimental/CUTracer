@@ -120,17 +120,20 @@ void cleanup_log_handle();
 void flush_log_files();
 
 /**
- * Builds a deterministic base filename for a kernel's trace log.
+ * Builds the base filename for the trace files of one kernel launch.
  *
  * Format:
- *   "kernel_<kernel_checksum>_iter<iteration>_<truncated_mangled_name>"
+ *   "kernel_<kernel_checksum>_iter<iteration>_pid<pid>_<truncated_mangled_name>"
  *
  * Details:
  * - Uses the kernel_checksum (FNV-1a hash of kernel name + SASS instructions)
  *   for robust kernel identification across recompilations.
  * - Appends the kernel iteration number to distinguish repeated launches.
+ * - Appends the calling process's ID: every process of a run counts its own
+ *   launches in the shared output directory.
  * - Includes a truncated (up to 150 chars) copy of the mangled name to aid
  *   human readability while keeping the filename manageable.
+ * - Prefixes CUTRACER_OUTPUT_DIR when it is set.
  *
  * Args:
  *   ctx: CUDA context associated with the kernel function.

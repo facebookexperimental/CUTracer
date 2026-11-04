@@ -87,7 +87,7 @@ Groups operand data for instrumentation functions:
 - `lprintf` (log file only), `oprintf` (stdout only), `loprintf` (both), `trace_lprintf` (kernel trace log only)
 - Verbose macros: `loprintf_v` (verbose ≥ 1), `loprintf_vl(level, ...)` (verbose ≥ level), `lprintf_v`, `oprintf_v`
 - `log_open_kernel_file(ctx, func, iteration, kernel_checksum)`, `log_close_kernel_file()`
-- `generate_kernel_log_basename(ctx, func, iteration, kernel_checksum)` — builds `kernel_<checksum>_iter<idx>_<name>` prefix
+- `generate_kernel_log_basename(ctx, func, iteration, kernel_checksum)` — builds `kernel_<checksum>_iter<idx>_pid<pid>_<name>` prefix
 - `init_log_handle()`, `cleanup_log_handle()`
 
 ## Key Host Functions 🧵

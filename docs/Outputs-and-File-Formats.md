@@ -5,14 +5,15 @@
 
 ## Per-kernel Trace Log 🧾
 
-- Filename: `kernel_<checksum>_iter<idx>_<mangled_name>.{log,ndjson,ndjson.zst,clp}`
+- Filename: `kernel_<checksum>_iter<idx>_pid<pid>_<mangled_name>.{log,ndjson,ndjson.zst,clp}`
+- `<idx>` counts the launches of the kernel in its process and `<pid>` is that process's ID, so processes that share the output directory, such as the ranks of a distributed job, write separate files.
 - Purpose: Detailed per-kernel trace output (register, memory, TMA, or opcode records) when relevant instrumentation modes are active.
 - The file extension depends on the trace format selected via `CUTRACER_TRACE_FORMAT` (see below).
 - With the [runtime identity manifest](#runtime-identity-manifest-) enabled, a launch that has a launch record is written to `capture_<launch>.{log,ndjson,ndjson.zst,clp}` instead, where `<launch>` is that record's key.
 
 ## Histogram CSV 📄
 
-- Filename: `kernel_<checksum>_iter<idx>_<mangled_name>_hist.csv`
+- Filename: `kernel_<checksum>_iter<idx>_pid<pid>_<mangled_name>_hist.csv`
 - Columns:
   - `warp_id` (int): Global warp ID.
   - `region_id` (int): Region ordinal within the warp (clock-to-clock segment).

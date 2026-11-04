@@ -837,11 +837,11 @@ def trace_command(
 
     \b
     Output files in the output directory:
-      kernel_<checksum>_iter<N>_<name>.ndjson      one per launch of a kernel
-      kernel_<checksum>_<hash>_<name>.cubin        the kernel's code, for `cutracer sass`
-      kernel_..._warp_status_summary.ndjson        warp report (deadlock_detection)
-      cutracer_kernel_events_<time>_<pid>.ndjson   one record per launch (--kernel-events)
-      cutracer_main_<time>_<pid>.log               CUTracer's log, one per process
+      kernel_<checksum>_iter<N>_pid<pid>_<name>.ndjson   one per launch of a kernel
+      kernel_<checksum>_<hash>_<name>.cubin              the kernel's code, for `cutracer sass`
+      kernel_..._warp_status_summary.ndjson              warp report (deadlock_detection)
+      cutracer_kernel_events_<time>_<pid>.ndjson         one record per launch (--kernel-events)
+      cutracer_main_<time>_<pid>.log                     CUTracer's log, one per process
 
     \b
     Instrument only part of a kernel with environment variables:

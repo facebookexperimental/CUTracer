@@ -14,7 +14,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <sstream>
 #include <string>
 
 /* nvbit interface file */
@@ -22,51 +21,22 @@
 
 /* include environment configuration */
 #include "env_config.h"
+#include "kernel_trace_name.h"
 
 /* include log handle header */
 #include "log.h"
 
 /**
- * Builds a deterministic base filename for a kernel's trace log.
+ * Builds the base filename of a kernel launch's trace files in
+ * CUTRACER_OUTPUT_DIR, named for the calling process.
  *
- * The resulting string embeds:
- *   - The kernel_checksum (FNV-1a hash of kernel name + SASS) for identification
- *   - The iteration number (decimal)
- *   - A truncated copy (first 150 chars) of the mangled name for readability
- *
- * If output_dir is set (via CUTRACER_OUTPUT_DIR), the filename
- * will be prefixed with that directory path.
- *
- * Example: "kernel_7fa21c3_iter42__Z23my_kernelPiS_..."
- * With path: "/tmp/traces/kernel_7fa21c3_iter42__Z23my_kernelPiS_..."
+ * Example: "/tmp/traces/kernel_7fa21c3_iter42_pid1234__Z23my_kernelPiS_..."
  */
 std::string generate_kernel_log_basename(CUcontext ctx, CUfunction func, uint32_t iteration,
                                          const std::string& kernel_checksum) {
-  const char* mangled_name_raw = nvbit_get_func_name(ctx, func, true);
-  if (!mangled_name_raw) {
-    mangled_name_raw = "unknown_kernel";
-  }
-
-  std::string mangled_name(mangled_name_raw);
-
-  // Truncate the name for the filename string part
-  std::string truncated_name = mangled_name.substr(0, 150);
-
-  std::stringstream ss;
-
-  // Prepend output_dir if specified
-  if (!output_dir.empty()) {
-    ss << output_dir;
-    // Ensure path ends with a separator
-    if (output_dir.back() != '/') {
-      ss << "/";
-    }
-  }
-
-  // Format to hex for the hash
-  ss << "kernel_" << kernel_checksum << "_iter" << std::dec << iteration << "_" << truncated_name;
-
-  return ss.str();
+  const char* mangled_name = nvbit_get_func_name(ctx, func, true);
+  return cutracer::kernel_trace_basename(output_dir, kernel_checksum, iteration, getpid(),
+                                         mangled_name ? mangled_name : "unknown_kernel");
 }
 
 /* ===== Global Variables ===== */

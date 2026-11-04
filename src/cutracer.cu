@@ -437,9 +437,10 @@ std::map<uint64_t, KernelDimensions> kernel_launch_to_dimensions_map;
 std::unordered_map<CUfunction, ClusterLaunchInfo> g_func_to_observed_cluster;
 pthread_mutex_t g_cluster_obs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Legacy trace names are kernel_<checksum>_iter<n>_<name>. Number launches by
-// that name rather than by CUfunction, so other contexts and reloaded modules
-// cannot overwrite an earlier trace. Callers hold kernel_launch_state_mutex.
+// Legacy trace names are kernel_<checksum>_iter<n>_pid<pid>_<name>. Number
+// launches by checksum and name rather than by CUfunction, so other contexts and
+// reloaded modules in this process cannot overwrite an earlier trace. Callers
+// hold kernel_launch_state_mutex.
 static std::map<std::pair<std::string, std::string>, uint32_t> kernel_iter_map;
 
 static uint32_t next_kernel_iteration(const KernelFuncMetadata& meta, bool selected) {

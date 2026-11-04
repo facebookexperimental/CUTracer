@@ -3,7 +3,7 @@
 - Purpose: Count instruction mnemonics per warp within regions delimited by clock reads.
 - Enable with: `CUTRACER_ANALYSIS=proton_instr_histogram` (auto-enables `opcode_only`).
 - Region model: first clock starts, next clock ends; alternating start/stop. Nested regions are not supported.
-- Output: per-kernel CSV `kernel_<hash>_iter<idx>_<name>_hist.csv` with columns `warp_id,region_id,instruction,count`.
+- Output: per-kernel CSV `kernel_<hash>_iter<idx>_pid<pid>_<name>_hist.csv` with columns `warp_id,region_id,instruction,count`.
 - Typical workflow: Collect histogram with CUTracer; collect a clean Chrome trace separately; merge to compute IPC (see "Post-processing: IPC Merge").
 
 Caveats:
