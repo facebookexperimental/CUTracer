@@ -19,6 +19,7 @@ from cutracer.runner import (
     InstrumentationConfig,
     resolve_cutracer_so,
     run_instrumented_target,
+    with_run_delay_seed,
 )
 
 
@@ -183,6 +184,32 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_DELAY_MODE"], "random")
         self.assertEqual(env["CUTRACER_DELAY_DUMP_PATH"], "/tmp/dump.json")
         self.assertEqual(env["CUTRACER_DELAY_LOAD_PATH"], "/tmp/load.json")
+
+    @patch("cutracer.runner.resources")
+    def test_passes_an_explicit_delay_seed(self, mock_resources: MagicMock) -> None:
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
+
+        def seed(delay_seed: int | None) -> str | None:
+            env = _build_cutracer_env(
+                cutracer_so="/path/to/cutracer.so",
+                instrument="random_delay",
+                analysis="random_delay",
+                kernel_filters=None,
+                instr_categories=None,
+                trace_format=None,
+                output_dir=None,
+                verbose=None,
+                zstd_level=None,
+                delay_ns=10000,
+                delay_dump_path="/tmp/dump.json",
+                delay_seed=delay_seed,
+                base_env={},
+                use_bundled_cuda_tools=False,
+            )
+            return env.get("CUTRACER_DELAY_SEED")
+
+        self.assertEqual(seed(9), "9")
+        self.assertIsNone(seed(None))
 
     @patch("cutracer.runner.resources")
     def test_sets_targeted_trace_filters(self, mock_resources: MagicMock) -> None:
@@ -513,3 +540,46 @@ class RunInstrumentedTargetTest(unittest.TestCase):
         command, kwargs = calls[0]
         self.assertEqual(command, "sh -c 'producer | consumer'")
         self.assertTrue(kwargs["shell"])
+
+
+class WithRunDelaySeedTest(unittest.TestCase):
+    """A delay-dump run gets one seed for all its processes."""
+
+    def test_dump_run_without_a_seed_gets_one(self) -> None:
+        seed = with_run_delay_seed(
+            InstrumentationConfig(delay_dump_path="/tmp/dump.json", base_env={})
+        ).delay_seed
+        assert seed is not None
+        self.assertTrue(0 <= seed < 2**64)
+
+    def test_given_or_inherited_seed_and_non_dump_runs_are_unchanged(self) -> None:
+        for config in (
+            InstrumentationConfig(base_env={}),
+            InstrumentationConfig(
+                delay_dump_path="/tmp/dump.json", delay_seed=9, base_env={}
+            ),
+            InstrumentationConfig(
+                delay_dump_path="/tmp/dump.json",
+                base_env={"CUTRACER_DELAY_SEED": "5"},
+            ),
+        ):
+            with self.subTest(config=config):
+                self.assertEqual(with_run_delay_seed(config), config)
+
+    def test_run_passes_the_pinned_seed_to_the_target(self) -> None:
+        runner = MagicMock()
+        with tempfile.NamedTemporaryFile(suffix=".so") as so:
+            run_instrumented_target(
+                ["app"],
+                InstrumentationConfig(
+                    cutracer_so=so.name,
+                    instrument="random_delay",
+                    analysis="random_delay",
+                    delay_ns=1000,
+                    delay_dump_path="/tmp/dump.json",
+                    base_env={"PATH": "/usr/bin"},
+                    use_bundled_cuda_tools=False,
+                ),
+                runner=runner,
+            )
+        self.assertIn("CUTRACER_DELAY_SEED", runner.call_args.kwargs["env"])

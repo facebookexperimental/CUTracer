@@ -15,13 +15,14 @@ import hashlib
 import importlib.resources as resources
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence, TypeVar
 
 import click
 from cutracer.file_utils import file_sha256
@@ -56,6 +57,7 @@ class InstrumentationConfig:
     delay_patterns: Optional[str] = None
     delay_dump_path: Optional[str] = None
     delay_load_path: Optional[str] = None
+    delay_seed: Optional[int] = None
     cpu_callstack: Optional[str] = None
     channel_records: Optional[int] = None
     kernel_events: Optional[str] = None
@@ -293,6 +295,7 @@ def build_cutracer_env(
     delay_patterns: Optional[str] = None,
     delay_dump_path: Optional[str] = None,
     delay_load_path: Optional[str] = None,
+    delay_seed: Optional[int] = None,
     cpu_callstack: Optional[str] = None,
     channel_records: Optional[int] = None,
     kernel_events: Optional[str] = None,
@@ -370,6 +373,8 @@ def build_cutracer_env(
         env["CUTRACER_DELAY_DUMP_PATH"] = str(Path(delay_dump_path).resolve())
     if delay_load_path is not None:
         env["CUTRACER_DELAY_LOAD_PATH"] = str(Path(delay_load_path).resolve())
+    if delay_seed is not None:
+        env["CUTRACER_DELAY_SEED"] = str(delay_seed)
     if cpu_callstack is not None:
         env["CUTRACER_CPU_CALLSTACK"] = str(cpu_callstack)
     if channel_records is not None:
@@ -446,6 +451,7 @@ def _resolve_and_build_env(
         delay_patterns=config.delay_patterns,
         delay_dump_path=config.delay_dump_path,
         delay_load_path=config.delay_load_path,
+        delay_seed=config.delay_seed,
         cpu_callstack=config.cpu_callstack,
         channel_records=config.channel_records,
         kernel_events=config.kernel_events,
@@ -459,6 +465,25 @@ def _resolve_and_build_env(
     return so_path, run_env
 
 
+_ConfigT = TypeVar("_ConfigT", bound=InstrumentationConfig)
+
+
+def with_run_delay_seed(config: _ConfigT) -> _ConfigT:
+    """Give a delay-dump run one seed unless the caller or environment set one.
+
+    Every process of the run shares it, so they make the same delay choices and
+    their writes to the dump path merge into one config.
+    """
+    env = os.environ if config.base_env is None else config.base_env
+    if (
+        config.delay_dump_path is None
+        or config.delay_seed is not None
+        or "CUTRACER_DELAY_SEED" in env
+    ):
+        return config
+    return replace(config, delay_seed=secrets.randbits(64))
+
+
 def run_instrumented_target(
     argv: Sequence[str],
     config: InstrumentationConfig,
@@ -469,6 +494,7 @@ def run_instrumented_target(
     if not argv:
         raise ValueError("instrumented target argv must not be empty")
 
+    config = with_run_delay_seed(config)
     _so_path, run_env = _resolve_and_build_env(config, reject_inherited_injection=False)
     return _run_with_environment(argv, config, run_env, runner=runner)
 
@@ -526,6 +552,7 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_DELAY_PATTERNS",
         "CUTRACER_DELAY_DUMP_PATH",
         "CUTRACER_DELAY_LOAD_PATH",
+        "CUTRACER_DELAY_SEED",
         "CUTRACER_CPU_CALLSTACK",
         "CUTRACER_CHANNEL_RECORDS",
         "CUTRACER_KERNEL_EVENTS",
@@ -813,8 +840,8 @@ def trace_command(
       kernel_<checksum>_iter<N>_<name>.ndjson      one per launch of a kernel
       kernel_<checksum>_<hash>_<name>.cubin        the kernel's code, for `cutracer sass`
       kernel_..._warp_status_summary.ndjson        warp report (deadlock_detection)
-      cutracer_kernel_events_<time>.ndjson         one record per launch (--kernel-events)
-      cutracer_main_<time>.log                     CUTracer's log
+      cutracer_kernel_events_<time>_<pid>.ndjson   one record per launch (--kernel-events)
+      cutracer_main_<time>_<pid>.log               CUTracer's log, one per process
 
     \b
     Instrument only part of a kernel with environment variables:
@@ -898,6 +925,7 @@ def trace_command(
         capture_output=False,
         shell=True,
     )
+    config = with_run_delay_seed(config)
 
     so_path, run_env = _resolve_and_build_env(config)
 

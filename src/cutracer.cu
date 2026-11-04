@@ -24,7 +24,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -64,6 +63,7 @@
 #include "log.h"
 
 /* delay configuration */
+#include "delay_choice.h"
 #include "delay_inject_config.h"
 
 /* implicit registers collection */
@@ -95,38 +95,6 @@ static TraceWriter* g_kernel_events_writer = nullptr;
 
 /* Callstack dedup table: FNV-1a hash → already emitted */
 static std::unordered_map<uint64_t, bool> callstack_seen;
-
-/* Random number generator for delay injection on/off control.
- * Uses std::random_device to seed std::mt19937 for true randomness
- * across different runs/processes. */
-static std::mt19937 g_delay_rng;
-static bool g_delay_rng_initialized = false;
-
-/* Lazily initialize the RNG with true randomness */
-static void ensure_delay_rng_initialized() {
-  if (!g_delay_rng_initialized) {
-    std::random_device rd;
-    g_delay_rng.seed(rd());
-    g_delay_rng_initialized = true;
-  }
-}
-
-/* Generate random enabled state with configurable probability (g_delay_enable_prob, default 0.5).
- * Short-circuits at the endpoints so --delay-enable-prob 1.0 / 0.0 are bit-deterministic and the
- * dumped replay config truly contains all-enabled / all-disabled points. */
-static bool generate_random_delay_enabled() {
-  ensure_delay_rng_initialized();
-  if (g_delay_enable_prob >= 1.0f) return true;
-  if (g_delay_enable_prob <= 0.0f) return false;
-  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-  return dist(g_delay_rng) < g_delay_enable_prob;
-}
-
-/* Generate a random seed for cluster mode CTA selection */
-static uint32_t generate_cluster_seed() {
-  ensure_delay_rng_initialized();
-  return g_delay_rng();
-}
 
 /**
  * @brief Extract the cluster_dim attribute from a cuLaunchKernelEx params
@@ -748,6 +716,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
   // Exact selection applies to the launch root, not its device callees.
   const bool exact_selection = exact_kernel_selector().enabled();
   bool should_instrument = exact_selection || kernel_filters.empty();
+  bool delay_config_grew = false;
   /* iterate on function */
   for (auto f : related_functions) {
     const char* unmangled_name = nvbit_get_func_name(ctx, f, false);
@@ -793,6 +762,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       assert(!is_delay_replay_mode() && "Dump and replay modes are mutually exclusive");
       // Reuse the kernel_checksum already computed above for trace writer
       kernel_delay_config = create_kernel_delay_config(mangled_name, meta.kernel_checksum);
+      delay_config_grew = true;
     }
 
     // Get replay instrumentation points once for replay mode
@@ -986,15 +956,15 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
             loprintf("Replay mode: kernel=%s pc=0x%lx NOT FOUND in config, skipping\n", unmangled_name, pc_offset);
           }
         } else {
-          // Random mode: generate random on/off with 50% probability
-          enabled = generate_random_delay_enabled();
+          enabled = cutracer::delay_point_enabled(g_delay_seed, meta.kernel_checksum, instr->getOffset(),
+                                                  g_delay_enable_prob);
           delay_ns = g_delay_ns;
 
           // Generate cluster seed only when cluster targeting is active —
           // it's the per-instrumentation-point selector for which CTA gets
           // delayed and is persisted to config for deterministic replay.
           if (g_delay_cta_target == 1) {
-            cluster_seed = generate_cluster_seed();
+            cluster_seed = cutracer::delay_point_cluster_seed(g_delay_seed, meta.kernel_checksum, instr->getOffset());
           }
 
           // Register the point for config output if kernel_delay_config was created
@@ -1076,6 +1046,9 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     /* ============================================ */
   }
 
+  if (delay_config_grew) {
+    save_delay_config();
+  }
   return should_instrument;
 }
 
@@ -1865,7 +1838,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
     }
 
     cleanup_log_handle();
-    finalize_delay_config();
+    save_delay_config();
   }
 
   pthread_mutex_unlock(&mutex);
@@ -2045,6 +2018,7 @@ void nvbit_at_init() {
     } else {
       events_basename = std::string("cutracer_kernel_events_") + time_buf;
     }
+    events_basename += "_" + std::to_string(getpid());
     // Kernel events are structured JSON records — always use NDJSON format
     // regardless of CUTRACER_TRACE_FORMAT (text mode would silently drop them,
     // zstd adds overhead for small files).

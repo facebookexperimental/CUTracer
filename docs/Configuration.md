@@ -106,6 +106,7 @@ python3 your_kernel.py
 | `CUTRACER_CLUSTER_CTA_ID` | int | `-1` (disabled) | Restrict delay injection to a specific CTA ID (used with `cluster*` modes). Setting this together with `CUTRACER_DELAY_LOAD_PATH` produces non-bit-identical replays |
 | `CUTRACER_DELAY_DUMP_PATH` | path | `""` (disabled) | Output path for delay config JSON (dump mode — records random delay pattern) |
 | `CUTRACER_DELAY_LOAD_PATH` | path | `""` (disabled) | Input path for delay config JSON (replay mode — deterministically reproduces a recorded pattern) |
+| `CUTRACER_DELAY_SEED` | uint64 | random | Seed of the per-point on/off choices. Processes that share it make the same choices and merge their writes to `CUTRACER_DELAY_DUMP_PATH`; `cutracer trace --delay-dump-path` and `cutracer stress` set one per run |
 
 > ⚠️ `CUTRACER_DELAY_DUMP_PATH` and `CUTRACER_DELAY_LOAD_PATH` are **mutually exclusive**. Setting both causes a FATAL exit.
 
@@ -221,6 +222,7 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_DELAY_MIN_NS` | Delay Injection |
 | `CUTRACER_DELAY_MODE` | Delay Injection |
 | `CUTRACER_DELAY_NS` | Delay Injection |
+| `CUTRACER_DELAY_SEED` | Delay Injection |
 | `CUTRACER_DUMP_CUBIN` | Debug |
 | `CUTRACER_INSTR_CATEGORIES` | Instruction Category Filtering |
 | `CUTRACER_INSTRUMENTATION_PLAN` | Advanced — Instrumentation Plans |

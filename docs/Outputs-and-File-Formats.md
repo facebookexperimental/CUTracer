@@ -1,6 +1,6 @@
 ## Main Tool Log 🗒️
 
-- Filename: `cutracer_main_YYYYMMDD_HHMMSS.log`
+- Filename: `cutracer_main_YYYYMMDD_HHMMSS_<pid>.log`, one per process
 - Contents: Initialization, kernel launch lines (ctx, grid/block sizes, kernel checksum), analysis messages.
 
 ## Per-kernel Trace Log 🧾
@@ -95,7 +95,7 @@ This is a **separate** NDJSON file (not the per-kernel trace) that records
 metadata about every kernel launch — useful for offline correlation, callstack
 analysis, and dedup studies.
 
-- Filename: `cutracer_kernel_events_YYYYMMDD_HHMMSS.ndjson`
+- Filename: `cutracer_kernel_events_YYYYMMDD_HHMMSS_<pid>.ndjson`, one per process
   (placed under `CUTRACER_OUTPUT_DIR` if set, otherwise the working directory)
 - Writer: `g_kernel_events_writer` in `src/cutracer.cu`
   (output produced by `src/trace_writer.cpp`)
@@ -171,6 +171,7 @@ trace is complete only when its own `capture_completion` footer says so.
 When using the `random_delay` analysis with `CUTRACER_DELAY_DUMP_PATH`, CUTracer writes a delay configuration JSON file for deterministic replay. This file is consumed by `CUTRACER_DELAY_LOAD_PATH`.
 
 - Filename: user-specified via `CUTRACER_DELAY_DUMP_PATH`
+- Written after each newly instrumented kernel and when the last CUDA context ends. All processes of a run write the same file: when the file's `seed` and `delay_ns` match their own, they add their kernels to it under the lock `<path>.lock`, otherwise they replace it.
 - See [Analyses](Analyses.md#data-race-detection-random_delay) for the full schema and dump/replay workflow.
 
 Top-level structure:
@@ -178,6 +179,7 @@ Top-level structure:
 {
   "version": "1.0",
   "delay_ns": 10000,
+  "seed": 4242,
   "kernels": {
     "<kernel_name>_<checksum>": {
       "kernel_name": "matmul_kernel",

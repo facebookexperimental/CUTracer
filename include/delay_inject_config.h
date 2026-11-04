@@ -51,8 +51,6 @@ struct DelayInjectConfig {
   std::string version = "1.0";
   uint32_t delay_ns;
   std::map<std::string, KernelDelayInjectConfig> kernels;  // Indexed by kernel name
-
-  bool save_to_file(const std::string& filepath) const;
 };
 
 // Global delay injection configuration
@@ -91,9 +89,12 @@ void register_delay_instrumentation_point(KernelDelayInjectConfig* kdc, Instr* i
                                           uint32_t cluster_seed = 0);
 
 /**
- * @brief Finalize and save delay config at context termination.
+ * @brief Write the delay config to CUTRACER_DELAY_DUMP_PATH, if set.
+ *
+ * Called after each newly instrumented kernel and when the last context ends:
+ * a process can exit without ending its contexts (torch elastic workers do).
  */
-void finalize_delay_config();
+void save_delay_config();
 
 /**
  * @brief Load delay configuration from a JSON file for replay mode.

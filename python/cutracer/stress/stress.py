@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -530,6 +531,9 @@ def _run_attempt_in_output_dir(
                 delay_mode="random",
                 delay_warpgroup_id=warpgroup,
                 delay_dump_path=config_path,
+                # A fresh seed per attempt, even when the caller's environment
+                # pins one: every process of the attempt shares it.
+                delay_seed=secrets.randbits(64),
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
@@ -567,6 +571,10 @@ def _run_attempt_in_output_dir(
                 error=f"launch failed: {type(exc).__name__}: {exc}",
             ),
         )
+    finally:
+        # The attempt's processes serialize their config merges on this lock;
+        # none are left once the target has returned.
+        _unlink(config_path + ".lock")
 
     log = _attempt_log(
         delay_ns=delay_ns,

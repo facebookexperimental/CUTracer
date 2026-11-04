@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <cerrno>
 #include <filesystem>
+#include <random>
 #include <sstream>
 
 #include "env_config.h"
@@ -110,6 +112,9 @@ int g_delay_warpgroup_id;
 
 // Probability per PC of enabling delay during recording (default 0.5 = 50/50 gate)
 float g_delay_enable_prob;
+
+// Seed of the per-point delay choices (CUTRACER_DELAY_SEED, else random)
+uint64_t g_delay_seed;
 
 // User-specified delay injection patterns
 std::vector<std::string> g_delay_patterns;
@@ -336,6 +341,23 @@ static void get_var_uint64(uint64_t& var, const char* env_name, uint64_t default
   loprintf("%s = %lu (%s)\n", env_name, var, description);
 }
 
+static uint64_t parse_delay_seed(const std::string& text) {
+  if (text.empty()) {
+    std::random_device rd;
+    const uint64_t seed = (static_cast<uint64_t>(rd()) << 32) | rd();
+    loprintf("Using random delay seed %llu\n", static_cast<unsigned long long>(seed));
+    return seed;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long seed = strtoull(text.c_str(), &end, 0);
+  if (errno != 0 || end == text.c_str() || *end != '\0' || text.find('-') != std::string::npos) {
+    fprintf(stderr, "FATAL: CUTRACER_DELAY_SEED='%s' is not an unsigned 64-bit integer.\n", text.c_str());
+    exit(1);
+  }
+  return seed;
+}
+
 static void get_var_str(std::string& var, const char* env_name, const std::string& default_val,
                         const char* description) {
   const char* env_val = getenv(env_name);
@@ -464,6 +486,12 @@ void parse_delay_config() {
     fprintf(stderr, "FATAL: CUTRACER_DELAY_ENABLE_PROB=%.3f out of range [0.0, 1.0].\n", g_delay_enable_prob);
     exit(1);
   }
+
+  std::string delay_seed_str;
+  get_var_str(delay_seed_str, "CUTRACER_DELAY_SEED", "",
+              "Seed of the per-point delay on/off choices; processes that share it make the same "
+              "choices and merge their delay dumps (empty = random)");
+  g_delay_seed = parse_delay_seed(delay_seed_str);
 
   // Parse delay mode (distribution) and CTA targeting (orthogonal axes).
   //

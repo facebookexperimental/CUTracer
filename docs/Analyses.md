@@ -74,8 +74,11 @@ CUTracer supports dumping delay configurations to JSON for **deterministic repro
 | `CUTRACER_DELAY_NS` | Fixed delay value in nanoseconds (required) |
 | `CUTRACER_DELAY_DUMP_PATH` | Output path for delay config JSON (dump mode) |
 | `CUTRACER_DELAY_LOAD_PATH` | Input path for delay config JSON (replay mode) |
+| `CUTRACER_DELAY_SEED` | Seed of the per-point on/off choices (dump mode; random if unset) |
 
 **Note**: You cannot use `CUTRACER_DELAY_DUMP_PATH` and `CUTRACER_DELAY_LOAD_PATH` at the same time.
+
+**Multi-process runs**: every process of a run (for example torchrun ranks) writes the same `CUTRACER_DELAY_DUMP_PATH`. A point's on/off choice depends only on `CUTRACER_DELAY_SEED`, the kernel checksum and the PC, so processes that share the seed make the same choices, and their writes merge into one config that every process can replay. `cutracer trace --delay-dump-path` and `cutracer stress` set one seed per run. Each process rewrites the file after it instruments a new kernel, so the config exists even when a process exits without ending its CUDA contexts.
 
 #### Workflow
 

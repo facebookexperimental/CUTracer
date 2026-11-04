@@ -181,6 +181,11 @@ extern int g_delay_warpgroup_id;
 // Set via CUTRACER_DELAY_ENABLE_PROB environment variable.
 extern float g_delay_enable_prob;
 
+// Seed of the per-point delay on/off choices and cluster seeds. Processes that
+// share it make the same choice at the same kernel PC, and their writes to
+// one delay dump path merge. Set via CUTRACER_DELAY_SEED (random if unset).
+extern uint64_t g_delay_seed;
+
 // User-specified delay injection patterns (optional, overrides DELAY_INJECTION_PATTERNS)
 // Comma-separated SASS substrings, e.g. "SYNCS.EXCH,BAR.SYNC"
 extern std::vector<std::string> g_delay_patterns;

@@ -161,6 +161,7 @@ supported loader before use.
 - `CUTRACER_DELAY_MODE`: Delay mode: `random` (per-thread random, default), `fixed` (same for all threads), `cluster` (one CTA per cluster), `cluster_fixed` (fixed delay, one CTA per cluster)
 - `CUTRACER_DELAY_DUMP_PATH`: Output path for delay config JSON file (for recording instrumentation patterns)
 - `CUTRACER_DELAY_LOAD_PATH`: Input path for delay config JSON file (for replay mode - deterministic reproduction)
+- `CUTRACER_DELAY_SEED`: Seed of the per-point on/off choices (random if unset). Processes that share it make the same choices and merge their writes to `CUTRACER_DELAY_DUMP_PATH`
 - `CUTRACER_DELAY_PATTERNS`: Comma-separated SASS instruction substrings for delay injection (overrides built-in patterns). Use `"*"` to match all instructions
 - `CUTRACER_DELAY_ENABLE_PROB`: Per-PC enable probability (0.0-1.0, default: 0.5). Use `1.0` with warp targeting
 - `CUTRACER_DELAY_WARPGROUP_ID`: Warp-targeted delay: warpgroup index (>= 0 selects warps `[4N..4N+3]`, -1 = disabled)

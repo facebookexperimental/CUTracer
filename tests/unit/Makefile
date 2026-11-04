@@ -12,7 +12,7 @@ CUDA_HOME ?= /usr/local/cuda
 
 # Test executables
 TESTS = test_instr_category test_kernel_types test_cubin_identity test_capture_completion \
-        test_cuda_callback_guard
+        test_cuda_callback_guard test_delay_config_file
 
 .PHONY: all clean test
 
@@ -39,6 +39,12 @@ test_capture_completion: ../../src/test/CaptureCompletionTest.cpp ../../src/trac
 
 test_cuda_callback_guard: ../../src/test/CudaCallbackGuardTest.cpp ../../include/cuda_callback_guard.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) $< $(LDFLAGS) $(GTEST_LIBS) -o $@
+
+test_delay_config_file: ../../src/test/DelayConfigFileTest.cpp ../../src/delay_config_file.cpp \
+                        ../../src/test/TemporaryDirectoryTest.h ../../include/delay_config_file.h \
+                        ../../include/delay_choice.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GTEST_CPPFLAGS) -I$(THIRD_PARTY) \
+		$(filter %.cpp,$^) $(LDFLAGS) $(GTEST_LIBS) -o $@
 
 test: $(TESTS)
 	@echo "Running unit tests..."

@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sstream>
 
+#include "delay_config_file.h"
 #include "delay_inject_config.h"
 #include "env_config.h"
 #include "log.h"
@@ -41,18 +42,14 @@ static std::string get_current_timestamp() {
   return oss.str();
 }
 
-bool DelayInjectConfig::save_to_file(const std::string& filepath) const {
-  std::ofstream file(filepath);
-  if (!file.is_open()) {
-    return false;
-  }
-
+static json delay_config_json(const DelayInjectConfig& config) {
   json config_json;
-  config_json["version"] = version;
-  config_json["delay_ns"] = delay_ns;
+  config_json["version"] = config.version;
+  config_json["delay_ns"] = config.delay_ns;
+  config_json["seed"] = g_delay_seed;
 
   json kernels_json = json::object();
-  for (const auto& [kernel_name, kdc] : kernels) {
+  for (const auto& [kernel_name, kdc] : config.kernels) {
     json kernel_json;
     kernel_json["kernel_name"] = kdc.kernel_name;
     kernel_json["kernel_checksum"] = kdc.kernel_checksum;
@@ -74,9 +71,7 @@ bool DelayInjectConfig::save_to_file(const std::string& filepath) const {
     kernels_json[kernel_name] = kernel_json;
   }
   config_json["kernels"] = kernels_json;
-
-  file << config_json.dump(2);
-  return true;
+  return config_json;
 }
 
 void init_delay_json_config() {
@@ -132,7 +127,7 @@ void register_delay_instrumentation_point(KernelDelayInjectConfig* kdc, Instr* i
   ip.cluster_seed = cluster_seed;
 }
 
-void finalize_delay_config() {
+void save_delay_config() {
   if (delay_dump_path.empty()) {
     return;
   }
@@ -140,8 +135,10 @@ void finalize_delay_config() {
   loprintf_v("Saving delay config to %s (%zu kernels)\n", delay_dump_path.c_str(),
              g_delay_inject_config.kernels.size());
 
-  if (!g_delay_inject_config.save_to_file(delay_dump_path)) {
-    fprintf(stderr, "ERROR: Failed to save delay config to %s\n", delay_dump_path.c_str());
+  const std::string error =
+      cutracer::merge_delay_config_file(delay_dump_path, delay_config_json(g_delay_inject_config));
+  if (!error.empty()) {
+    fprintf(stderr, "ERROR: Failed to save delay config to %s: %s\n", delay_dump_path.c_str(), error.c_str());
   }
 }
 

@@ -193,6 +193,7 @@ void init_log_handle() {
   }
   main_log_filename += "cutracer_main_";
   main_log_filename += timestamp;
+  main_log_filename += "_" + std::to_string(getpid());
   main_log_filename += ".log";
 
   g_main_log_file = fopen(main_log_filename.c_str(), "w");

@@ -65,7 +65,7 @@ KERNEL_FILTERS=add_kernel \
 ```
 
 **Outputs** (in your current working directory):
-- `cutracer_main_YYYYMMDD_HHMMSS.log` (main tool log)
+- `cutracer_main_YYYYMMDD_HHMMSS_<pid>.log` (main tool log)
 - `kernel_<hash>_iter<idx>_<name>_hist.csv` (per-kernel instruction histogram)
 
 ### Multi-mode tracing with cubin dump (advanced)
