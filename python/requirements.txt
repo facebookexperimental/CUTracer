@@ -2,8 +2,13 @@
 #
 # Requirements file for CUTracer Python package.
 #
-# NOTE: This file is synced with pyproject.toml dependencies.
-# When updating dependencies, please keep both files in sync.
+# NOTE: This file mirrors pyproject.toml [project.dependencies] and
+# [project.optional-dependencies]; pyproject.toml is the canonical source.
+# When updating any dependency in either file, update the other in the
+# same change. This file intentionally flattens core + clp + dev into one
+# install, unlike `pip install .`, which installs core dependencies only.
+# The section headers below are parsed by tests/test_dependency_sync.py;
+# do not rename them without updating that test.
 #
 # To install: pip install -r requirements.txt
 
