@@ -36,7 +36,7 @@ CUDA_VERSION=${CUDA_VERSION:-12.8}
 NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.7.2}
 CUDA_CUPTI_VERSION=${CUDA_CUPTI_VERSION:-13.3.75}
 INSTALL_NCCL=${INSTALL_NCCL:-1}
-NCCL_VERSION=${NCCL_VERSION:-v2.30.7-1}
+NCCL_VERSION=${NCCL_VERSION:-v2.32.3-1}
 
 # Minimum required disk space in GB (can be overridden)
 REQUIRED_DISK_SPACE_GB=${REQUIRED_DISK_SPACE_GB:-15}
@@ -69,11 +69,11 @@ declare -A CUDA_RUNFILE=(
 
 declare -A CUDNN_VERSIONS=(
   ["12.6"]="9.10.2.21"
-  ["12.8"]="9.26.0.51"
-  ["12.9"]="9.26.0.51"
-  ["13.0"]="9.26.0.51"
-  ["13.2"]="9.26.0.51"
-  ["13.4"]="9.26.0.51"
+  ["12.8"]="9.27.0.42"
+  ["12.9"]="9.27.0.42"
+  ["13.0"]="9.27.0.42"
+  ["13.2"]="9.27.0.42"
+  ["13.4"]="9.27.0.42"
 )
 
 declare -A CUDA_MAJOR=(
