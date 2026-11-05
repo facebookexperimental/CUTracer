@@ -54,6 +54,7 @@ declare -A CUDA_FULL_VERSION=(
   ["13.0"]="13.0.3"
   ["13.2"]="13.2.2"
   ["13.4"]="13.4.1"
+  ["13.5"]="13.5.0"
 )
 
 declare -A CUDA_RUNFILE=(
@@ -65,6 +66,9 @@ declare -A CUDA_RUNFILE=(
   # 13.4.1 runfile carries no driver suffix; NVIDIA published it after
   # upstream wired 13.4 to the preview network repo (runfile URL verified).
   ["13.4"]="cuda_13.4.1_linux"
+  # 13.5.0 runfile likewise carries no driver suffix, since the driver is no
+  # longer bundled with the toolkit from 13.4 on (runfile URL verified).
+  ["13.5"]="cuda_13.5.0_linux"
 )
 
 declare -A CUDNN_VERSIONS=(
@@ -74,6 +78,7 @@ declare -A CUDNN_VERSIONS=(
   ["13.0"]="9.27.0.42"
   ["13.2"]="9.27.0.42"
   ["13.4"]="9.27.0.42"
+  ["13.5"]="9.27.0.42"
 )
 
 declare -A CUDA_MAJOR=(
@@ -83,6 +88,7 @@ declare -A CUDA_MAJOR=(
   ["13.0"]="13"
   ["13.2"]="13"
   ["13.4"]="13"
+  ["13.5"]="13"
 )
 
 # Create temporary directory
