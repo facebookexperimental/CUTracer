@@ -1043,6 +1043,10 @@ void* recv_thread_fun(void* args) {
             continue;
           }
 
+          // One snapshot serves both the deadlock checks and the SASS lookup below.
+          KernelLaunchStateSnapshot launch_state;
+          const bool has_launch_state = copy_kernel_launch_state(ri->kernel_launch_id, launch_state);
+
           if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
             WarpKey key = {ri->cta_id_x, ri->cta_id_y, ri->cta_id_z, ri->warp_id};
             if (is_new_kernel) {
@@ -1061,8 +1065,7 @@ void* recv_thread_fun(void* args) {
 
             // Determine if current instruction is BAR.SYNC.DEFER_BLOCKING
             bool is_barrier_defer = false;
-            KernelLaunchStateSnapshot launch_state;
-            if (copy_kernel_launch_state(ri->kernel_launch_id, launch_state)) {
+            if (has_launch_state) {
               is_barrier_defer = is_barrier_defer_blocking_for_opcode(ctx_state, launch_state.func, ri->opcode_id);
             }
             ctx_state->last_is_defer_blocking_by_warp[key] = is_barrier_defer;
@@ -1080,8 +1083,7 @@ void* recv_thread_fun(void* args) {
           // Get SASS string and register indices for trace output
           std::string sass_str_cpp;
           const RegIndices* reg_indices_ptr = nullptr;
-          KernelLaunchStateSnapshot launch_state;
-          if (copy_kernel_launch_state(ri->kernel_launch_id, launch_state)) {
+          if (has_launch_state) {
             if (ctx_state->id_to_sass_map.count(launch_state.func) &&
                 ctx_state->id_to_sass_map[launch_state.func].count(ri->opcode_id)) {
               sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][ri->opcode_id];

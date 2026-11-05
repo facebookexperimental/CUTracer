@@ -245,7 +245,7 @@ def build_sanitizer_result(
     error: str | None = None,
     provenance: ExecutionProvenance | None = None,
 ) -> SanitizerSweepResult:
-    """Build the canonical result used by both Local and MAST producers."""
+    """Build the canonical result used by both local and remote producers."""
     tool = spec.sanitizer_tool
     if tool is None:
         raise ValueError("sanitizer experiment requires a sanitizer_tool")
