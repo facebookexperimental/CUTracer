@@ -22,6 +22,7 @@ from cutracer.stress.stress import (
     run_stress,
     save_report,
     StressConfig,
+    SYMPTOM_HANG,
 )
 
 
@@ -103,6 +104,22 @@ def _parse_int_list(text: str) -> list[int]:
     show_default=True,
     help="Per-attempt timeout (s).",
 )
+@click.option(
+    "--kernel-timeout-s",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="CUTracer's per-kernel timeout in every run (0 = off). With a timeout, "
+    "the 15 s no-data watchdog is turned off, so a slow kernel is not mistaken "
+    "for a hung one.",
+)
+@click.option(
+    "--hang-is-bug/--no-hang-is-bug",
+    default=False,
+    show_default=True,
+    help="Count a run whose kernel CUTracer's watchdog ended (a hang) as a "
+    "reproduction, whatever the oracle's exit code. Pair with --kernel-timeout-s.",
+)
 @click.argument("oracle", nargs=-1, type=click.UNPROCESSED, required=True)
 def stress_command(
     delay_ladder_ns: str,
@@ -118,6 +135,8 @@ def stress_command(
     report_path: str | None,
     cutracer_so: str | None,
     timeout: int,
+    kernel_timeout_s: int,
+    hang_is_bug: bool,
     oracle: tuple[str, ...],
 ) -> None:
     """Search for a random-delay config that triggers a bug.
@@ -154,6 +173,8 @@ def stress_command(
         kernel_filters=kernel_filters,
         output_dir=output_dir,
         timeout=timeout,
+        kernel_timeout_s=kernel_timeout_s,
+        hang_is_bug=hang_is_bug,
     )
     click.echo(
         f"Running stress: {config.baseline_runs} baseline + "
@@ -172,8 +193,9 @@ def stress_command(
     if result.triggering is not None and os.path.exists(result.triggering.config_path):
         dump_out = dump_path or f"{output_dir}/triggering_config.json"
         shutil.copyfile(result.triggering.config_path, dump_out)
+        symptom = " (hang)" if result.triggering.symptom == SYMPTOM_HANG else ""
         click.echo(
-            f"Reproduced: delay_ns={result.triggering.delay_ns} "
+            f"Reproduced{symptom}: delay_ns={result.triggering.delay_ns} "
             f"warpgroup={result.triggering.warpgroup_id} "
             f"rate={result.reproduction_rate:.2f} -> {dump_out}"
         )
@@ -187,6 +209,13 @@ def stress_command(
         click.echo(
             f"Not reproduced across {result.completed_trials} trial(s) "
             f"({result.infra_errors} infra error(s)). No triggering config saved."
+        )
+    if result.hangs and not hang_is_bug:
+        click.echo(
+            f"NOTE: CUTracer's watchdog ended a hung kernel in {result.hangs} "
+            f"attempt(s); they were classified by the oracle's exit code. Pass "
+            f"--hang-is-bug to count hangs as reproductions.",
+            err=True,
         )
 
     if result.attribution == ATTRIBUTION_NATURAL:

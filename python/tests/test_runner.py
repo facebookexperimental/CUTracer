@@ -4,7 +4,9 @@
 
 import os
 import shutil
+import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,6 +21,7 @@ from cutracer.runner import (
     InstrumentationConfig,
     resolve_cutracer_so,
     run_instrumented_target,
+    run_process_group,
     with_run_delay_seed,
 )
 
@@ -583,3 +586,65 @@ class WithRunDelaySeedTest(unittest.TestCase):
                 runner=runner,
             )
         self.assertIn("CUTRACER_DELAY_SEED", runner.call_args.kwargs["env"])
+
+
+def _alive(pid: int) -> bool:
+    """Whether `pid` is a live (not zombie) process."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            state = stat.read().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state != "Z"
+
+
+def _gone_within(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while _alive(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+class RunProcessGroupTest(unittest.TestCase):
+    def test_returns_output_and_exit_code(self) -> None:
+        result = run_process_group(
+            ["sh", "-c", "echo out; echo err >&2; exit 3"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "out\n")
+        self.assertEqual(result.stderr, "err\n")
+
+    def test_check_raises_on_failure(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError):
+            run_process_group(["sh", "-c", "exit 2"], check=True)
+
+    def test_timeout_kills_every_process_of_the_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_process_group(
+                    ["sh", "-c", f"sleep 300 & echo $! > {pid_file}; wait"],
+                    timeout=1,
+                    capture_output=True,
+                    text=True,
+                    kill_grace_s=1,
+                )
+            with open(pid_file) as fh:
+                worker = int(fh.read())
+        self.assertTrue(_gone_within(worker, 10))
+
+    def test_processes_left_after_the_target_exits_are_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            result = run_process_group(
+                ["sh", "-c", f"sleep 300 >/dev/null 2>&1 & echo $! > {pid_file}"],
+                timeout=30,
+            )
+            with open(pid_file) as fh:
+                worker = int(fh.read())
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(_gone_within(worker, 10))

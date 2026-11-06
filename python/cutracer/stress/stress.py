@@ -23,18 +23,31 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import click
-from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
+from cutracer.runner import (
+    InstrumentationConfig,
+    run_instrumented_target,
+    run_process_group,
+    RunTarget,
+)
 from cutracer.stress.retention import (
     MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
     retain_oldest_and_newest,
 )
+from cutracer.watchdog import main_logs, watchdog_terminations
 
 
 logger: logging.Logger = logging.getLogger(__name__)
 MAX_REJECTED_CONFIGS = _MAX_REJECTED_CONFIGS
+# CUTracer's default no-data watchdog, kept when no kernel timeout is set.
+_DEFAULT_NO_DATA_TIMEOUT_S = 15
+
+# What the oracle observed in a reproduced attempt.
+SYMPTOM_FAILURE = "failure"
+# CUTracer's watchdog ended a hung kernel (requires `hang_is_bug`).
+SYMPTOM_HANG = "hang"
 
 
 @dataclass
@@ -62,6 +75,15 @@ class StressConfig:
     baseline_runs: int = 0
     output_dir: str = "."
     timeout: int = 1800
+    # CUTracer's per-kernel timeout for every run (0 = off). random_delay sends
+    # no trace data, so otherwise CUTracer's no-data watchdog ends any kernel
+    # that runs for 15 s; a positive value turns that watchdog off and bounds
+    # each kernel by this timeout instead.
+    kernel_timeout_s: int = 0
+    # Count a run whose kernel CUTracer's watchdog ended (a hang) as a
+    # reproduction, whatever the oracle's exit code. Off by default: a large
+    # delay can also slow a correct kernel past the timeout.
+    hang_is_bug: bool = False
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
     resume_result: Optional["StressResult"] = None
@@ -83,6 +105,10 @@ class StressConfig:
             raise ValueError("delay_ladder_ns must contain at least one delay")
         if self.baseline_runs < 0:
             raise ValueError(f"baseline_runs must be >= 0, got {self.baseline_runs}")
+        if self.kernel_timeout_s < 0:
+            raise ValueError(
+                f"kernel_timeout_s must be >= 0, got {self.kernel_timeout_s}"
+            )
 
 
 @dataclass
@@ -95,6 +121,7 @@ class TriggeringConfig:
     enable_prob: float
     attempt_index: int
     enabled_point_count: Optional[int] = None
+    symptom: str = SYMPTOM_FAILURE
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -104,6 +131,7 @@ class TriggeringConfig:
             "enable_prob": self.enable_prob,
             "attempt_index": self.attempt_index,
             "enabled_point_count": self.enabled_point_count,
+            "symptom": self.symptom,
         }
 
 
@@ -137,6 +165,10 @@ class StressResult:
     # ``infra_errors`` so a caller can tell "the workload hangs" apart from a
     # generic launch/tooling failure.
     timed_out: int = 0
+    # Attempts in which CUTracer's watchdog ended a hung kernel. They are also
+    # counted by outcome: as reproductions with `hang_is_bug`, otherwise by the
+    # oracle's exit code (or as `timed_out`).
+    hangs: int = 0
     # Attempts where the oracle reported the bug but the delay config it ran
     # under enabled NO injection point. The failure is real, but nothing this
     # search did can have caused it -- see `_enabled_point_count`.
@@ -155,6 +187,7 @@ class StressResult:
     # the same reason the search arm keeps `timed_out` and `infra_errors` apart.
     baseline_timed_out: int = 0
     baseline_infra_errors: int = 0
+    baseline_hangs: int = 0
     attribution: str = ATTRIBUTION_NO_BASELINE
 
     @property
@@ -187,6 +220,7 @@ class StressResult:
             "unattributed_reproductions": self.unattributed_reproductions,
             "infra_errors": self.infra_errors,
             "timed_out": self.timed_out,
+            "hangs": self.hangs,
             "log_size_bytes": self.log_size_bytes,
             "reproduction_rate": self.reproduction_rate,
             "baseline_requested": self.baseline_requested,
@@ -194,6 +228,7 @@ class StressResult:
             "baseline_reproductions": self.baseline_reproductions,
             "baseline_timed_out": self.baseline_timed_out,
             "baseline_infra_errors": self.baseline_infra_errors,
+            "baseline_hangs": self.baseline_hangs,
             "baseline_rate": self.baseline_rate,
             "attribution": self.attribution,
             "triggering_config": (
@@ -212,6 +247,7 @@ class _AttemptResult:
     log: str
     timed_out: int = 0
     unattributed: int = 0
+    hangs: int = 0
     # Delay config of an attempt that was rejected by validation. Kept so the
     # rejection can be diagnosed after the fact; a remote worker cannot be
     # attached to, and deleting the evidence at the moment validation fails
@@ -342,6 +378,7 @@ def _attempt_log(
     stdout: str = "",
     stderr: str = "",
     error: str = "",
+    watchdog: Sequence[str] = (),
 ) -> str:
     target = "all" if warpgroup is None else str(warpgroup)
     sections = [
@@ -353,9 +390,16 @@ def _attempt_log(
         sections.extend(("--- stdout ---", stdout))
     if stderr:
         sections.extend(("--- stderr ---", stderr))
+    if watchdog:
+        sections.extend(("--- CUTracer watchdog ---", *watchdog))
     if error:
         sections.extend(("--- error ---", error))
     return "\n".join(sections)
+
+
+def _no_data_timeout_s(config: StressConfig) -> int:
+    """The no-data watchdog setting: off whenever the kernel timeout bounds kernels."""
+    return 0 if config.kernel_timeout_s > 0 else _DEFAULT_NO_DATA_TIMEOUT_S
 
 
 def _validate_delay_config(  # noqa: C901
@@ -515,6 +559,9 @@ def _run_attempt_in_output_dir(
         os.unlink(config_path)
     except FileNotFoundError:
         pass
+    logs_before = main_logs(instrumentation_output_dir)
+    proc: Optional[subprocess.CompletedProcess[str]] = None
+    timeout_error = ""
     try:
         proc = run_instrumented_target(
             config.oracle_argv,
@@ -534,29 +581,18 @@ def _run_attempt_in_output_dir(
                 # A fresh seed per attempt, even when the caller's environment
                 # pins one: every process of the attempt shares it.
                 delay_seed=secrets.randbits(64),
+                kernel_timeout_s=config.kernel_timeout_s,
+                no_data_timeout_s=_no_data_timeout_s(config),
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
                 use_bundled_cuda_tools=config.use_bundled_cuda_tools,
                 kernel_events="nostack" if warpgroup is not None else None,
             ),
-            runner=runner,
+            runner=runner or run_process_group,
         )
     except subprocess.TimeoutExpired as exc:
-        _unlink(config_path)
-        return _AttemptResult(
-            0,
-            0,
-            0,
-            None,
-            _attempt_log(
-                delay_ns=delay_ns,
-                warpgroup=warpgroup,
-                attempt=attempt,
-                error=f"timed out: {exc}",
-            ),
-            timed_out=1,
-        )
+        timeout_error = f"timed out: {exc}"
     except (click.ClickException, OSError, ValueError) as exc:
         _unlink(config_path)
         return _AttemptResult(
@@ -576,18 +612,30 @@ def _run_attempt_in_output_dir(
         # none are left once the target has returned.
         _unlink(config_path + ".lock")
 
+    watchdog = watchdog_terminations(instrumentation_output_dir, before=logs_before)
+    hangs = 1 if watchdog else 0
+    # A hang ended by CUTracer's watchdog is the symptom itself; the oracle's
+    # exit code (or its absence after an outer timeout) then carries nothing.
+    hung = bool(watchdog) and config.hang_is_bug
+    returncode = None if proc is None else proc.returncode
     log = _attempt_log(
         delay_ns=delay_ns,
         warpgroup=warpgroup,
         attempt=attempt,
-        returncode=proc.returncode,
-        stdout=proc.stdout or "",
-        stderr=proc.stderr or "",
+        returncode=returncode,
+        stdout="" if proc is None else proc.stdout or "",
+        stderr="" if proc is None else proc.stderr or "",
+        error=timeout_error,
+        watchdog=watchdog,
     )
-    is_interesting = proc.returncode == 0
-    is_clean = proc.returncode != 0 and (
+    if returncode is None and not hung:
+        _unlink(config_path)
+        return _AttemptResult(0, 0, 0, None, log, timed_out=1, hangs=hangs)
+
+    is_interesting = hung or returncode == 0
+    is_clean = not is_interesting and (
         not config.not_interesting_exit_codes
-        or proc.returncode in config.not_interesting_exit_codes
+        or returncode in config.not_interesting_exit_codes
     )
     if not is_interesting and not is_clean:
         rejected = _preserve_rejected_config(config_path)
@@ -596,8 +644,9 @@ def _run_attempt_in_output_dir(
             0,
             1,
             None,
-            log + f"\n--- error ---\nunexpected oracle returncode {proc.returncode}",
+            log + f"\n--- error ---\nunexpected oracle returncode {returncode}",
             rejected_config_path=rejected,
+            hangs=hangs,
         )
 
     if (
@@ -614,19 +663,11 @@ def _run_attempt_in_output_dir(
             0,
             0,
             None,
-            _attempt_log(
-                delay_ns=delay_ns,
-                warpgroup=warpgroup,
-                attempt=attempt,
-                stdout=proc.stdout or "",
-                stderr=proc.stderr or "",
-                error=(
-                    "oracle reported the bug but the delay config enabled 0 "
-                    "verifiable injection points: the target reproduces without "
-                    "attributable injected delay"
-                ),
-            ),
+            log + "\n--- error ---\noracle reported the bug but the delay config "
+            "enabled 0 verifiable injection points: the target reproduces "
+            "without attributable injected delay",
             unattributed=1,
+            hangs=hangs,
         )
 
     config_error, kernel_identity, enabled_point_count = _validate_delay_config(
@@ -644,6 +685,7 @@ def _run_attempt_in_output_dir(
             None,
             log + f"\n--- error ---\n{config_error}",
             rejected_config_path=rejected,
+            hangs=hangs,
         )
     assert kernel_identity is not None
     assert enabled_point_count is not None
@@ -662,6 +704,7 @@ def _run_attempt_in_output_dir(
                 None,
                 log + f"\n--- error ---\n{targeting_error}",
                 rejected_config_path=rejected,
+                hangs=hangs,
             )
 
     if is_interesting:
@@ -676,11 +719,13 @@ def _run_attempt_in_output_dir(
                 enable_prob=config.enable_prob,
                 attempt_index=attempt,
                 enabled_point_count=enabled_point_count,
+                symptom=SYMPTOM_HANG if hung else SYMPTOM_FAILURE,
             ),
             log,
+            hangs=hangs,
         )
     _unlink(config_path)
-    return _AttemptResult(1, 0, 0, None, log)
+    return _AttemptResult(1, 0, 0, None, log, hangs=hangs)
 
 
 def _run_attempt(
@@ -833,6 +878,7 @@ class _BaselineResult:
     timed_out: int
     infra_errors: int
     logs: List[str]
+    hangs: int = 0
 
 
 def _run_baseline(
@@ -856,6 +902,7 @@ def _run_baseline(
     reproduced = 0
     timed_out = 0
     infra_errors = 0
+    hangs = 0
     logs: List[str] = []
     if config.baseline_runs <= 0:
         # A caller that opted out of the control arm must not pay for anything
@@ -863,6 +910,9 @@ def _run_baseline(
         return _BaselineResult(0, 0, 0, 0, 0, logs)
     delay_ns = config.delay_ladder_ns[0]
     for attempt in range(config.baseline_runs):
+        logs_before = main_logs(config.output_dir)
+        proc: Optional[subprocess.CompletedProcess[str]] = None
+        error = "baseline (injection disabled)"
         try:
             proc = run_instrumented_target(
                 config.oracle_argv,
@@ -877,35 +927,37 @@ def _run_baseline(
                     delay_ns=delay_ns,
                     delay_enable_prob=0.0,
                     delay_mode="random",
+                    kernel_timeout_s=config.kernel_timeout_s,
+                    no_data_timeout_s=_no_data_timeout_s(config),
                     cwd=config.cwd,
                     timeout=config.timeout,
                     base_env=config.base_env,
                     use_bundled_cuda_tools=config.use_bundled_cuda_tools,
                 ),
-                runner=runner,
+                runner=runner or run_process_group,
             )
         except subprocess.TimeoutExpired as exc:
-            timed_out += 1
-            logs.append(
-                _attempt_log(
-                    delay_ns=delay_ns,
-                    warpgroup=None,
-                    attempt=attempt,
-                    error=f"baseline timed out: {exc}",
-                )
-            )
-            continue
+            error = f"baseline timed out: {exc}"
+        watchdog = watchdog_terminations(config.output_dir, before=logs_before)
+        hangs += 1 if watchdog else 0
         logs.append(
             _attempt_log(
                 delay_ns=delay_ns,
                 warpgroup=None,
                 attempt=attempt,
-                stdout=proc.stdout or "",
-                stderr=proc.stderr or "",
-                error="baseline (injection disabled)",
+                stdout="" if proc is None else proc.stdout or "",
+                stderr="" if proc is None else proc.stderr or "",
+                error=error,
+                watchdog=watchdog,
             )
         )
-        if proc.returncode == 0:
+        if watchdog and config.hang_is_bug:
+            # The target hangs without any injected delay.
+            completed += 1
+            reproduced += 1
+        elif proc is None:
+            timed_out += 1
+        elif proc.returncode == 0:
             completed += 1
             reproduced += 1
         elif (
@@ -924,6 +976,7 @@ def _run_baseline(
         timed_out=timed_out,
         infra_errors=infra_errors,
         logs=logs,
+        hangs=hangs,
     )
 
 
@@ -975,6 +1028,7 @@ def run_stress(  # noqa: C901
     reproductions = 0 if resume is None else resume.reproductions
     infra_errors = 0 if resume is None else resume.infra_errors
     timed_out = 0 if resume is None else resume.timed_out
+    hangs = 0 if resume is None else resume.hangs
     unattributed = 0 if resume is None else resume.unattributed_reproductions
     baseline = (
         _run_baseline(config, cutracer_so=cutracer_so, runner=runner)
@@ -986,6 +1040,7 @@ def run_stress(  # noqa: C901
             timed_out=resume.baseline_timed_out,
             infra_errors=resume.baseline_infra_errors,
             logs=[],
+            hangs=resume.baseline_hangs,
         )
     )
     rejected_config_paths: List[str] = _bounded_rejected_config_paths(
@@ -1031,12 +1086,14 @@ def run_stress(  # noqa: C901
             triggering=triggering,
             log_path=log_path,
             timed_out=timed_out,
+            hangs=hangs,
             unattributed_reproductions=unattributed,
             baseline_requested=baseline.requested,
             baseline_completed=baseline.completed,
             baseline_reproductions=baseline.reproductions,
             baseline_timed_out=baseline.timed_out,
             baseline_infra_errors=baseline.infra_errors,
+            baseline_hangs=baseline.hangs,
             attribution=_attribution(
                 baseline_requested=baseline.requested,
                 baseline_completed=baseline.completed,
@@ -1068,6 +1125,7 @@ def run_stress(  # noqa: C901
                 reproductions += outcome.reproductions
                 infra_errors += outcome.infra_errors
                 timed_out += outcome.timed_out
+                hangs += outcome.hangs
                 unattributed += outcome.unattributed
                 trial_ordinal += 1
                 _record_rejected_config(
@@ -1113,12 +1171,14 @@ def run_stress(  # noqa: C901
         triggering=triggering,
         log_path=log_path,
         timed_out=timed_out,
+        hangs=hangs,
         unattributed_reproductions=unattributed,
         baseline_requested=baseline.requested,
         baseline_completed=baseline.completed,
         baseline_reproductions=baseline.reproductions,
         baseline_timed_out=baseline.timed_out,
         baseline_infra_errors=baseline.infra_errors,
+        baseline_hangs=baseline.hangs,
         attribution=_attribution(
             baseline_requested=baseline.requested,
             baseline_completed=baseline.completed,
