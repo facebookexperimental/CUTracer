@@ -106,7 +106,7 @@ analysis, and dedup studies.
 
 | `type` value | When emitted | Key fields |
 |--------------|--------------|------------|
-| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name` (demangled), `mangled_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `nregs`, `shmem`, `stream_id` |
+| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name` (demangled), `mangled_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `cluster_dim` (`[x,y,z]`, `[1,1,1]` without clusters), `cluster_size`, `nregs`, `shmem`, `stream_id` |
 | `"callstack_def"` | First time a unique CPU callstack is seen (mode=`dedup`) | `callstack_id` (hex hash), `frames` (array of strings), `source` |
 
 `kernel_name` remains the human-readable demangled name. `mangled_name` is the

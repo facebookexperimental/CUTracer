@@ -366,8 +366,9 @@ static uint64_t hash_callstack(const std::vector<std::string>& frames) {
  * In NOSTACK mode, omits callstack information entirely.
  */
 static void write_kernel_launch_event(const KernelFuncMetadata& meta, const KernelDimensions& dims,
-                                      unsigned int dynamic_shmem, uint64_t stream_id, uint64_t launch_id,
-                                      const std::vector<std::string>& callstack, const std::string& callstack_source) {
+                                      const ClusterLaunchInfo& cluster, unsigned int dynamic_shmem, uint64_t stream_id,
+                                      uint64_t launch_id, const std::vector<std::string>& callstack,
+                                      const std::string& callstack_source) {
   if (!g_kernel_events_writer || kernel_events_mode == KernelEventsMode::DISABLED) {
     return;
   }
@@ -380,6 +381,8 @@ static void write_kernel_launch_event(const KernelFuncMetadata& meta, const Kern
   event["kernel_checksum"] = meta.kernel_checksum;
   event["grid"] = {dims.gridDimX, dims.gridDimY, dims.gridDimZ};
   event["block"] = {dims.blockDimX, dims.blockDimY, dims.blockDimZ};
+  event["cluster_dim"] = {cluster.x, cluster.y, cluster.z};
+  event["cluster_size"] = cluster.size();
   event["nregs"] = meta.nregs;
   event["shmem"] = meta.shmem_static_nbytes + dynamic_shmem;
   event["stream_id"] = stream_id;
@@ -976,16 +979,16 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 
         // Dispatcher: 5-branch combinatorial over orthogonal targeting axes.
         // Axes: distribution (g_delay_mode), CTA targeting (g_delay_cta_target),
-        // warp targeting (g_delay_warp_mask / g_delay_warpgroup_id). The
-        // cluster+warp combo is FATAL'd at env-parse; the assert here is
-        // defense-in-depth and a placeholder for a future
-        // instrument_delay_cluster_warpgroup.
+        // warp targeting (g_delay_warp_mask / g_delay_warpgroup_id).
         const bool warp_active = (g_delay_warp_mask != 0) || (g_delay_warpgroup_id >= 0);
         const bool cluster_active = (g_delay_cta_target == 1);
+        const uint32_t warp_mask = effective_delay_warp_mask(g_delay_warp_mask, g_delay_warpgroup_id);
 
         if (found && enabled) {
           if (cluster_active && warp_active) {
-            assert(false && "cluster + warp targeting unsupported (see CUTRACER_DELAY_* validation)");
+            // Cluster + warp targeting: stall only the selected warps of the
+            // selected CTA of each cluster, with a fixed delay (warp lock-step).
+            instrument_cluster_warp_delay_injection(instr, delay_ns, warp_mask, cluster_seed, g_cluster_cta_id);
           } else if (cluster_active) {
             // Cluster targeting: delay one CTA per cluster (random per point via
             // cluster_seed, or forced via g_cluster_cta_id). Distribution within
@@ -1010,9 +1013,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
         if (found) {
           char warp_tag[64] = {0};
           if (warp_active) {
-            uint32_t effective_mask =
-                (g_delay_warpgroup_id >= 0) ? (0xFu << (g_delay_warpgroup_id * 4)) : g_delay_warp_mask;
-            snprintf(warp_tag, sizeof(warp_tag), " [WARPGROUP mask=0x%x id=%d]", effective_mask, g_delay_warpgroup_id);
+            snprintf(warp_tag, sizeof(warp_tag), " [WARPGROUP mask=0x%x id=%d]", warp_mask, g_delay_warpgroup_id);
           }
           loprintf("Delay injection: kernel=%s pc=0x%lx sass='%s' enabled=%s delay=%u%s%s%s\n", unmangled_name,
                    instr->getOffset(), instr->getSass(), enabled ? "true" : "false", enabled ? delay_ns : 0,
@@ -1421,7 +1422,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       } else {
         stream_id = (uint64_t)((cuLaunchKernel_params*)params)->hStream;
       }
-      write_kernel_launch_event(meta, dims, dynamic_shmem, stream_id, kernel_launch_id, cpu_callstack,
+      write_kernel_launch_event(meta, dims, cluster, dynamic_shmem, stream_id, kernel_launch_id, cpu_callstack,
                                 callstack_source);
     }
   }
@@ -1941,7 +1942,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   // Write structured kernel launch event for graph node launches
   if (kernel_events_mode != KernelEventsMode::DISABLED) {
     const auto& meta_ev = get_or_create_kernel_func_metadata(func, ctx);
-    write_kernel_launch_event(meta_ev, dims, config.shmem_dynamic_nbytes, (uint64_t)stream, kernel_launch_id,
+    write_kernel_launch_event(meta_ev, dims, cluster, config.shmem_dynamic_nbytes, (uint64_t)stream, kernel_launch_id,
                               cpu_callstack, callstack_source);
   }
 

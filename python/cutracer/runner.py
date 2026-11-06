@@ -688,7 +688,9 @@ _CUTRACER_OPTIONS = [
         help="Warp-targeted delay: warpgroup index (>= 0 selects warps [4N..4N+3]). "
         "Use to stall one warpgroup while peers race ahead (exposes warpgroup-scheduler races, "
         "e.g. TMEM dealloc on Blackwell). Resolved to a 32-bit warp mask on the host side. "
-        "Wins over --delay-warp-mask when both are set (a startup warning is emitted).",
+        "Wins over --delay-warp-mask when both are set (a startup warning is emitted). "
+        "With --delay-mode cluster or cluster_fixed, only the selected CTA of each cluster "
+        "stalls these warps.",
     ),
     click.option(
         "--delay-warp-mask",
@@ -697,7 +699,9 @@ _CUTRACER_OPTIONS = [
         help="Warp-targeted delay: explicit bitmask of CTA-local warp ids (hex or decimal, "
         "e.g. '0xF' for warps 0-3, '0xF0' for warps 4-7). Bit N == 1 means warp N is delayed. "
         "Warps >= 32 are silently skipped. Accepts strings so '0xF' works; C++ side parses "
-        "via strtoul(_, nullptr, 0). Ignored when --delay-warpgroup-id is also set.",
+        "via strtoul(_, nullptr, 0). Ignored when --delay-warpgroup-id is also set. "
+        "With --delay-mode cluster or cluster_fixed, only the selected CTA of each cluster "
+        "stalls these warps.",
     ),
     click.option(
         "--delay-patterns",
