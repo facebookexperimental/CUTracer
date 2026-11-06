@@ -237,6 +237,9 @@ struct CTXstate {
 
   // Deadlock handling
   std::atomic<time_t> kernel_start_time{0};
+  // Kernel that set kernel_start_time, for the kernel timeout message
+  // (guarded by writers_mutex)
+  std::string kernel_start_name;
   std::atomic<time_t> last_data_received_time{0};
   int deadlock_consecutive_hits = 0;
   bool deadlock_termination_initiated = false;

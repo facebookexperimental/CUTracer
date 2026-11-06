@@ -111,6 +111,83 @@ class TestHangE2E(unittest.TestCase):
     def _captured_output(result: subprocess.CompletedProcess) -> str:
         return (result.stdout or "") + (result.stderr or "")
 
+    # ------------------------------------------------------------------
+    # Test: --kernel-timeout-s ends a hang when no trace data flows
+    # ------------------------------------------------------------------
+
+    def test_kernel_timeout_with_random_delay_only(self):
+        """random_delay alone sends no channel records; the timeout must still fire.
+
+        All delay points are disabled: the kernel hangs on its own and the
+        no-data watchdog is off, so only the kernel timeout can end the run.
+        """
+        self._clean_trace_dir()
+        env = _build_cutracer_env(
+            cutracer_so=self.cutracer_so,
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters="add_kernel",
+            instr_categories=None,
+            trace_format=None,
+            output_dir=self.trace_dir,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=1000,
+            delay_enable_prob=0.0,
+            kernel_timeout_s=5,
+            no_data_timeout_s=0,
+        )
+        result = subprocess.run(
+            [sys.executable, self.script_path],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = self._captured_output(result)
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            f"Expected the kernel timeout to terminate the subprocess.\n"
+            f"OUTPUT:\n{output[-4000:]}",
+        )
+        self.assertIn(
+            "Kernel timeout: running for",
+            output,
+            f"Kernel timeout message not found.\nOUTPUT:\n{output[-4000:]}",
+        )
+        self.assertIn("kernel=add_kernel", output)
+
+    def test_random_delay_only_warns_that_no_data_watchdog_is_the_only_limit(self):
+        """Without a kernel timeout, startup must name the no-data watchdog
+        (15 s by default) as the limit that ends a delay-only run, so its
+        "No-data hang detected" is not mistaken for a deadlock diagnosis."""
+        self._clean_trace_dir()
+        env = _build_cutracer_env(
+            cutracer_so=self.cutracer_so,
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters="add_kernel",
+            instr_categories=None,
+            trace_format=None,
+            output_dir=self.trace_dir,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=1000,
+            delay_enable_prob=0.0,
+        )
+        result = subprocess.run(
+            [sys.executable, self.script_path],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = self._captured_output(result)
+        self.assertNotEqual(result.returncode, 0, output[-4000:])
+        self.assertIn("WARNING: random_delay alone sends no trace data", output)
+        self.assertIn("No-data hang detected", output)
+
     def _assert_deadlock_detected(self, result: subprocess.CompletedProcess):
         """Common precondition: CUTracer terminated the process on hang."""
         output = self._captured_output(result)

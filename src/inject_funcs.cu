@@ -415,14 +415,37 @@ extern "C" __device__ __noinline__ void instrument_tma(int pred, int opcode_id, 
 }
 
 /**
+ * @brief Sleep the calling thread for about @p delay_ns nanoseconds.
+ *
+ * A single __nanosleep() sleeps at most about 1 ms (the PTX nanosleep limit),
+ * so longer delays sleep in 1 ms chunks. Before SM 7.0 there is no nanosleep,
+ * so the thread busy-waits on clock64() instead (about 2 cycles per ns).
+ */
+__device__ __forceinline__ void sleep_for_ns(uint32_t delay_ns) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+  constexpr uint32_t kChunkNs = 1000000u;
+  uint32_t remaining = delay_ns;
+  while (remaining > kChunkNs) {
+    __nanosleep(kChunkNs);
+    remaining -= kChunkNs;
+  }
+  if (remaining > 0u) {
+    __nanosleep(remaining);
+  }
+#else
+  const uint64_t delay_cycles = static_cast<uint64_t>(delay_ns) * 2;
+  const uint64_t start = clock64();
+  while ((clock64() - start) < delay_cycles) {
+  }
+#endif
+}
+
+/**
  * @brief Device function to inject delay before any instrumented instruction.
  *
  * Injects a nanosleep delay before an instruction to expose potential race
  * conditions. The delay value is computed on the host during instrumentation,
  * so each instruction receives a unique, fixed delay value.
- *
- * Uses __nanosleep() intrinsic on SM 7.0+ (Volta and later), with a fallback
- * to busy-wait using clock64() on older architectures.
  *
  * @param pred Guard predicate value (from nvbit_add_call_arg_guard_pred_val)
  * @param delay_ns Delay in nanoseconds (passed from host, 0 = no delay)
@@ -431,16 +454,7 @@ extern "C" __device__ __noinline__ void instrument_delay(int pred, uint32_t dela
   if (!pred) {
     return;
   }
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-  __nanosleep(delay_ns);
-#else
-  // Fallback: busy-wait using clock64 (approximate 2 cycles per ns)
-  uint64_t delay_cycles = delay_ns * 2;
-  uint64_t start = clock64();
-  while ((clock64() - start) < delay_cycles) {
-  }
-#endif
+  sleep_for_ns(delay_ns);
 }
 
 /**
@@ -481,14 +495,7 @@ extern "C" __device__ __noinline__ void instrument_delay_random(int pred, uint32
   uint32_t range = max_delay_ns - min_delay_ns;
   uint32_t delay = min_delay_ns + (range > 0 ? seed % (range + 1) : 0);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-  __nanosleep(delay);
-#else
-  uint64_t delay_cycles = delay * 2;
-  uint64_t start = clock64();
-  while ((clock64() - start) < delay_cycles) {
-  }
-#endif
+  sleep_for_ns(delay);
 }
 
 /**
@@ -576,19 +583,7 @@ extern "C" __device__ __noinline__ void instrument_delay_random_cluster(int pred
     delay = min_delay_ns + (range > 0 ? seed % (range + 1) : 0);
   }
 
-  // CUDA __nanosleep has an implementation-defined per-call maximum
-  // (~1ms in practice on Hopper/Blackwell). For larger requested delays we
-  // loop in 1ms chunks so a 50ms or 500ms request actually sleeps that long
-  // instead of silently capping at the hardware limit.
-  const uint32_t CHUNK_NS = 1000000u;  // 1 ms
-  uint32_t remaining = delay;
-  while (remaining > CHUNK_NS) {
-    __nanosleep(CHUNK_NS);
-    remaining -= CHUNK_NS;
-  }
-  if (remaining > 0) {
-    __nanosleep(remaining);
-  }
+  sleep_for_ns(delay);
 #else
   // Reference args to silence unused-parameter warnings under -Wall.
   (void)pred;
@@ -640,18 +635,7 @@ extern "C" __device__ __noinline__ void instrument_delay_warpgroup(int pred, uin
     return;
   }
 
-  // CUDA __nanosleep has an implementation-defined per-call maximum
-  // (~1ms in practice on Hopper/Blackwell). Loop in 1ms chunks so a 50ms or
-  // 500ms request actually sleeps that long instead of silently capping.
-  const uint32_t CHUNK_NS = 1000000u;
-  uint32_t remaining = delay_ns;
-  while (remaining > CHUNK_NS) {
-    __nanosleep(CHUNK_NS);
-    remaining -= CHUNK_NS;
-  }
-  if (remaining > 0u) {
-    __nanosleep(remaining);
-  }
+  sleep_for_ns(delay_ns);
 #else
   // Reference args to silence unused-parameter warnings under -Wall.
   (void)pred;

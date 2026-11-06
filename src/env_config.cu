@@ -722,6 +722,15 @@ bool has_any_instrumentation_enabled() {
   return !enabled_instrument_types_ordered.empty();
 }
 
+bool has_channel_instrumentation_enabled() {
+  for (const InstrumentType type : enabled_instrument_types_ordered) {
+    if (type != InstrumentType::RANDOM_DELAY) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool is_analysis_type_enabled(AnalysisType type) {
   return enabled_analysis_types.count(type);
 }
@@ -1296,6 +1305,24 @@ void init_config_from_env() {
   get_var_uint32(no_data_timeout_s, "CUTRACER_NO_DATA_TIMEOUT_S", 15,
                  "No-data hang timeout in seconds (default: 15). Detect silent kernel hangs. "
                  "Independent of deadlock detection (0 = disabled)");
+
+  // random_delay alone sends no channel records, so with the kernel timeout
+  // off the no-data watchdog is the only thing that ends a long kernel — and
+  // in this mode it measures silence since launch, which a legitimately
+  // delayed kernel produces just as a hung one does. Say so once at startup
+  // instead of letting the eventual "No-data hang detected" read as a
+  // deadlock diagnosis.
+  if (is_instrument_type_enabled(InstrumentType::RANDOM_DELAY) && !has_channel_instrumentation_enabled() &&
+      kernel_timeout_s == 0 && no_data_timeout_s > 0) {
+    fprintf(stderr,
+            "WARNING: random_delay alone sends no trace data and CUTRACER_KERNEL_TIMEOUT_S is\n"
+            "         disabled, so the no-data watchdog (CUTRACER_NO_DATA_TIMEOUT_S=%u) will end\n"
+            "         any kernel that runs longer than that — including one legitimately slowed\n"
+            "         by injected delays, which the log then reports as a hang. For long-running\n"
+            "         kernels, raise CUTRACER_NO_DATA_TIMEOUT_S or set CUTRACER_KERNEL_TIMEOUT_S\n"
+            "         (in this mode it counts from launch and names the kernel it ends).\n",
+            no_data_timeout_s);
+  }
 
   // Trace file size limit (MB, 0 = disabled)
   get_var_uint32(trace_size_limit_mb, "CUTRACER_TRACE_SIZE_LIMIT_MB", 0,

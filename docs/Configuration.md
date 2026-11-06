@@ -189,8 +189,8 @@ runaway-large. All accept `0` to disable.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `CUTRACER_KERNEL_TIMEOUT_S` | uint32 | `0` (disabled) | Max wall-clock seconds a single kernel is allowed to run |
-| `CUTRACER_NO_DATA_TIMEOUT_S` | uint32 | `15` | Abort if no records arrive on the channel for this many seconds |
+| `CUTRACER_KERNEL_TIMEOUT_S` | uint32 | `0` (disabled) | Max wall-clock seconds a single kernel is allowed to run, counted from its first trace record, or from its launch when it sends none (`random_delay` alone, instrumentation plans) |
+| `CUTRACER_NO_DATA_TIMEOUT_S` | uint32 | `15` | Abort if no records arrive on the channel for this many seconds. With `random_delay` alone no records ever arrive, so this is a per-kernel wall-clock limit counted from launch; CUTracer warns at startup when it is the only limit in that mode |
 | `CUTRACER_TRACE_SIZE_LIMIT_MB` | uint32 | `0` (disabled) | Stop tracing once the on-disk trace reaches this size (MB) |
 
 ---

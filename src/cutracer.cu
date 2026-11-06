@@ -1442,6 +1442,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       ctx_state->kernel_start_time = time(nullptr);
+      ctx_state->kernel_start_name = meta.unmangled_name;
       ctx_state->last_data_received_time = 0;
       auto& writer = create_trace_writer_locked(ctx_state, current_launch_id, base_filename, metadata);
       if (!plan_applied.is_null()) writer.write_metadata(plan_applied);
