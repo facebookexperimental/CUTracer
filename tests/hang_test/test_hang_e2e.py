@@ -60,6 +60,18 @@ class TestHangE2E(unittest.TestCase):
         tmp.close()
         cls.script_path = tmp.name
 
+        graph_content = pkg_resources.resource_string(
+            "hang_test_resources",
+            "test_hang_graph.py",
+        ).decode()
+        graph_tmp = tempfile.NamedTemporaryFile(
+            suffix=".py", mode="w", delete=False, prefix="hang_graph_"
+        )
+        graph_tmp.write(graph_content)
+        graph_tmp.flush()
+        graph_tmp.close()
+        cls.graph_script_path = graph_tmp.name
+
         # Temp dir for CUTracer trace + warp-status output
         cls.trace_dir = tempfile.mkdtemp(prefix="cutracer_hang_")
 
@@ -67,6 +79,8 @@ class TestHangE2E(unittest.TestCase):
     def tearDownClass(cls):
         if hasattr(cls, "script_path") and os.path.exists(cls.script_path):
             os.unlink(cls.script_path)
+        if hasattr(cls, "graph_script_path") and os.path.exists(cls.graph_script_path):
+            os.unlink(cls.graph_script_path)
         if hasattr(cls, "trace_dir") and os.path.exists(cls.trace_dir):
             shutil.rmtree(cls.trace_dir, ignore_errors=True)
 
@@ -156,6 +170,42 @@ class TestHangE2E(unittest.TestCase):
             output,
             f"Kernel timeout message not found.\nOUTPUT:\n{output[-4000:]}",
         )
+        self.assertIn("kernel=add_kernel", output)
+
+    def test_kernel_timeout_with_random_delay_only_in_a_cuda_graph(self):
+        """A delay-only graph execution must start the kernel timeout too.
+
+        The launches during graph capture do not execute, and graph nodes
+        send no trace records, so only the start time recorded at graph node
+        launch lets the kernel timeout end the replayed hang (the no-data
+        watchdog is off).
+        """
+        self._clean_trace_dir()
+        env = _build_cutracer_env(
+            cutracer_so=self.cutracer_so,
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters="add_kernel",
+            instr_categories=None,
+            trace_format=None,
+            output_dir=self.trace_dir,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=1000,
+            delay_enable_prob=0.0,
+            kernel_timeout_s=5,
+            no_data_timeout_s=0,
+        )
+        result = subprocess.run(
+            [sys.executable, self.graph_script_path],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = self._captured_output(result)
+        self.assertNotEqual(result.returncode, 0, output[-4000:])
+        self.assertIn("Kernel timeout: running for", output)
         self.assertIn("kernel=add_kernel", output)
 
     def test_random_delay_only_warns_that_no_data_watchdog_is_the_only_limit(self):
