@@ -21,6 +21,7 @@ from cutracer.stress.stress import (
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
     ATTRIBUTION_NO_BASELINE,
+    reduce_args,
     run_stress,
     save_report,
     STRATEGY_ISOLATE,
@@ -308,7 +309,7 @@ def stress_command(  # noqa: C901
     if result.triggering is not None and os.path.exists(result.triggering.config_path):
         dump_out = dump_path or f"{output_dir}/triggering_config.json"
         shutil.copyfile(result.triggering.config_path, dump_out)
-        _echo_reproduction(result, dump_out, oracle)
+        _echo_reproduction(config, result, dump_out, oracle)
     elif result.triggering is not None:
         click.echo(
             f"Reproduced (delay_ns={result.triggering.delay_ns}) but its delay "
@@ -372,7 +373,10 @@ def stress_command(  # noqa: C901
 
 
 def _echo_reproduction(
-    result: StressResult, dump_out: str, oracle: tuple[str, ...]
+    config: StressConfig,
+    result: StressResult,
+    dump_out: str,
+    oracle: tuple[str, ...],
 ) -> None:
     triggering = result.triggering
     assert triggering is not None
@@ -395,3 +399,6 @@ def _echo_reproduction(
         replay = ["cutracer", "trace", *triggering.replay_args]
         replay += ["--delay-load-path", dump_out, "--", *oracle]
         click.echo(f"Replay: {shlex.join(replay)}")
+        reduce = ["cutracer", "reduce", "-c", dump_out, "-t", shlex.join(oracle)]
+        reduce += reduce_args(config, triggering)
+        click.echo(f"Reduce: {shlex.join(reduce)}")

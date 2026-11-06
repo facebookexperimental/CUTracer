@@ -491,6 +491,105 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(result.outcome, ReplayOutcome.INFRA_ERROR)
         self.assertIn("kernel event line exceeds", result.error or "")
 
+    def test_replay_passes_the_recorded_targeting(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        run_replay(
+            str(self.config_path),
+            ReplayConfig(
+                oracle_argv=["./oracle"],
+                cutracer_so=str(self.cutracer_so),
+                delay_mode="cluster_fixed",
+                delay_cluster_cta_id=1,
+                delay_warp_mask="0x10",
+                delay_patterns="SYNCS.PHASECHK",
+                kernel_timeout_s=60,
+            ),
+            runner=runner,
+        )
+
+        env = calls[0]
+        self.assertEqual(env["CUTRACER_DELAY_MODE"], "cluster_fixed")
+        self.assertEqual(env["CUTRACER_CLUSTER_CTA_ID"], "1")
+        self.assertEqual(env["CUTRACER_DELAY_WARP_MASK"], "0x10")
+        self.assertEqual(env["CUTRACER_DELAY_PATTERNS"], "SYNCS.PHASECHK")
+        self.assertEqual(env["CUTRACER_KERNEL_TIMEOUT_S"], "60")
+        self.assertEqual(env["CUTRACER_NO_DATA_TIMEOUT_S"], "0")
+
+    def test_replay_rejects_a_negative_kernel_timeout(self):
+        with self.assertRaisesRegex(ValueError, "kernel timeout"):
+            ReplayConfig(oracle_argv=["./oracle"], kernel_timeout_s=-1)
+
+    def _hang_runner(self, *, returncode=-15, raise_timeout=False):
+        """A runner whose replay hangs: CUTracer logs its kernel timeout, then SIGTERM."""
+
+        def runner(argv, **kwargs):
+            log = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"]) / "cutracer_main_1.log"
+            log.write_text(
+                "Kernel timeout: running for 61 seconds (limit: 60 seconds); "
+                "sending SIGTERM. kernel=k\n"
+            )
+            if raise_timeout:
+                raise subprocess.TimeoutExpired(argv, 1)
+            return subprocess.CompletedProcess(argv, returncode, "", "")
+
+        return runner
+
+    def _replay_config(self, **overrides):
+        fields = {
+            "oracle_argv": ["./oracle"],
+            "cutracer_so": str(self.cutracer_so),
+            "output_dir": str(self.temp_dir / "replay"),
+        }
+        fields.update(overrides)
+        os.makedirs(fields["output_dir"], exist_ok=True)
+        return ReplayConfig(**fields)
+
+    def test_replay_hang_is_interesting_with_hang_is_bug(self):
+        hang = run_replay(
+            str(self.config_path),
+            self._replay_config(hang_is_bug=True),
+            runner=self._hang_runner(),
+        )
+        exit_code_rules = run_replay(
+            str(self.config_path),
+            self._replay_config(output_dir=str(self.temp_dir / "plain")),
+            runner=self._hang_runner(),
+        )
+
+        self.assertEqual(hang.outcome, ReplayOutcome.INTERESTING)
+        self.assertIn("Kernel timeout: running for 61 seconds", hang.error)
+        self.assertEqual(exit_code_rules.outcome, ReplayOutcome.INFRA_ERROR)
+
+    def test_replay_timeout_after_a_watchdog_hang_is_interesting(self):
+        hang = run_replay(
+            str(self.config_path),
+            self._replay_config(hang_is_bug=True),
+            runner=self._hang_runner(raise_timeout=True),
+        )
+        plain = run_replay(
+            str(self.config_path),
+            self._replay_config(output_dir=str(self.temp_dir / "plain")),
+            runner=self._hang_runner(raise_timeout=True),
+        )
+
+        self.assertEqual(hang.outcome, ReplayOutcome.INTERESTING)
+        self.assertEqual(plain.outcome, ReplayOutcome.TIMED_OUT)
+
+    def test_replay_ignores_watchdog_lines_of_earlier_replays(self):
+        config = self._replay_config(hang_is_bug=True)
+        run_replay(str(self.config_path), config, runner=self._hang_runner())
+
+        def clean_runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        clean = run_replay(str(self.config_path), config, runner=clean_runner)
+        self.assertEqual(clean.outcome, ReplayOutcome.NOT_INTERESTING)
+
     def test_reducer_aborts_on_replay_infra_error(self):
         def runner(argv, **kwargs):
             return subprocess.CompletedProcess(argv, 2, "", "launch failed")
