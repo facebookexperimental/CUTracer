@@ -17,6 +17,12 @@
       "minimum": 0,
       "description": "Default delay value in nanoseconds used during instrumentation"
     },
+    "seed": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615,
+      "description": "CUTRACER_DELAY_SEED of the run (uint64_t); each point's on/off choice is derived from it, the kernel checksum and the PC"
+    },
     "kernels": {
       "type": "object",
       "description": "Map of kernel configurations, keyed by kernel_name + timestamp",
@@ -81,6 +87,12 @@
         "on": {
           "type": "boolean",
           "description": "Whether delay injection is enabled for this point"
+        },
+        "cluster_seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Cluster delay modes: per-point seed (uint32_t) that picks which CTA of each cluster is delayed (written when nonzero)"
         }
       },
       "additionalProperties": false
