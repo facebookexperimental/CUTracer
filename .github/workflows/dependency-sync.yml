@@ -1,0 +1,41 @@
+name: Dependency Sync
+
+# Fail fast when python/pyproject.toml and python/requirements.txt drift.
+# The check itself lives in python/tests/test_dependency_sync.py and also
+# runs with the Python unit tests on the GPU workflows; this workflow only
+# gives it a seconds-long CPU signal instead of waiting for a GPU lane.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/requirements.txt"
+      - "python/tests/test_dependency_sync.py"
+      - ".github/workflows/dependency-sync.yml"
+  push:
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/requirements.txt"
+      - "python/tests/test_dependency_sync.py"
+      - ".github/workflows/dependency-sync.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check-dependency-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check pyproject.toml and requirements.txt are in sync
+        run: |
+          cd python
+          python -m unittest discover -s tests -p "test_dependency_sync.py" -v

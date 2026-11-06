@@ -15,19 +15,28 @@ authors = [
 readme = "README.md"
 license = "MIT"
 
+# Canonical dependency list: requirements.txt mirrors [project.dependencies]
+# and [project.optional-dependencies] below (flattened into one file).
+# When updating any dependency in either file, update the other in the same
+# change; if the two disagree, this file wins. [build-system] requires are
+# build-only and are intentionally not mirrored in requirements.txt.
 dependencies = [
     "click>=8.0.0",
     "jsonschema>=4.0.0",
     "zstandard>=0.20.0",
     "tabulate>=0.9.0",
+    "importlib_resources>=5.0.0; python_version < '3.11'",
     "tritonparse>=0.4.3",
 ]
 
 [project.optional-dependencies]
 # Must stay optional: yscope_clp_core ships only x86_64 wheels (no sdist), so
 # requiring it breaks `pip install cutracer` on aarch64 (e.g. GB200/GB300).
+# The platform_machine marker keeps the clp extra a no-op off x86_64,
+# matching requirements.txt; querying a .clp archive there reports that
+# yscope_clp_core is unavailable.
 clp = [
-    "yscope_clp_core>=0.7.1b2",
+    "yscope_clp_core>=0.7.1b2; platform_machine == 'x86_64'",
 ]
 dev = [
     "mypy>=1.0.0",
