@@ -151,9 +151,10 @@ Random delays slow a producer down along with its consumers, so they rarely let 
 cutracer stress --strategy isolate -k my_kernel -o /tmp/iso -- ./oracle.sh
 # Reproduced (hang): delay_ns=1000000 target=cluster rank 1, warp 4 rate=0.20 -> /tmp/iso/triggering_config.json
 # Replay: cutracer trace ... --delay-mode cluster_fixed --delay-cluster-cta-id 1 --delay-warp-mask 0x10 ... --delay-load-path /tmp/iso/triggering_config.json -- ./oracle.sh
+# Reduce: cutracer reduce -c /tmp/iso/triggering_config.json -t ./oracle.sh ... --delay-warp-mask 0x10 ... --hang-is-bug
 ```
 
-A delay config records which points were on, not how the delay was targeted, so `triggering_config` in `stress_report.json` also carries the `target`, the `symptom` and the `replay_args` that restore the targeting. Both strategies take `--kernel-timeout-s` and `--hang-is-bug`. With a kernel timeout, the 15 s no-data watchdog is off, so a kernel slowed down by its delays is not mistaken for a hung one.
+A delay config records which points were on, not how the delay was targeted, so `triggering_config` in `stress_report.json` also carries the `target`, the `symptom` and the `replay_args` that restore the targeting. The CLI also prints the `cutracer reduce` command (`--delay-mode`, `--delay-cluster-cta-id`, `--delay-warp-mask`, `--delay-patterns`, `--kernel-timeout-s`, `--hang-is-bug`) that narrows the config down to the waits that matter with the same targeting. Both strategies take `--kernel-timeout-s` and `--hang-is-bug`. With a kernel timeout, the 15 s no-data watchdog is off, so a kernel slowed down by its delays is not mistaken for a hung one.
 
 ---
 

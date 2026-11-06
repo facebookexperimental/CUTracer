@@ -20,7 +20,13 @@ from typing import Callable, Mapping, Optional, Sequence
 from click import ClickException
 from cutracer.cutracer_logger import get_logger
 from cutracer.reduce.config_mutator import DelayConfigMutator, DelayPoint
-from cutracer.runner import InstrumentationConfig, run_instrumented_target, RunTarget
+from cutracer.runner import (
+    InstrumentationConfig,
+    run_instrumented_target,
+    run_process_group,
+    RunTarget,
+)
+from cutracer.watchdog import main_logs, watchdog_terminations
 
 logger = get_logger("reduce")
 
@@ -45,6 +51,17 @@ class ReplayConfig:
     delay_mode: Optional[str] = None
     delay_warpgroup_id: Optional[int] = None
     delay_warp_mask: Optional[str] = None
+    # The rest of the targeting a candidate was recorded under (a delay config
+    # records which points are on, not how the delay was targeted), e.g. from
+    # the `replay_args` of a `cutracer stress --strategy isolate` report.
+    delay_cluster_cta_id: Optional[int] = None
+    delay_patterns: Optional[str] = None
+    # CUTracer's per-kernel timeout for each replay (0 = off); a positive value
+    # turns the no-data watchdog off, as in `cutracer stress`.
+    kernel_timeout_s: int = 0
+    # A replay whose kernel CUTracer's watchdog ended (a hang) is interesting,
+    # whatever the oracle's exit code.
+    hang_is_bug: bool = False
     output_dir: Optional[str] = None
     timeout: int = 300
     cwd: Optional[str] = None
@@ -61,6 +78,8 @@ class ReplayConfig:
     def __post_init__(self) -> None:
         if self.timeout <= 0:
             raise ValueError("replay timeout must be positive")
+        if self.kernel_timeout_s < 0:
+            raise ValueError("replay kernel timeout must be >= 0")
         if (self.expected_kernel_name is None) != (
             self.expected_kernel_checksum is None
         ):
@@ -331,13 +350,27 @@ def _classify_replay_process(
     )
 
 
-def _run_replay_once(
+def _run_replay_once(  # noqa: C901
     config_path: str,
     config: ReplayConfig,
     *,
     output_dir: Optional[str],
     runner: Optional[RunTarget] = None,
 ) -> ReplayResult:
+    # Without an output directory, CUTracer writes its main logs to
+    # CUTRACER_OUTPUT_DIR when the caller's environment sets one (the runner
+    # only overrides it for an explicit output dir), else to the target's
+    # working directory.
+    log_dir = (
+        output_dir or os.environ.get("CUTRACER_OUTPUT_DIR") or config.cwd or os.getcwd()
+    )
+    logs_before = main_logs(log_dir) if config.hang_is_bug else set()
+
+    def hang_lines() -> list[str]:
+        if not config.hang_is_bug:
+            return []
+        return watchdog_terminations(log_dir, before=logs_before)
+
     try:
         proc = run_instrumented_target(
             config.oracle_argv,
@@ -351,20 +384,35 @@ def _run_replay_once(
                 output_dir=output_dir,
                 delay_ns=_replay_delay_ns(config_path),
                 delay_mode=config.delay_mode,
+                delay_cluster_cta_id=config.delay_cluster_cta_id,
                 delay_warpgroup_id=config.delay_warpgroup_id,
                 delay_warp_mask=config.delay_warp_mask,
+                delay_patterns=config.delay_patterns,
                 delay_load_path=config_path,
                 kernel_events=(
                     "nostack" if config.expected_kernel_name is not None else None
+                ),
+                kernel_timeout_s=config.kernel_timeout_s,
+                no_data_timeout_s=(
+                    0
+                    if config.kernel_timeout_s > 0
+                    else InstrumentationConfig.no_data_timeout_s
                 ),
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
                 capture_output=config.capture_output,
             ),
-            runner=runner,
+            runner=runner or run_process_group,
         )
     except subprocess.TimeoutExpired as exc:
+        watchdog = hang_lines()
+        if watchdog:
+            return ReplayResult(
+                outcome=ReplayOutcome.INTERESTING,
+                returncode=None,
+                error="hang: " + watchdog[0],
+            )
         return ReplayResult(
             outcome=ReplayOutcome.TIMED_OUT,
             returncode=None,
@@ -377,7 +425,17 @@ def _run_replay_once(
             error=str(exc),
         )
 
-    replay_result = _classify_replay_process(proc, config)
+    watchdog = hang_lines()
+    if watchdog:
+        replay_result = ReplayResult(
+            outcome=ReplayOutcome.INTERESTING,
+            returncode=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            error="hang: " + watchdog[0],
+        )
+    else:
+        replay_result = _classify_replay_process(proc, config)
     if replay_result.outcome == ReplayOutcome.INFRA_ERROR:
         return replay_result
 

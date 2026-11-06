@@ -532,6 +532,21 @@ def _replay_args(
     targeted, so a replay must pass the targeting again.
     """
     args = ["-i", "random_delay", "-a", "random_delay", "--delay-ns", str(delay_ns)]
+    args += _targeting_args(config, warpgroup=warpgroup, target=target)
+    if config.kernel_timeout_s > 0:
+        args += ["--no-data-timeout-s", "0"]
+    return args
+
+
+def _targeting_args(
+    config: StressConfig,
+    *,
+    warpgroup: Optional[int],
+    target: Optional[DelayTarget],
+) -> List[str]:
+    """Options that `cutracer trace` and `cutracer reduce` share to restore an
+    attempt's targeting and kernel timeout."""
+    args: List[str] = []
     if config.kernel_filters:
         args += ["-k", config.kernel_filters]
     if target is not None:
@@ -548,7 +563,23 @@ def _replay_args(
         args += ["--delay-patterns", patterns]
     if config.kernel_timeout_s > 0:
         args += ["--kernel-timeout-s", str(config.kernel_timeout_s)]
-        args += ["--no-data-timeout-s", "0"]
+    return args
+
+
+def reduce_args(config: StressConfig, triggering: TriggeringConfig) -> List[str]:
+    """`cutracer reduce` options that replay the triggering config the way the
+    search ran it; add `-c <config> -t <oracle>`."""
+    target = None
+    if triggering.target is not None:
+        warp = triggering.target.get("warp")
+        if warp is not None:
+            target = DelayTarget(
+                warp=int(warp),
+                cluster_rank=triggering.target.get("cluster_rank"),
+            )
+    args = _targeting_args(config, warpgroup=triggering.warpgroup_id, target=target)
+    if triggering.symptom == SYMPTOM_HANG:
+        args.append("--hang-is-bug")
     return args
 
 

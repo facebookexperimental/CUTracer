@@ -273,6 +273,94 @@ class ReduceCliTest(unittest.TestCase):
         self.assertIn("Minimal set:", result.output)
         self.assertIn("Iterations:", result.output)
 
+    def test_reduce_replays_with_the_recorded_targeting(self):
+        """An isolate finding replays only with the targeting it was found under."""
+        oracle = Path(self.temp_dir) / "oracle_targeting.sh"
+        oracle.write_text(
+            "#!/bin/bash\n"
+            '[ "$CUTRACER_DELAY_MODE" = cluster_fixed ] && '
+            '[ "$CUTRACER_CLUSTER_CTA_ID" = 1 ] && '
+            '[ "$CUTRACER_DELAY_WARP_MASK" = 0x10 ] && '
+            '[ "$CUTRACER_DELAY_PATTERNS" = SYNCS.PHASECHK ] && '
+            '[ "$CUTRACER_KERNEL_TIMEOUT_S" = 60 ] && '
+            '[ "$CUTRACER_NO_DATA_TIMEOUT_S" = 0 ] && exit 0\n'
+            "exit 1\n"
+        )
+        oracle.chmod(0o755)
+        targeting = [
+            "--delay-mode",
+            "cluster_fixed",
+            "--delay-cluster-cta-id",
+            "1",
+            "--delay-warp-mask",
+            "0x10",
+            "--delay-patterns",
+            "SYNCS.PHASECHK",
+            "--kernel-timeout-s",
+            "60",
+        ]
+
+        def invoke(*extra):
+            return self.runner.invoke(
+                main,
+                [
+                    "reduce",
+                    *self.runtime_args,
+                    "--config",
+                    str(self.config_file),
+                    "--test",
+                    str(oracle),
+                    "--output",
+                    str(Path(self.temp_dir) / "report.json"),
+                    "--minimal-config",
+                    str(Path(self.temp_dir) / "minimal.json"),
+                    *extra,
+                ],
+            )
+
+        targeted = invoke(*targeting)
+        untargeted = invoke()
+
+        self.assertEqual(targeted.exit_code, 0, targeted.output)
+        self.assertIn("REDUCTION COMPLETE", targeted.output)
+        self.assertNotEqual(untargeted.exit_code, 0)
+        self.assertIn("Initial config does not trigger", untargeted.output)
+
+    def test_reduce_counts_a_watchdog_hang_with_hang_is_bug(self):
+        oracle = Path(self.temp_dir) / "oracle_hang.sh"
+        oracle.write_text(
+            "#!/bin/bash\n"
+            'echo "Kernel timeout: running for 61 seconds (limit: 60 seconds); '
+            'sending SIGTERM. kernel=k" > "$CUTRACER_OUTPUT_DIR/cutracer_main_$$.log"\n'
+            "exit 143\n"
+        )
+        oracle.chmod(0o755)
+
+        def invoke(*extra):
+            return self.runner.invoke(
+                main,
+                [
+                    "reduce",
+                    *self.runtime_args,
+                    "--config",
+                    str(self.config_file),
+                    "--test",
+                    str(oracle),
+                    "--output",
+                    str(Path(self.temp_dir) / "report.json"),
+                    "--minimal-config",
+                    str(Path(self.temp_dir) / "minimal.json"),
+                    *extra,
+                ],
+            )
+
+        hang_is_bug = invoke("--hang-is-bug")
+        exit_code_only = invoke()
+
+        self.assertEqual(hang_is_bug.exit_code, 0, hang_is_bug.output)
+        self.assertIn("REDUCTION COMPLETE", hang_is_bug.output)
+        self.assertNotEqual(exit_code_only.exit_code, 0)
+
 
 class ReduceCliEmptyConfigTest(unittest.TestCase):
     """Tests for reduce command with edge case configs."""

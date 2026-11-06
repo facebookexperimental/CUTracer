@@ -105,6 +105,49 @@ def _run_reduction(
 )
 @click.option("-k", "--kernel-filters", default=None, help="Kernel name filter.")
 @click.option(
+    "--delay-mode",
+    type=click.Choice(["random", "fixed", "cluster", "cluster_fixed"]),
+    default=None,
+    help="Delay mode the config was recorded under (as for `cutracer trace`).",
+)
+@click.option(
+    "--delay-cluster-cta-id",
+    type=int,
+    default=None,
+    help="CTA index in each cluster that the config delays (cluster modes).",
+)
+@click.option(
+    "--delay-warpgroup-id",
+    type=int,
+    default=None,
+    help="Warpgroup that the config delays.",
+)
+@click.option(
+    "--delay-warp-mask",
+    default=None,
+    help="CTA-local warp mask that the config delays, e.g. 0x10.",
+)
+@click.option(
+    "--delay-patterns",
+    default=None,
+    help="SASS substrings the config was recorded with.",
+)
+@click.option(
+    "--kernel-timeout-s",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="CUTracer's per-kernel timeout in each replay (0 = off); also turns the "
+    "no-data watchdog off.",
+)
+@click.option(
+    "--hang-is-bug/--no-hang-is-bug",
+    default=False,
+    show_default=True,
+    help="Treat a replay whose kernel CUTracer's watchdog ended (a hang) as "
+    "interesting, whatever the oracle's exit code.",
+)
+@click.option(
     "--timeout",
     type=click.IntRange(min=1),
     default=300,
@@ -157,6 +200,13 @@ def reduce_command(
     test: str,
     cutracer_so: str | None,
     kernel_filters: str | None,
+    delay_mode: str | None,
+    delay_cluster_cta_id: int | None,
+    delay_warpgroup_id: int | None,
+    delay_warp_mask: str | None,
+    delay_patterns: str | None,
+    kernel_timeout_s: int,
+    hang_is_bug: bool,
     timeout: int,
     output: str,
     minimal_config: str,
@@ -188,12 +238,19 @@ def reduce_command(
     a wrapper script that exits 0 on manifest (the issue1996_pytest_race.sh
     convention).
 
+    A config found by ``cutracer stress --strategy isolate`` replays only with
+    the targeting it was recorded under (the last example); ``cutracer stress``
+    prints that command.
+
     Examples:
 
     \b
       cutracer reduce -c repro.json -t ./test_race.sh
       cutracer reduce -c repro.json -t ./test_race.sh --strategy bisect
       cutracer reduce -c repro.json -t ./test_race.sh -s bisect --confidence-runs 3
+      cutracer reduce -c triggering_config.json -t ./oracle.sh --delay-mode cluster_fixed \\
+          --delay-cluster-cta-id 1 --delay-warp-mask 0x10 --delay-patterns SYNCS.PHASECHK \\
+          --kernel-timeout-s 60 --hang-is-bug
     """
     if verbose:
         get_logger().setLevel(logging.DEBUG)
@@ -223,6 +280,13 @@ def reduce_command(
             oracle_argv=oracle_argv,
             cutracer_so=cutracer_so,
             kernel_filters=kernel_filters,
+            delay_mode=delay_mode,
+            delay_cluster_cta_id=delay_cluster_cta_id,
+            delay_warpgroup_id=delay_warpgroup_id,
+            delay_warp_mask=delay_warp_mask,
+            delay_patterns=delay_patterns,
+            kernel_timeout_s=kernel_timeout_s,
+            hang_is_bug=hang_is_bug,
             output_dir=os.path.dirname(os.path.abspath(minimal_config)),
             timeout=timeout,
             capture_output=not verbose,
