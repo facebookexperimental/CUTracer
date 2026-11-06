@@ -2,11 +2,16 @@
 
 """Core random-delay stress search for ``cutracer stress``.
 
-Runs a correctness oracle repeatedly under random delay injection to discover a
-delay configuration that triggers a (data-race) bug, then keeps that config for
+Runs a correctness oracle repeatedly under delay injection to discover a delay
+configuration that triggers a (data-race) bug, then keeps that config for
 deterministic replay / reduction. This is the *discovery* counterpart to
 ``cutracer reduce`` (which minimizes an already-known triggering config); both
 own their oracle-driven delay loops inside CUTracer.
+
+Two strategies: ``random`` injects random per-thread delays at every candidate
+point (optionally one warpgroup at a time); ``isolate`` stalls one (cluster
+rank, CTA-local warp) at a time with a fixed delay while every other warp runs
+at full speed (see ``StressConfig.strategy``).
 
 The loop reuses CUTracer's public instrumented-target runner, so a single
 attempt is exactly what ``cutracer trace -i random_delay`` would run -- no
@@ -49,6 +54,44 @@ SYMPTOM_FAILURE = "failure"
 # CUTracer's watchdog ended a hung kernel (requires `hang_is_bug`).
 SYMPTOM_HANG = "hang"
 
+STRATEGY_RANDOM = "random"
+STRATEGY_ISOLATE = "isolate"
+# Isolate searches delay mbarrier waits by default: a consumer that never
+# releases its slot misbehaves when it reaches its wait late (the parity it
+# waits for may then name a later phase), while arriving late at a load only
+# makes it read a newer value.
+ISOLATE_DEFAULT_PATTERNS = "SYNCS.PHASECHK"
+# CUTracer warp masks are 32 bits wide (CUDA allows 32 warps per CTA).
+_MAX_WARPS = 32
+
+
+@dataclass(frozen=True)
+class DelayTarget:
+    """One actor of an isolate search: a CTA-local warp on one cluster rank.
+
+    ``cluster_rank`` is None for launches without clusters, where the warp is
+    delayed in every CTA.
+    """
+
+    warp: int
+    cluster_rank: Optional[int] = None
+
+    @property
+    def warp_mask(self) -> str:
+        return hex(1 << self.warp)
+
+    def label(self) -> str:
+        if self.cluster_rank is None:
+            return f"warp {self.warp}"
+        return f"cluster rank {self.cluster_rank}, warp {self.warp}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cluster_rank": self.cluster_rank,
+            "warp": self.warp,
+            "warp_mask": self.warp_mask,
+        }
+
 
 @dataclass
 class StressConfig:
@@ -84,6 +127,23 @@ class StressConfig:
     # reproduction, whatever the oracle's exit code. Off by default: a large
     # delay can also slow a correct kernel past the timeout.
     hang_is_bug: bool = False
+    # STRATEGY_RANDOM: random per-thread delays at every candidate point, all
+    # warps at once or one warpgroup at a time (`warpgroup_ids`).
+    # STRATEGY_ISOLATE: one target (cluster rank, CTA-local warp) per attempt,
+    # with a fixed delay before each matching instruction (`enable_prob` is
+    # ignored) while every other warp runs at full speed. Random delays slow a
+    # producer down together with its consumers, so they cannot show that a
+    # consumer is missing from the release protocol; isolating that consumer
+    # lets the producer lap it.
+    strategy: str = STRATEGY_RANDOM
+    # Isolate targets: cluster ranks (tried high to low) and CTA-local warps.
+    # None = every rank / warp of the instrumented launches the control arm
+    # observed, which needs `baseline_runs >= 1`.
+    isolate_ranks: Optional[List[int]] = None
+    isolate_warps: Optional[List[int]] = None
+    # SASS substrings to delay at (CUTRACER_DELAY_PATTERNS). None = mbarrier
+    # waits for isolate, CUTracer's built-in patterns for random.
+    delay_patterns: Optional[str] = None
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
     resume_result: Optional["StressResult"] = None
@@ -103,12 +163,37 @@ class StressConfig:
         # the service classifies ValueError as an INFRA_ERROR.
         if not self.delay_ladder_ns:
             raise ValueError("delay_ladder_ns must contain at least one delay")
+        if any(delay_ns < 1 for delay_ns in self.delay_ladder_ns):
+            raise ValueError("delay_ladder_ns entries must be positive")
+        if self.attempts_per_delay < 1:
+            raise ValueError(
+                f"attempts_per_delay must be positive, got {self.attempts_per_delay}"
+            )
+        if not 0.0 < self.enable_prob <= 1.0:
+            raise ValueError(f"enable_prob must be in (0, 1], got {self.enable_prob}")
+        if any(not 0 <= group < 8 for group in self.warpgroup_ids):
+            raise ValueError("warpgroup_ids must be in [0, 8)")
         if self.baseline_runs < 0:
             raise ValueError(f"baseline_runs must be >= 0, got {self.baseline_runs}")
         if self.kernel_timeout_s < 0:
             raise ValueError(
                 f"kernel_timeout_s must be >= 0, got {self.kernel_timeout_s}"
             )
+        if self.strategy not in (STRATEGY_RANDOM, STRATEGY_ISOLATE):
+            raise ValueError(f"unknown stress strategy {self.strategy!r}")
+        if self.strategy == STRATEGY_ISOLATE:
+            if self.warpgroup_ids:
+                raise ValueError("warpgroup_ids do not apply to an isolate search")
+        elif self.isolate_ranks is not None or self.isolate_warps is not None:
+            raise ValueError("isolate_ranks and isolate_warps need strategy isolate")
+        if self.isolate_ranks is not None and not self.isolate_ranks:
+            raise ValueError("isolate_ranks must name at least one cluster rank")
+        if self.isolate_warps is not None and not self.isolate_warps:
+            raise ValueError("isolate_warps must name at least one warp")
+        if any(rank < 0 for rank in self.isolate_ranks or []):
+            raise ValueError("isolate_ranks must be >= 0")
+        if any(not 0 <= warp < _MAX_WARPS for warp in self.isolate_warps or []):
+            raise ValueError(f"isolate_warps must be in [0, {_MAX_WARPS})")
 
 
 @dataclass
@@ -122,6 +207,11 @@ class TriggeringConfig:
     attempt_index: int
     enabled_point_count: Optional[int] = None
     symptom: str = SYMPTOM_FAILURE
+    # The isolate target (`DelayTarget.to_dict()`); None for random searches.
+    target: Optional[Dict[str, Any]] = None
+    # `cutracer trace` options that replay this config with the targeting it
+    # was recorded under; add `--delay-load-path <config> -- <oracle>`.
+    replay_args: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -132,6 +222,8 @@ class TriggeringConfig:
             "attempt_index": self.attempt_index,
             "enabled_point_count": self.enabled_point_count,
             "symptom": self.symptom,
+            "target": self.target,
+            "replay_args": list(self.replay_args),
         }
 
 
@@ -211,9 +303,24 @@ class StressResult:
     # Delay configs of attempts rejected by validation, newest last. Retained
     # so a rejection can be explained from published artifacts alone.
     rejected_config_paths: List[str] = field(default_factory=list)
+    strategy: str = STRATEGY_RANDOM
+    # The isolate targets in search order (`DelayTarget.to_dict()`).
+    targets: List[Dict[str, Any]] = field(default_factory=list)
+    # Schedule shape the counts were accumulated against, recorded by
+    # `run_stress`. A resume locates the remaining trials by counting the
+    # ones already run, so it must reuse this shape; None for results
+    # reconstructed from older reports, which skip the check.
+    delay_ladder_ns: Optional[List[int]] = None
+    attempts_per_delay: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "strategy": self.strategy,
+            "targets": list(self.targets),
+            "delay_ladder_ns": (
+                None if self.delay_ladder_ns is None else list(self.delay_ladder_ns)
+            ),
+            "attempts_per_delay": self.attempts_per_delay,
             "reproduced": self.reproduced,
             "completed_trials": self.completed_trials,
             "reproductions": self.reproductions,
@@ -379,10 +486,14 @@ def _attempt_log(
     stderr: str = "",
     error: str = "",
     watchdog: Sequence[str] = (),
+    target: Optional[DelayTarget] = None,
 ) -> str:
-    target = "all" if warpgroup is None else str(warpgroup)
+    if target is not None:
+        placement = f"target={target.label()}"
+    else:
+        placement = f"warpgroup={'all' if warpgroup is None else warpgroup}"
     sections = [
-        f"=== delay_ns={delay_ns} warpgroup={target} attempt={attempt} ===",
+        f"=== delay_ns={delay_ns} {placement} attempt={attempt} ===",
     ]
     if returncode is not None:
         sections.append(f"returncode={returncode}")
@@ -400,6 +511,206 @@ def _attempt_log(
 def _no_data_timeout_s(config: StressConfig) -> int:
     """The no-data watchdog setting: off whenever the kernel timeout bounds kernels."""
     return 0 if config.kernel_timeout_s > 0 else _DEFAULT_NO_DATA_TIMEOUT_S
+
+
+def _delay_patterns(config: StressConfig) -> Optional[str]:
+    if config.delay_patterns:
+        return config.delay_patterns
+    return ISOLATE_DEFAULT_PATTERNS if config.strategy == STRATEGY_ISOLATE else None
+
+
+def _replay_args(
+    config: StressConfig,
+    *,
+    delay_ns: int,
+    warpgroup: Optional[int],
+    target: Optional[DelayTarget],
+) -> List[str]:
+    """`cutracer trace` options that replay an attempt's config as it ran.
+
+    The delay config records which points were on, not how the delay was
+    targeted, so a replay must pass the targeting again.
+    """
+    args = ["-i", "random_delay", "-a", "random_delay", "--delay-ns", str(delay_ns)]
+    if config.kernel_filters:
+        args += ["-k", config.kernel_filters]
+    if target is not None:
+        if target.cluster_rank is None:
+            args += ["--delay-mode", "fixed"]
+        else:
+            args += ["--delay-mode", "cluster_fixed"]
+            args += ["--delay-cluster-cta-id", str(target.cluster_rank)]
+        args += ["--delay-warp-mask", target.warp_mask]
+    elif warpgroup is not None:
+        args += ["--delay-warpgroup-id", str(warpgroup)]
+    patterns = _delay_patterns(config)
+    if patterns:
+        args += ["--delay-patterns", patterns]
+    if config.kernel_timeout_s > 0:
+        args += ["--kernel-timeout-s", str(config.kernel_timeout_s)]
+        args += ["--no-data-timeout-s", "0"]
+    return args
+
+
+@dataclass(frozen=True)
+class _LaunchGeometry:
+    """The largest instrumented launch shape a control run observed."""
+
+    warps: int
+    cluster_size: int
+
+    def merge(self, other: Optional["_LaunchGeometry"]) -> "_LaunchGeometry":
+        if other is None:
+            return self
+        return _LaunchGeometry(
+            max(self.warps, other.warps), max(self.cluster_size, other.cluster_size)
+        )
+
+
+def _kernel_launch_events(output_dir: str) -> List[Dict[str, Any]]:
+    """Every readable `kernel_launch` event in the kernel-events files of a run."""
+    events: List[Dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(output_dir))
+    except OSError:
+        return events
+    for name in names:
+        if not name.startswith("cutracer_kernel_events_") or not name.endswith(
+            ".ndjson"
+        ):
+            continue
+        try:
+            with open(os.path.join(output_dir, name)) as source:
+                for line in source:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "kernel_launch":
+                        events.append(event)
+        except (OSError, UnicodeError):
+            continue
+    return events
+
+
+def _block_warps(event: Mapping[str, Any]) -> Optional[int]:
+    block = event.get("block")
+    if (
+        not isinstance(block, list)
+        or len(block) != 3
+        or any(type(dimension) is not int or dimension <= 0 for dimension in block)
+    ):
+        return None
+    return (block[0] * block[1] * block[2] + 31) // 32
+
+
+def _cluster_size(event: Mapping[str, Any]) -> int:
+    """The launch's cluster size; 1 without clusters or from a CUTracer that did not record it."""
+    size = event.get("cluster_size", 1)
+    return size if type(size) is int and size >= 1 else 1
+
+
+def _instrumented_geometry(
+    output_dir: str, config_path: str
+) -> Optional[_LaunchGeometry]:
+    """Warps per CTA and cluster size of the launches whose kernels have delay points.
+
+    `config_path` is the run's delay dump: it lists every instrumented kernel
+    and its candidate points, so launches of kernels that have nothing to delay
+    (or were not instrumented at all) do not widen the search.
+    """
+    try:
+        with open(config_path) as source:
+            kernels = json.load(source).get("kernels", {})
+        checksums = {
+            kernel.get("kernel_checksum")
+            for kernel in kernels.values()
+            if isinstance(kernel, dict) and kernel.get("instrumentation_points")
+        }
+    except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    by_checksum: Dict[str, _LaunchGeometry] = {}
+    for event in _kernel_launch_events(output_dir):
+        warps = _block_warps(event)
+        checksum = event.get("kernel_checksum")
+        if warps is None or not isinstance(checksum, str) or checksum not in checksums:
+            continue
+        launch = _LaunchGeometry(warps, _cluster_size(event))
+        by_checksum[checksum] = launch.merge(by_checksum.get(checksum))
+    if not by_checksum:
+        return None
+    # Search the widest launch of one kernel: merging the warps of one kernel
+    # with the cluster size of another could invent targets no launch has.
+    return max(by_checksum.values(), key=lambda item: (item.warps, item.cluster_size))
+
+
+def _isolate_targets(
+    config: StressConfig, geometry: Optional[_LaunchGeometry]
+) -> List[DelayTarget]:
+    """The isolate targets in search order: cluster ranks high to low, warps ascending.
+
+    Higher ranks come first: in a multi-CTA kernel rank 0 usually leads, and a
+    warp of a peer CTA whose work is predicated off is the one most easily left
+    out of the release protocol.
+    """
+    if config.isolate_ranks is None or config.isolate_warps is None:
+        if geometry is None:
+            if config.baseline_runs <= 0:
+                raise ValueError(
+                    "an isolate search that discovers its targets from the "
+                    "control arm needs baseline_runs >= 1; pass "
+                    "baseline_runs >= 1, or the isolate_ranks and "
+                    "isolate_warps explicitly"
+                )
+            raise ValueError(
+                "the control arm recorded no instrumented launch with delay "
+                "points, so there is nothing to isolate; check the kernel filter "
+                "and the delay patterns, or pass the ranks and warps explicitly"
+            )
+    warps = (
+        sorted(set(config.isolate_warps))
+        if config.isolate_warps is not None
+        else list(range(min(_MAX_WARPS, geometry.warps if geometry else 0)))
+    )
+    ranks: Sequence[Optional[int]] = (None,)
+    if config.isolate_ranks is not None:
+        ranks = sorted(set(config.isolate_ranks), reverse=True)
+    elif geometry is not None and geometry.cluster_size > 1:
+        ranks = range(geometry.cluster_size - 1, -1, -1)
+    return [DelayTarget(warp, rank) for rank in ranks for warp in warps]
+
+
+@dataclass(frozen=True)
+class _Trial:
+    delay_ns: int
+    attempt: int
+    warpgroup: Optional[int] = None
+    target: Optional[DelayTarget] = None
+
+
+def _trial_schedule(config: StressConfig, targets: List[DelayTarget]) -> List[_Trial]:
+    """Every planned attempt, in run order.
+
+    A random search sweeps the delay ladder outermost, each delay over every
+    warpgroup. An isolate search gives each target every delay before moving
+    to the next target, so a finding on an early target does not wait for the
+    whole ladder to run on every other target first.
+    """
+    attempts = range(config.attempts_per_delay)
+    if config.strategy == STRATEGY_ISOLATE:
+        return [
+            _Trial(delay_ns, attempt, target=target)
+            for target in targets
+            for delay_ns in config.delay_ladder_ns
+            for attempt in attempts
+        ]
+    warpgroups: List[Optional[int]] = [int(x) for x in config.warpgroup_ids] or [None]
+    return [
+        _Trial(delay_ns, attempt, warpgroup=warpgroup)
+        for delay_ns in config.delay_ladder_ns
+        for warpgroup in warpgroups
+        for attempt in attempts
+    ]
 
 
 def _validate_delay_config(  # noqa: C901
@@ -484,13 +795,35 @@ def _validate_delay_config(  # noqa: C901
     )
 
 
-def _validate_warpgroup_launch(  # noqa: C901
+def _validate_warpgroup_launch(
     output_dir: str,
     *,
     warpgroup: int,
     kernel_identity: tuple[str, str],
 ) -> Optional[str]:
     """Verify that a targeted warpgroup has at least one live warp at launch."""
+    return _validate_target_launch(
+        output_dir,
+        kernel_identity=kernel_identity,
+        warp=4 * warpgroup,
+        cluster_rank=None,
+        label=f"warpgroup {warpgroup}",
+    )
+
+
+def _validate_target_launch(  # noqa: C901
+    output_dir: str,
+    *,
+    kernel_identity: tuple[str, str],
+    warp: int,
+    cluster_rank: Optional[int],
+    label: str,
+) -> Optional[str]:
+    """Verify that a matching launch has CTA-local `warp` (and cluster rank).
+
+    A target outside every launch makes the attempt inject nothing, so its
+    "not reproduced" would be meaningless.
+    """
     _kernel_name, kernel_checksum = kernel_identity
     matched_launch = False
     try:
@@ -518,30 +851,55 @@ def _validate_warpgroup_launch(  # noqa: C901
                     ):
                         continue
                     matched_launch = True
-                    block = event.get("block")
+                    block_warps = _block_warps(event)
                     if (
-                        not isinstance(block, list)
-                        or len(block) != 3
-                        or any(
-                            type(dimension) is not int or dimension <= 0
-                            for dimension in block
+                        block_warps is not None
+                        and warp < block_warps
+                        and (
+                            cluster_rank is None or cluster_rank < _cluster_size(event)
                         )
                     ):
-                        continue
-                    block_threads = block[0] * block[1] * block[2]
-                    block_warps = (block_threads + 31) // 32
-                    if 4 * warpgroup < block_warps:
                         return None
         except (OSError, UnicodeError) as exc:
             read_errors.append(f"{name}: {exc}")
     if read_errors:
         return "kernel launch evidence is unreadable: " + "; ".join(read_errors)
     if matched_launch:
-        return f"warpgroup {warpgroup} has no live warp in the matching kernel launch"
-    return "no matching kernel launch evidence was recorded for warpgroup targeting"
+        return f"{label} has no live warp in the matching kernel launch"
+    return f"no matching kernel launch evidence was recorded for {label} targeting"
 
 
-def _run_attempt_in_output_dir(
+def _attempt_targeting(
+    config: StressConfig,
+    *,
+    warpgroup: Optional[int],
+    target: Optional[DelayTarget],
+) -> Dict[str, Any]:
+    """The InstrumentationConfig fields that place an attempt's delays."""
+    if target is None:
+        return {
+            "delay_mode": "random",
+            "delay_enable_prob": config.enable_prob,
+            "delay_warpgroup_id": warpgroup,
+        }
+    return {
+        "delay_mode": "fixed" if target.cluster_rank is None else "cluster_fixed",
+        "delay_enable_prob": 1.0,
+        "delay_cluster_cta_id": target.cluster_rank,
+        "delay_warp_mask": target.warp_mask,
+    }
+
+
+def _attempt_config_name(
+    delay_ns: int, warpgroup: Optional[int], target: Optional[DelayTarget], attempt: int
+) -> str:
+    if target is None:
+        return f"delay-{delay_ns}-wg-{warpgroup}-attempt-{attempt}.json"
+    rank = "all" if target.cluster_rank is None else target.cluster_rank
+    return f"delay-{delay_ns}-rank-{rank}-warp-{target.warp}-attempt-{attempt}.json"
+
+
+def _run_attempt_in_output_dir(  # noqa: C901
     config: StressConfig,
     *,
     delay_ns: int,
@@ -550,10 +908,11 @@ def _run_attempt_in_output_dir(
     cutracer_so: Optional[str],
     runner: Optional[RunTarget],
     instrumentation_output_dir: str,
+    target: Optional[DelayTarget] = None,
 ) -> _AttemptResult:
     config_path = os.path.join(
         config.output_dir,
-        f"delay-{delay_ns}-wg-{warpgroup}-attempt-{attempt}.json",
+        _attempt_config_name(delay_ns, warpgroup, target, attempt),
     )
     try:
         os.unlink(config_path)
@@ -574,9 +933,7 @@ def _run_attempt_in_output_dir(
                 exact_kernel_checksum=config.exact_kernel_checksum,
                 output_dir=instrumentation_output_dir,
                 delay_ns=delay_ns,
-                delay_enable_prob=config.enable_prob,
-                delay_mode="random",
-                delay_warpgroup_id=warpgroup,
+                delay_patterns=_delay_patterns(config),
                 delay_dump_path=config_path,
                 # A fresh seed per attempt, even when the caller's environment
                 # pins one: every process of the attempt shares it.
@@ -587,7 +944,10 @@ def _run_attempt_in_output_dir(
                 timeout=config.timeout,
                 base_env=config.base_env,
                 use_bundled_cuda_tools=config.use_bundled_cuda_tools,
-                kernel_events="nostack" if warpgroup is not None else None,
+                kernel_events=(
+                    "nostack" if warpgroup is not None or target is not None else None
+                ),
+                **_attempt_targeting(config, warpgroup=warpgroup, target=target),
             ),
             runner=runner or run_process_group,
         )
@@ -605,6 +965,7 @@ def _run_attempt_in_output_dir(
                 warpgroup=warpgroup,
                 attempt=attempt,
                 error=f"launch failed: {type(exc).__name__}: {exc}",
+                target=target,
             ),
         )
     finally:
@@ -627,6 +988,7 @@ def _run_attempt_in_output_dir(
         stderr="" if proc is None else proc.stderr or "",
         error=timeout_error,
         watchdog=watchdog,
+        target=target,
     )
     if returncode is None and not hung:
         _unlink(config_path)
@@ -689,23 +1051,32 @@ def _run_attempt_in_output_dir(
         )
     assert kernel_identity is not None
     assert enabled_point_count is not None
-    if warpgroup is not None:
+    targeting_error: Optional[str] = None
+    if target is not None:
+        targeting_error = _validate_target_launch(
+            instrumentation_output_dir,
+            kernel_identity=kernel_identity,
+            warp=target.warp,
+            cluster_rank=target.cluster_rank,
+            label=target.label(),
+        )
+    elif warpgroup is not None:
         targeting_error = _validate_warpgroup_launch(
             instrumentation_output_dir,
             warpgroup=warpgroup,
             kernel_identity=kernel_identity,
         )
-        if targeting_error is not None:
-            rejected = _preserve_rejected_config(config_path)
-            return _AttemptResult(
-                0,
-                0,
-                1,
-                None,
-                log + f"\n--- error ---\n{targeting_error}",
-                rejected_config_path=rejected,
-                hangs=hangs,
-            )
+    if targeting_error is not None:
+        rejected = _preserve_rejected_config(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + f"\n--- error ---\n{targeting_error}",
+            rejected_config_path=rejected,
+            hangs=hangs,
+        )
 
     if is_interesting:
         return _AttemptResult(
@@ -720,6 +1091,10 @@ def _run_attempt_in_output_dir(
                 attempt_index=attempt,
                 enabled_point_count=enabled_point_count,
                 symptom=SYMPTOM_HANG if hung else SYMPTOM_FAILURE,
+                target=None if target is None else target.to_dict(),
+                replay_args=_replay_args(
+                    config, delay_ns=delay_ns, warpgroup=warpgroup, target=target
+                ),
             ),
             log,
             hangs=hangs,
@@ -736,10 +1111,11 @@ def _run_attempt(
     attempt: int,
     cutracer_so: Optional[str],
     runner: Optional[RunTarget],
+    target: Optional[DelayTarget] = None,
 ) -> _AttemptResult:
     event_dir = (
         tempfile.mkdtemp(prefix=".stress_events_", dir=config.output_dir)
-        if warpgroup is not None
+        if warpgroup is not None or target is not None
         else None
     )
     try:
@@ -751,6 +1127,7 @@ def _run_attempt(
             cutracer_so=cutracer_so,
             runner=runner,
             instrumentation_output_dir=event_dir or config.output_dir,
+            target=target,
         )
     finally:
         if event_dir is not None:
@@ -879,6 +1256,8 @@ class _BaselineResult:
     infra_errors: int
     logs: List[str]
     hangs: int = 0
+    # Instrumented launch shape, recorded for isolate searches only.
+    geometry: Optional[_LaunchGeometry] = None
 
 
 def _run_baseline(
@@ -895,22 +1274,33 @@ def _run_baseline(
     them apart. `--delay-enable-prob 0` keeps the instrumentation and removes
     only the stalls, which is the variable the search manipulates.
 
-    No dump path is passed: an all-disabled config is not worth keeping, and not
-    writing one keeps the baseline out of the search's config namespace.
+    No dump path is passed for a random search: an all-disabled config is not
+    worth keeping, and not writing one keeps the baseline out of the search's
+    config namespace. An isolate search runs each control run in a scratch
+    directory with a dump and kernel events, to learn which warps and cluster
+    ranks the instrumented launches have.
     """
     completed = 0
     reproduced = 0
     timed_out = 0
     infra_errors = 0
     hangs = 0
+    geometry: Optional[_LaunchGeometry] = None
     logs: List[str] = []
     if config.baseline_runs <= 0:
         # A caller that opted out of the control arm must not pay for anything
         # here -- including reading `delay_ladder_ns[0]`.
         return _BaselineResult(0, 0, 0, 0, 0, logs)
     delay_ns = config.delay_ladder_ns[0]
+    isolate = config.strategy == STRATEGY_ISOLATE
     for attempt in range(config.baseline_runs):
-        logs_before = main_logs(config.output_dir)
+        run_dir = (
+            tempfile.mkdtemp(prefix=".stress_baseline_", dir=config.output_dir)
+            if isolate
+            else config.output_dir
+        )
+        dump_path = os.path.join(run_dir, "delay_config.json") if isolate else None
+        logs_before = main_logs(run_dir)
         proc: Optional[subprocess.CompletedProcess[str]] = None
         error = "baseline (injection disabled)"
         try:
@@ -923,10 +1313,13 @@ def _run_baseline(
                     kernel_filters=config.kernel_filters,
                     exact_kernel_name=config.exact_kernel_name,
                     exact_kernel_checksum=config.exact_kernel_checksum,
-                    output_dir=config.output_dir,
+                    output_dir=run_dir,
                     delay_ns=delay_ns,
                     delay_enable_prob=0.0,
                     delay_mode="random",
+                    delay_patterns=_delay_patterns(config),
+                    delay_dump_path=dump_path,
+                    kernel_events="nostack" if isolate else None,
                     kernel_timeout_s=config.kernel_timeout_s,
                     no_data_timeout_s=_no_data_timeout_s(config),
                     cwd=config.cwd,
@@ -938,7 +1331,11 @@ def _run_baseline(
             )
         except subprocess.TimeoutExpired as exc:
             error = f"baseline timed out: {exc}"
-        watchdog = watchdog_terminations(config.output_dir, before=logs_before)
+        watchdog = watchdog_terminations(run_dir, before=logs_before)
+        if dump_path is not None:
+            launches = _instrumented_geometry(run_dir, dump_path)
+            geometry = launches.merge(geometry) if launches else geometry
+            shutil.rmtree(run_dir, ignore_errors=True)
         hangs += 1 if watchdog else 0
         logs.append(
             _attempt_log(
@@ -977,6 +1374,7 @@ def _run_baseline(
         infra_errors=infra_errors,
         logs=logs,
         hangs=hangs,
+        geometry=geometry,
     )
 
 
@@ -1014,7 +1412,7 @@ def run_stress(  # noqa: C901
     cutracer_so: Optional[str] = None,
     runner: Optional[RunTarget] = None,
 ) -> StressResult:
-    """Sweep the delay ladder under random injection until the oracle reproduces.
+    """Run the planned attempts (see `_trial_schedule`) until the oracle reproduces.
 
     A "reproduction" requires an interesting oracle exit (0), a dumped delay
     config (otherwise there is nothing to replay/reduce, so the attempt is
@@ -1049,12 +1447,41 @@ def run_stress(  # noqa: C901
     )
     triggering = None if resume is None else resume.triggering
     stop = False
-    warp_targets: List[Optional[int]] = (
-        [int(x) for x in config.warpgroup_ids] if config.warpgroup_ids else [None]
-    )
-    planned_trials = (
-        len(config.delay_ladder_ns) * len(warp_targets) * config.attempts_per_delay
-    )
+    targets: List[DelayTarget] = []
+    if config.strategy == STRATEGY_ISOLATE:
+        if resume is not None and (
+            config.isolate_ranks is None or config.isolate_warps is None
+        ):
+            # The control arm that chose the targets does not run again.
+            raise ValueError(
+                "resuming an isolate search needs explicit isolate_ranks and "
+                "isolate_warps"
+            )
+        targets = _isolate_targets(config, baseline.geometry)
+    schedule = _trial_schedule(config, targets)
+    planned_trials = len(schedule)
+    if resume is not None:
+        # The remaining trials are located by counting the ones already run,
+        # which is only the same position under the original schedule shape.
+        if (
+            resume.delay_ladder_ns is not None
+            and list(resume.delay_ladder_ns) != list(config.delay_ladder_ns)
+        ) or (
+            resume.attempts_per_delay is not None
+            and resume.attempts_per_delay != config.attempts_per_delay
+        ):
+            raise ValueError(
+                "resuming a stress search needs the original delay_ladder_ns "
+                "and attempts_per_delay; the remaining trials are located by "
+                "counting the ones already run"
+            )
+        if resume.targets and resume.targets != [
+            target.to_dict() for target in targets
+        ]:
+            raise ValueError(
+                "resuming an isolate search needs the original targets; the "
+                "remaining trials are located by counting the ones already run"
+            )
     attempted_trials = completed + infra_errors + timed_out
     if min(completed, reproductions, unattributed, infra_errors, timed_out) < 0:
         raise ValueError("resumed stress progress contains negative counts")
@@ -1102,64 +1529,56 @@ def run_stress(  # noqa: C901
             ),
             log_size_bytes=log_size_bytes if log_path is not None else None,
             rejected_config_paths=list(rejected_config_paths),
+            strategy=config.strategy,
+            targets=[target.to_dict() for target in targets],
+            delay_ladder_ns=list(config.delay_ladder_ns),
+            attempts_per_delay=config.attempts_per_delay,
         )
 
-    trial_ordinal = 0
-    for delay_ns in config.delay_ladder_ns:
-        for warpgroup in warp_targets:
-            for attempt in range(config.attempts_per_delay):
-                if trial_ordinal < attempted_trials:
-                    trial_ordinal += 1
-                    continue
-                if stop:
-                    break
-                outcome = _run_attempt(
-                    config,
-                    delay_ns=delay_ns,
-                    warpgroup=warpgroup,
-                    attempt=attempt,
-                    cutracer_so=cutracer_so,
-                    runner=runner,
-                )
-                completed += outcome.completed_trials
-                reproductions += outcome.reproductions
-                infra_errors += outcome.infra_errors
-                timed_out += outcome.timed_out
-                hangs += outcome.hangs
-                unattributed += outcome.unattributed
-                trial_ordinal += 1
-                _record_rejected_config(
-                    rejected_config_paths,
-                    outcome.rejected_config_path,
-                    owned_root=config.output_dir,
-                )
-                if outcome.triggering is not None:
-                    if triggering is None:
-                        triggering = outcome.triggering
-                    if config.stop_on_first:
-                        stop = True
-
-                try:
-                    log_path, log_size_bytes = _write_stress_log(
-                        config.output_dir,
-                        outcome.log,
-                        append=log_path is not None,
-                    )
-                except OSError:
-                    # Surface the just-completed attempt to an adapter before
-                    # propagating persistence failure. The adapter can retain
-                    # exact counts even though no durable log is available.
-                    if config.progress_callback is not None:
-                        config.progress_callback(progress_result(None))
-                    raise
-                if config.progress_callback is not None:
-                    config.progress_callback(progress_result(log_path))
-                if stop:
-                    break
-            if stop:
-                break
+    for trial in schedule[attempted_trials:]:
         if stop:
             break
+        outcome = _run_attempt(
+            config,
+            delay_ns=trial.delay_ns,
+            warpgroup=trial.warpgroup,
+            attempt=trial.attempt,
+            cutracer_so=cutracer_so,
+            runner=runner,
+            target=trial.target,
+        )
+        completed += outcome.completed_trials
+        reproductions += outcome.reproductions
+        infra_errors += outcome.infra_errors
+        timed_out += outcome.timed_out
+        hangs += outcome.hangs
+        unattributed += outcome.unattributed
+        _record_rejected_config(
+            rejected_config_paths,
+            outcome.rejected_config_path,
+            owned_root=config.output_dir,
+        )
+        if outcome.triggering is not None:
+            if triggering is None:
+                triggering = outcome.triggering
+            if config.stop_on_first:
+                stop = True
+
+        try:
+            log_path, log_size_bytes = _write_stress_log(
+                config.output_dir,
+                outcome.log,
+                append=log_path is not None,
+            )
+        except OSError:
+            # Surface the just-completed attempt to an adapter before
+            # propagating persistence failure. The adapter can retain
+            # exact counts even though no durable log is available.
+            if config.progress_callback is not None:
+                config.progress_callback(progress_result(None))
+            raise
+        if config.progress_callback is not None:
+            config.progress_callback(progress_result(log_path))
 
     rate = (reproductions / completed) if completed else 0.0
     return StressResult(
@@ -1187,6 +1606,10 @@ def run_stress(  # noqa: C901
         ),
         log_size_bytes=log_size_bytes if log_path is not None else None,
         rejected_config_paths=list(rejected_config_paths),
+        strategy=config.strategy,
+        targets=[target.to_dict() for target in targets],
+        delay_ladder_ns=list(config.delay_ladder_ns),
+        attempts_per_delay=config.attempts_per_delay,
     )
 
 

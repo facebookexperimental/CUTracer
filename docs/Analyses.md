@@ -136,6 +136,25 @@ The delay config file has the following structure:
 }
 ```
 
+### Searching for a Triggering Config (`cutracer stress`)
+
+`cutracer stress` runs an oracle (exit 0 = bug reproduced) many times under delay injection, after a matched control arm (`--baseline-runs`: the same instrumentation with every delay off), and saves the first delay config that reproduces the bug for replay and `cutracer reduce`.
+
+| Strategy | What one attempt delays | Finds |
+|----------|-------------------------|-------|
+| `random` (default) | Random per-thread delays at every candidate point, or in one warpgroup (`--warpgroup-ids`) | Races that a perturbed schedule exposes |
+| `isolate` | One CTA-local warp on one cluster rank: a fixed delay before each of its mbarrier waits (`SYNCS.PHASECHK`), while every other warp runs at full speed | A warp the synchronization protocol does not wait for, such as a consumer that reads a ring slot it never releases |
+
+Random delays slow a producer down along with its consumers, so they rarely let the producer lap a consumer that is missing from the release protocol. `--strategy isolate` tries one target per attempt (cluster ranks high to low, then warps, taken from the instrumented launches of the control arm, or from `--isolate-ranks` and `--isolate-warps`) and stops at the first that fails. A consumer that reaches its wait two phases late waits on the parity of a phase that may never complete, so isolate counts a hang ended by CUTracer's kernel timeout as a reproduction (`--hang-is-bug`, with `--kernel-timeout-s 60`) and reports it as `"symptom": "hang"`. By default each target gets one 1 ms delay: a clean kernel with W warps per CTA and clusters of C CTAs costs W × C attempts.
+
+```bash
+cutracer stress --strategy isolate -k my_kernel -o /tmp/iso -- ./oracle.sh
+# Reproduced (hang): delay_ns=1000000 target=cluster rank 1, warp 4 rate=0.20 -> /tmp/iso/triggering_config.json
+# Replay: cutracer trace ... --delay-mode cluster_fixed --delay-cluster-cta-id 1 --delay-warp-mask 0x10 ... --delay-load-path /tmp/iso/triggering_config.json -- ./oracle.sh
+```
+
+A delay config records which points were on, not how the delay was targeted, so `triggering_config` in `stress_report.json` also carries the `target`, the `symptom` and the `replay_args` that restore the targeting. Both strategies take `--kernel-timeout-s` and `--hang-is-bug`. With a kernel timeout, the 15 s no-data watchdog is off, so a kernel slowed down by its delays is not mistaken for a hung one.
+
 ---
 
 ## SASS Extraction (cutracer sass) 🔍
@@ -193,6 +212,7 @@ several subcommands. Run any of them with `--help` for full details.
 | `cutracer validate` | Validate the structure / schema of an NDJSON, Zstd-NDJSON, or text trace file |
 | `cutracer query` | Inspect a trace file with row-level filters (`--filter "warp=24;pc=0x43d0"`), `--head` / `--tail` / `--all-lines`, and `--group-by … --count` aggregation |
 | `cutracer sass` | Disassemble a `.cubin` to SASS via `nvdisasm` (see "SASS Extraction" above) |
+| `cutracer stress` | Search for a delay config that triggers a bug: random delays, or `--strategy isolate` to stall one warp of one cluster rank at a time (see "Searching for a Triggering Config" above) |
 | `cutracer reduce` | Post-process a trace into a smaller summary report (see `cutracer reduce --help`) |
 | `cutracer compare` | Diff two traces / validation reports and surface deltas |
 | `cutracer analyze` | Analysis subgroup. Includes `cutracer analyze warp-summary <trace>`; internal builds expose additional analyses (e.g. data-race, deadlock, MMA/TMA dataflow) under the same group |
