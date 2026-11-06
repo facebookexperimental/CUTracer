@@ -32,8 +32,12 @@ inline uint64_t delay_point_hash(uint64_t seed, std::string_view kernel_checksum
 // Probabilities of exactly 0 and 1 give all-off and all-on points.
 inline bool delay_point_enabled(uint64_t seed, std::string_view kernel_checksum, uint64_t pc_offset,
                                 float enable_prob) {
-  if (enable_prob >= 1.0f) return true;
-  if (enable_prob <= 0.0f) return false;
+  if (enable_prob >= 1.0f) {
+    return true;
+  }
+  if (enable_prob <= 0.0f) {
+    return false;
+  }
   const double unit = static_cast<double>(delay_point_hash(seed, kernel_checksum, pc_offset, 1) >> 11) * 0x1.0p-53;
   return unit < enable_prob;
 }

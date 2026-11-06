@@ -32,7 +32,9 @@ class FileLock {
   FileLock& operator=(const FileLock&) = delete;
 
   ~FileLock() {
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) {
+      close(fd_);
+    }
   }
 
   bool locked() const {
@@ -55,9 +57,13 @@ bool same_run(const json& existing, const json& config) {
 
 json same_run_kernels(const std::string& path, const json& config) {
   std::ifstream file(path);
-  if (!file) return json::object();
+  if (!file) {
+    return json::object();
+  }
   const json existing = json::parse(file, nullptr, /*allow_exceptions=*/false);
-  if (!same_run(existing, config)) return json::object();
+  if (!same_run(existing, config)) {
+    return json::object();
+  }
   const auto kernels = existing.find("kernels");
   return kernels != existing.end() && kernels->is_object() ? *kernels : json::object();
 }
@@ -67,10 +73,14 @@ json same_run_kernels(const std::string& path, const json& config) {
 std::string merge_delay_config_file(const std::string& path, const json& config) {
   const std::string lock_path = path + ".lock";
   const FileLock lock{lock_path};
-  if (!lock.locked()) return errno_message("cannot lock", lock_path);
+  if (!lock.locked()) {
+    return errno_message("cannot lock", lock_path);
+  }
 
   const json own = config.value("kernels", json::object());
-  if (own.empty() && access(path.c_str(), F_OK) == 0) return "";
+  if (own.empty() && access(path.c_str(), F_OK) == 0) {
+    return "";
+  }
   json kernels = same_run_kernels(path, config);
   for (const auto& [key, kernel] : own.items()) {
     kernels[key] = kernel;
@@ -81,7 +91,9 @@ std::string merge_delay_config_file(const std::string& path, const json& config)
   const std::string tmp_path = path + ".tmp." + std::to_string(getpid());
   {
     std::ofstream out(tmp_path, std::ios::trunc);
-    if (!out) return errno_message("cannot write", tmp_path);
+    if (!out) {
+      return errno_message("cannot write", tmp_path);
+    }
     out << merged.dump(2);
     out.close();
     if (!out) {
