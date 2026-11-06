@@ -165,6 +165,42 @@ void instrument_cluster_delay_injection(Instr* instr, uint32_t min_delay_ns, uin
 void instrument_warpgroup_delay_injection(Instr* instr, uint32_t delay_ns, uint32_t warp_mask, int32_t warpgroup_id);
 
 /**
+ * @brief Instruments an instruction to inject a fixed delay on selected warps of
+ *        one CTA per cluster.
+ *
+ * Inserts a call to the `instrument_delay_cluster_warp` device function before
+ * the instruction. Combines the CTA selection of
+ * instrument_cluster_delay_injection with the warp selection of
+ * instrument_warpgroup_delay_injection: a thread sleeps only when both select
+ * it. Isolates one warp role on one cluster rank.
+ *
+ * @param instr           The instruction to instrument
+ * @param delay_ns        Fixed delay in nanoseconds
+ * @param warp_mask       CTA-local warp mask (a warpgroup id already resolved
+ *                        with effective_delay_warp_mask)
+ * @param cluster_seed    Seed selecting the CTA in each cluster when
+ *                        @p cta_id_override < 0
+ * @param cta_id_override >= 0 forces this CTA index in every cluster
+ */
+void instrument_cluster_warp_delay_injection(Instr* instr, uint32_t delay_ns, uint32_t warp_mask, uint32_t cluster_seed,
+                                             int32_t cta_id_override);
+
+/**
+ * @brief Resolve warp targeting to one CTA-local warp mask.
+ *
+ * A warpgroup id >= 0 selects warps [4N..4N+3] and wins over @p warp_mask.
+ * Only ids 0..7 name a warpgroup of the 32-bit mask; a higher id selects no
+ * warp (and must not reach the shift, which would be undefined for >= 32).
+ * Range-checked at env parse; this stays total for any other caller.
+ */
+inline uint32_t effective_delay_warp_mask(uint32_t warp_mask, int32_t warpgroup_id) {
+  if (warpgroup_id < 0) {
+    return warp_mask;
+  }
+  return (warpgroup_id < 8) ? (0xFu << (warpgroup_id * 4)) : 0u;
+}
+
+/**
  * @brief SASS instruction patterns for delay injection.
  */
 static const std::vector<const char*> DELAY_INJECTION_PATTERNS = {

@@ -244,19 +244,30 @@ void instrument_cluster_delay_injection(Instr* instr, uint32_t min_delay_ns, uin
 }
 
 void instrument_warpgroup_delay_injection(Instr* instr, uint32_t delay_ns, uint32_t warp_mask, int32_t warpgroup_id) {
-  /* warpgroup_id is sugar: "warpgroup N" expands to warps [4N .. 4N+3].
-   * If warpgroup_id >= 0 it wins over warp_mask; the device function only
-   * sees a single resolved mask. */
-  const uint32_t effective_mask = (warpgroup_id >= 0) ? (0xFu << (warpgroup_id * 4)) : warp_mask;
-
   nvbit_insert_call(instr, "instrument_delay_warpgroup",
                     get_ipoint_from_config(InstrumentType::RANDOM_DELAY, IPOINT_BEFORE));
   /* guard predicate value */
   nvbit_add_call_arg_guard_pred_val(instr);
   /* fixed delay in nanoseconds */
   nvbit_add_call_arg_const_val32(instr, delay_ns);
+  /* bitmask of CTA-local warp ids to delay; the device function only sees the resolved mask */
+  nvbit_add_call_arg_const_val32(instr, effective_delay_warp_mask(warp_mask, warpgroup_id));
+}
+
+void instrument_cluster_warp_delay_injection(Instr* instr, uint32_t delay_ns, uint32_t warp_mask, uint32_t cluster_seed,
+                                             int32_t cta_id_override) {
+  nvbit_insert_call(instr, "instrument_delay_cluster_warp",
+                    get_ipoint_from_config(InstrumentType::RANDOM_DELAY, IPOINT_BEFORE));
+  /* guard predicate value */
+  nvbit_add_call_arg_guard_pred_val(instr);
+  /* fixed delay in nanoseconds */
+  nvbit_add_call_arg_const_val32(instr, delay_ns);
   /* bitmask of CTA-local warp ids to delay */
-  nvbit_add_call_arg_const_val32(instr, effective_mask);
+  nvbit_add_call_arg_const_val32(instr, warp_mask);
+  /* seed for selecting which CTA in the cluster gets delayed */
+  nvbit_add_call_arg_const_val32(instr, cluster_seed);
+  /* host-side CTA selection override: -1 = random via seed, >=0 = force this CTA index */
+  nvbit_add_call_arg_const_val32(instr, (uint32_t)cta_id_override);
 }
 
 /**

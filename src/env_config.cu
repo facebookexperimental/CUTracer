@@ -556,12 +556,23 @@ void parse_delay_config() {
               "Warp-targeted delay: warpgroup index (-1 = disabled, >= 0 selects warps [4N..4N+3]). "
               "Wins over CUTRACER_DELAY_WARP_MASK when both are set.");
 
+  if (g_delay_warpgroup_id < -1 || g_delay_warpgroup_id >= 8) {
+    fprintf(stderr,
+            "FATAL: CUTRACER_DELAY_WARPGROUP_ID=%d is out of range.\n"
+            "       A warpgroup selects warps [4N..4N+3] of the 32 CTA-local warps, so the id\n"
+            "       must be -1 (disabled) or in [0, 8). Use CUTRACER_DELAY_WARP_MASK to name\n"
+            "       an explicit set of warps instead.\n",
+            g_delay_warpgroup_id);
+    exit(1);
+  }
+
   if (g_delay_warp_mask != 0 && g_delay_warpgroup_id >= 0) {
     fprintf(stderr,
             "WARNING: Both CUTRACER_DELAY_WARPGROUP_ID=%d and CUTRACER_DELAY_WARP_MASK=0x%x are set.\n"
             "  CUTRACER_DELAY_WARPGROUP_ID wins — the warpgroup mask 0x%x will be used and the\n"
             "  explicit mask 0x%x will be ignored. Unset one of them to silence this warning.\n",
-            g_delay_warpgroup_id, g_delay_warp_mask, (0xFu << (g_delay_warpgroup_id * 4)), g_delay_warp_mask);
+            g_delay_warpgroup_id, g_delay_warp_mask, effective_delay_warp_mask(g_delay_warp_mask, g_delay_warpgroup_id),
+            g_delay_warp_mask);
   }
 
   // Parse user-specified delay patterns (optional, overrides DELAY_INJECTION_PATTERNS)
@@ -609,33 +620,22 @@ void parse_delay_config() {
             g_cluster_cta_id, g_cluster_cta_id);
   }
 
-  // Cross-axis validations: warp targeting vs. CTA targeting / distribution mode / enable_prob.
-  // Mirrors the dispatcher cascade in cutracer.cu — keep these aligned.
+  // Cross-axis validations: warp targeting vs. distribution mode / enable_prob.
+  // Mirrors the dispatcher cascade in cutracer.cu — keep these aligned. Warp
+  // targeting combines with cluster targeting: only the selected warps of the
+  // selected CTA of each cluster are delayed.
   const bool warp_active = (g_delay_warp_mask != 0) || (g_delay_warpgroup_id >= 0);
-  const bool cluster_active = (g_delay_cta_target == 1);
-
-  // FATAL: warp + cluster targeting is not yet supported. The Diff 1 device
-  // function takes only (delay_ns, warp_mask) — no cluster_seed/cta_id. A real
-  // combo will require a new instrument_delay_cluster_warpgroup; until then,
-  // surface the conflict early instead of silently letting one axis win.
-  if (warp_active && cluster_active) {
-    fprintf(stderr,
-            "FATAL: Warp-targeted delay (CUTRACER_DELAY_WARP_MASK / CUTRACER_DELAY_WARPGROUP_ID)\n"
-            "       cannot be combined with cluster targeting (CUTRACER_DELAY_MODE=cluster%s).\n"
-            "       Pick one axis: either delay across all CTAs with a warp mask, or delay one\n"
-            "       CTA per cluster with all warps.\n",
-            (g_delay_mode == 0) ? "_fixed" : "");
-    exit(1);
-  }
 
   // WARNING: warp targeting always uses fixed distribution within selected
   // warps (warp lock-step requires every thread in a warp to sleep the same
-  // amount). --delay-mode random is silently downgraded to fixed.
+  // amount). A random distribution (--delay-mode random or cluster) is
+  // silently downgraded to fixed.
   if (warp_active && g_delay_mode == 1) {
     fprintf(stderr,
             "WARNING: Warp-targeted delay always uses fixed distribution within selected warps\n"
             "         (warp lock-step requires all 32 threads sleep the same amount).\n"
-            "         CUTRACER_DELAY_MODE=random is silently treated as fixed.\n");
+            "         CUTRACER_DELAY_MODE=%s is silently treated as %s.\n",
+            (g_delay_cta_target == 1) ? "cluster" : "random", (g_delay_cta_target == 1) ? "cluster_fixed" : "fixed");
   }
 
   // INFO: warp targeting with the default 0.5 gate halves the active PCs.

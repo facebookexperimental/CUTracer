@@ -498,6 +498,45 @@ extern "C" __device__ __noinline__ void instrument_delay_random(int pred, uint32
   sleep_for_ns(delay);
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+/**
+ * @brief Whether this thread's CTA is the one selected for delay in its cluster.
+ *
+ * cta_id_override >= 0 selects CTA `cta_id_override % cluster_size` in every
+ * cluster; otherwise cluster_seed selects CTA `cluster_seed % cluster_size`.
+ * The %cluster_ctaid / %cluster_nctaid registers need sm_90+. A launch without
+ * clusters (or with one-CTA clusters) selects no CTA: there is no inter-CTA
+ * synchronization to perturb.
+ */
+__device__ __forceinline__ bool cluster_cta_selected(uint32_t cluster_seed, int32_t cta_id_override) {
+  const int4 cluster_nctaid = get_cluster_nctaid();
+  const int total_ctas = cluster_nctaid.x * cluster_nctaid.y * cluster_nctaid.z;
+  if (total_ctas <= 1) {
+    return false;
+  }
+  const int4 cluster_ctaid = get_cluster_ctaid();
+  const int my_cta_linear =
+      cluster_ctaid.x + cluster_ctaid.y * cluster_nctaid.x + cluster_ctaid.z * cluster_nctaid.x * cluster_nctaid.y;
+  const int target_cta =
+      (cta_id_override >= 0) ? (cta_id_override % total_ctas) : (int)(cluster_seed % (uint32_t)total_ctas);
+  return my_cta_linear == target_cta;
+}
+#endif
+
+/**
+ * @brief Whether this thread's CTA-local warp is set in warp_mask.
+ *
+ * The warp id is the logical warp position in the block, computed from
+ * threadIdx and blockDim, not NVBit's grid-wide get_global_warp_id() or PTX
+ * %warpid (a physical slot). Every lane of a warp gets the same answer, so a
+ * branch on it does not diverge. Warps >= 32 are never selected.
+ */
+__device__ __forceinline__ bool cta_warp_selected(uint32_t warp_mask) {
+  const uint32_t tid_linear = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+  const uint32_t warp_id = tid_linear >> 5;
+  return warp_id < 32u && ((warp_mask >> warp_id) & 1u) != 0u;
+}
+
 /**
  * @brief Device function to inject a random delay on exactly one CTA within a cluster.
  *
@@ -528,39 +567,15 @@ extern "C" __device__ __noinline__ void instrument_delay_random_cluster(int pred
   // (e.g. sm_80) ptxas rejects them, so compile this whole body into a no-op
   // there. Cluster mode itself is meaningless on pre-Hopper hardware.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if (!pred) {
+  // cta_id_override (set host-side via --delay-cluster-cta-id) always wins
+  // over cluster_seed, including in --delay-load-path replay mode: setting it
+  // during replay overrides the recorded cluster_seed of every point, so replay
+  // is no longer bit-identical to the recording. Useful for A/B-bisecting "did
+  // the bug fire because CTA X was delayed?". cluster_seed (host-generated per
+  // point in record mode, loaded from the config in replay mode) is
+  // deterministic across runs that share a delay config and set no override.
+  if (!pred || !cluster_cta_selected(cluster_seed, cta_id_override)) {
     return;
-  }
-
-  // Determine cluster geometry
-  int4 cluster_nctaid = get_cluster_nctaid();
-  int total_ctas = cluster_nctaid.x * cluster_nctaid.y * cluster_nctaid.z;
-
-  // No clustering or single-CTA cluster — skip delay
-  if (total_ctas <= 1) {
-    return;
-  }
-
-  // Compute this CTA's linear index within the cluster
-  int4 cluster_ctaid = get_cluster_ctaid();
-  int my_cta_linear =
-      cluster_ctaid.x + cluster_ctaid.y * cluster_nctaid.x + cluster_ctaid.z * cluster_nctaid.x * cluster_nctaid.y;
-
-  // Select which CTA in the cluster gets delayed. Precedence:
-  //   1. cta_id_override >= 0 (set host-side via --delay-cluster-cta-id):
-  //      target_cta = cta_id_override % total_ctas. ALWAYS WINS — including
-  //      in --delay-load-path replay mode. Setting the override during replay
-  //      intentionally overrides the recorded cluster_seed for every point,
-  //      so replay is no longer bit-identical to the recording. Useful for
-  //      A/B-bisecting "did the bug fire because CTA X was delayed?".
-  //   2. cluster_seed (host-generated per instrumentation point in record
-  //      mode, loaded from config in replay mode):
-  //      target_cta = cluster_seed % total_ctas. Deterministic across runs
-  //      that share the same delay config AND do not set the override.
-  int target_cta = (cta_id_override >= 0) ? (cta_id_override % total_ctas) : (int)(cluster_seed % (uint32_t)total_ctas);
-
-  if (my_cta_linear != target_cta) {
-    return;  // Not the selected CTA, no delay
   }
 
   // Selected CTA: compute delay either as fixed (= max_delay_ns) or per-thread
@@ -603,16 +618,8 @@ extern "C" __device__ __noinline__ void instrument_delay_random_cluster(int pred
  * so the warp stalls as a single scheduling unit. This is what produces the
  * warpgroup-vs-warpgroup timing skew that intra-CTA races (e.g. consumer
  * warpgroup vs. destructor warpgroup) require — per-thread randomness washes
- * out at the warp boundary and cannot reproduce this class of bug.
- *
- * CTA-local warp id is computed from threadIdx and blockDim. We do not use
- * NVBit's get_global_warp_id() (grid-wide) or PTX %warpid (physical slot,
- * unstable across scheduler) — warp targeting is a CTA-local concept and must
- * be based on the logical warp position within the block.
- *
- * Warps whose id is >= 32 (kernels with > 1024 threads/CTA cannot occur on
- * current hardware, but defensively) are silently skipped: the mask is 32-bit
- * and addresses warps 0..31 only.
+ * out at the warp boundary and cannot reproduce this class of bug. See
+ * cta_warp_selected for how the CTA-local warp id is computed.
  *
  * @param pred       Guard predicate value (per-thread, from nvbit_add_call_arg_guard_pred_val).
  * @param delay_ns   Fixed delay in nanoseconds for every thread in each selected warp.
@@ -621,25 +628,48 @@ extern "C" __device__ __noinline__ void instrument_delay_random_cluster(int pred
  */
 extern "C" __device__ __noinline__ void instrument_delay_warpgroup(int pred, uint32_t delay_ns, uint32_t warp_mask) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-  if (!pred) {
+  if (!pred || !cta_warp_selected(warp_mask)) {
     return;
   }
-
-  const uint32_t tid_linear = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
-  const uint32_t warp_id = tid_linear >> 5;
-
-  // warp-uniform: all 32 lanes compute the same warp_id, so the branch does
-  // not introduce intra-warp divergence. Hit warps stall together.
-  const bool hit = (warp_id < 32u) && (((warp_mask >> warp_id) & 1u) != 0u);
-  if (!hit) {
-    return;
-  }
-
   sleep_for_ns(delay_ns);
 #else
   // Reference args to silence unused-parameter warnings under -Wall.
   (void)pred;
   (void)delay_ns;
   (void)warp_mask;
+#endif
+}
+
+/**
+ * @brief Device function to inject a fixed delay on selected warps of one CTA per cluster.
+ *
+ * A thread sleeps only when its CTA is the selected CTA of its cluster (see
+ * cluster_cta_selected) and its CTA-local warp is set in warp_mask (see
+ * cta_warp_selected). This stalls one warp role on one cluster rank, for
+ * example the MMA warp of the peer CTA of a 2-CTA kernel, while every other
+ * warp, including the same role on the other ranks, runs at full speed. Within
+ * the selected warps every thread sleeps delay_ns, so each warp stalls as one
+ * unit. A launch without clusters is not delayed, as in the cluster-only mode.
+ *
+ * @param pred            Guard predicate value (from nvbit_add_call_arg_guard_pred_val).
+ * @param delay_ns        Fixed delay in nanoseconds.
+ * @param warp_mask       Bitmask of CTA-local warp ids (bit i set = delay warp i).
+ * @param cluster_seed    Host-generated seed selecting the CTA when cta_id_override < 0.
+ * @param cta_id_override >= 0 delays this CTA index in every cluster.
+ */
+extern "C" __device__ __noinline__ void instrument_delay_cluster_warp(int pred, uint32_t delay_ns, uint32_t warp_mask,
+                                                                      uint32_t cluster_seed, int32_t cta_id_override) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if (!pred || !cta_warp_selected(warp_mask) || !cluster_cta_selected(cluster_seed, cta_id_override)) {
+    return;
+  }
+  sleep_for_ns(delay_ns);
+#else
+  // Reference args to silence unused-parameter warnings under -Wall.
+  (void)pred;
+  (void)delay_ns;
+  (void)warp_mask;
+  (void)cluster_seed;
+  (void)cta_id_override;
 #endif
 }
