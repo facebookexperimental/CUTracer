@@ -578,6 +578,11 @@ def reduce_args(config: StressConfig, triggering: TriggeringConfig) -> List[str]
                 cluster_rank=triggering.target.get("cluster_rank"),
             )
     args = _targeting_args(config, warpgroup=triggering.warpgroup_id, target=target)
+    # Reduce's per-replay outer timeout defaults to 300 s while a search runs
+    # its attempts with `config.timeout` (1800 s by default): a replay killed
+    # by the outer timeout before CUTracer's kernel timeout fires cannot be
+    # recognized as the hang the search found.
+    args += ["--timeout", str(config.timeout)]
     if triggering.symptom == SYMPTOM_HANG:
         args.append("--hang-is-bug")
     return args
@@ -585,16 +590,19 @@ def reduce_args(config: StressConfig, triggering: TriggeringConfig) -> List[str]
 
 @dataclass(frozen=True)
 class _LaunchGeometry:
-    """The largest instrumented launch shape a control run observed."""
+    """One instrumented kernel's largest launch shape a control run observed."""
 
     warps: int
     cluster_size: int
+    checksum: str = ""
 
     def merge(self, other: Optional["_LaunchGeometry"]) -> "_LaunchGeometry":
         if other is None:
             return self
         return _LaunchGeometry(
-            max(self.warps, other.warps), max(self.cluster_size, other.cluster_size)
+            max(self.warps, other.warps),
+            max(self.cluster_size, other.cluster_size),
+            self.checksum or other.checksum,
         )
 
 
@@ -641,14 +649,17 @@ def _cluster_size(event: Mapping[str, Any]) -> int:
     return size if type(size) is int and size >= 1 else 1
 
 
-def _instrumented_geometry(
+def _instrumented_geometries(
     output_dir: str, config_path: str
-) -> Optional[_LaunchGeometry]:
-    """Warps per CTA and cluster size of the launches whose kernels have delay points.
+) -> List[_LaunchGeometry]:
+    """Per-kernel launch shapes of the launches whose kernels have delay points.
 
     `config_path` is the run's delay dump: it lists every instrumented kernel
     and its candidate points, so launches of kernels that have nothing to delay
-    (or were not instrumented at all) do not widen the search.
+    (or were not instrumented at all) do not widen the search. Shapes stay
+    per kernel (in first-launch order): merging the warps of one kernel with
+    the cluster size of another could invent targets no launch has, and
+    keeping only the widest kernel would drop the other kernels' targets.
     """
     try:
         with open(config_path) as source:
@@ -659,33 +670,49 @@ def _instrumented_geometry(
             if isinstance(kernel, dict) and kernel.get("instrumentation_points")
         }
     except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
-        return None
+        return []
     by_checksum: Dict[str, _LaunchGeometry] = {}
     for event in _kernel_launch_events(output_dir):
         warps = _block_warps(event)
         checksum = event.get("kernel_checksum")
         if warps is None or not isinstance(checksum, str) or checksum not in checksums:
             continue
-        launch = _LaunchGeometry(warps, _cluster_size(event))
+        launch = _LaunchGeometry(warps, _cluster_size(event), checksum)
         by_checksum[checksum] = launch.merge(by_checksum.get(checksum))
-    if not by_checksum:
-        return None
-    # Search the widest launch of one kernel: merging the warps of one kernel
-    # with the cluster size of another could invent targets no launch has.
-    return max(by_checksum.values(), key=lambda item: (item.warps, item.cluster_size))
+    return list(by_checksum.values())
+
+
+def _merge_geometries(
+    geometries: List[_LaunchGeometry], new: List[_LaunchGeometry]
+) -> List[_LaunchGeometry]:
+    """Fold another control run's per-kernel shapes into `geometries`."""
+    by_checksum = {geometry.checksum: geometry for geometry in geometries}
+    order = [geometry.checksum for geometry in geometries]
+    for geometry in new:
+        if geometry.checksum in by_checksum:
+            by_checksum[geometry.checksum] = geometry.merge(
+                by_checksum[geometry.checksum]
+            )
+        else:
+            by_checksum[geometry.checksum] = geometry
+            order.append(geometry.checksum)
+    return [by_checksum[checksum] for checksum in order]
 
 
 def _isolate_targets(
-    config: StressConfig, geometry: Optional[_LaunchGeometry]
+    config: StressConfig, geometries: Sequence[_LaunchGeometry]
 ) -> List[DelayTarget]:
     """The isolate targets in search order: cluster ranks high to low, warps ascending.
 
     Higher ranks come first: in a multi-CTA kernel rank 0 usually leads, and a
     warp of a peer CTA whose work is predicated off is the one most easily left
-    out of the release protocol.
+    out of the release protocol. Targets are collected from every instrumented
+    launch shape, without combining one kernel's warps with another's cluster
+    ranks; a target named for several kernels is tried once, because one
+    attempt delays that warp of every kernel it launches in.
     """
     if config.isolate_ranks is None or config.isolate_warps is None:
-        if geometry is None:
+        if not geometries:
             if config.baseline_runs <= 0:
                 raise ValueError(
                     "an isolate search that discovers its targets from the "
@@ -698,17 +725,33 @@ def _isolate_targets(
                 "points, so there is nothing to isolate; check the kernel filter "
                 "and the delay patterns, or pass the ranks and warps explicitly"
             )
-    warps = (
-        sorted(set(config.isolate_warps))
-        if config.isolate_warps is not None
-        else list(range(min(_MAX_WARPS, geometry.warps if geometry else 0)))
-    )
-    ranks: Sequence[Optional[int]] = (None,)
-    if config.isolate_ranks is not None:
-        ranks = sorted(set(config.isolate_ranks), reverse=True)
-    elif geometry is not None and geometry.cluster_size > 1:
-        ranks = range(geometry.cluster_size - 1, -1, -1)
-    return [DelayTarget(warp, rank) for rank in ranks for warp in warps]
+    if config.isolate_ranks is not None and config.isolate_warps is not None:
+        warps = sorted(set(config.isolate_warps))
+        ranks: Sequence[Optional[int]] = sorted(set(config.isolate_ranks), reverse=True)
+        return [DelayTarget(warp, rank) for rank in ranks for warp in warps]
+    targets: List[DelayTarget] = []
+    seen: set[DelayTarget] = set()
+    for geometry in geometries:
+        warps = (
+            sorted(set(config.isolate_warps))
+            if config.isolate_warps is not None
+            else list(range(min(_MAX_WARPS, geometry.warps)))
+        )
+        if config.isolate_ranks is not None:
+            shape_ranks: Sequence[Optional[int]] = sorted(
+                set(config.isolate_ranks), reverse=True
+            )
+        elif geometry.cluster_size > 1:
+            shape_ranks = range(geometry.cluster_size - 1, -1, -1)
+        else:
+            shape_ranks = (None,)
+        for rank in shape_ranks:
+            for warp in warps:
+                target = DelayTarget(warp, rank)
+                if target not in seen:
+                    seen.add(target)
+                    targets.append(target)
+    return targets
 
 
 @dataclass(frozen=True)
@@ -750,30 +793,37 @@ def _validate_delay_config(  # noqa: C901
     delay_ns: int,
     expected_kernel_name: Optional[str],
     expected_kernel_checksum: Optional[str],
-) -> tuple[Optional[str], Optional[tuple[str, str]], Optional[int]]:
-    """Return validated kernel identity and enabled-PC count for a config."""
+) -> tuple[Optional[str], List[tuple[str, str]], Optional[int]]:
+    """Return validated kernel identities and enabled-PC count for a config.
+
+    Every eligible kernel with enabled points is returned, not just the
+    first: an attempt's target may belong to any of them, so target
+    validation must not bind itself to one kernel's launch shape.
+    """
     if not os.path.isfile(path):
-        return "CUTracer wrote no delay config", None, None
+        return "CUTracer wrote no delay config", [], None
     try:
         with open(path) as source:
             payload = json.load(source)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return f"delay config is unreadable: {exc}", None, None
+        return f"delay config is unreadable: {exc}", [], None
     if not isinstance(payload, dict) or payload.get("version") != "1.0":
-        return "delay config has an unsupported or missing version", None, None
+        return "delay config has an unsupported or missing version", [], None
     configured_delay = payload.get("delay_ns")
     if type(configured_delay) is not int or configured_delay != delay_ns:
         return (
             "delay config does not match the attempted delay "
             f"({configured_delay!r} != {delay_ns})",
-            None,
+            [],
             None,
         )
     kernels = payload.get("kernels")
     if not isinstance(kernels, dict) or not kernels:
-        return "delay config contains no instrumented kernels", None, None
+        return "delay config contains no instrumented kernels", [], None
 
-    matched_identity: Optional[tuple[str, str]] = None
+    identities: List[tuple[str, str]] = []
+    enabled_count = 0
+    saw_eligible_kernel = False
     for raw_kernel in kernels.values():
         if not isinstance(raw_kernel, dict):
             continue
@@ -788,7 +838,7 @@ def _validate_delay_config(  # noqa: C901
                 continue
         elif expected_kernel_name is not None and kernel_name != expected_kernel_name:
             continue
-        matched_identity = (kernel_name, kernel_checksum)
+        saw_eligible_kernel = True
         points = raw_kernel.get("instrumentation_points")
         if not isinstance(points, dict):
             continue
@@ -809,19 +859,22 @@ def _validate_delay_config(  # noqa: C901
             ):
                 enabled_pcs.add(point_pc)
         if enabled_pcs:
-            return None, (kernel_name, kernel_checksum), len(enabled_pcs)
+            identities.append((kernel_name, kernel_checksum))
+            enabled_count += len(enabled_pcs)
 
-    if matched_identity is None and (
+    if identities:
+        return None, identities, enabled_count
+    if not saw_eligible_kernel and (
         expected_kernel_name is not None or expected_kernel_checksum is not None
     ):
         return (
             "delay config does not contain the expected kernel identity",
-            None,
+            [],
             None,
         )
     return (
         "delay config contains no enabled point for the expected delay",
-        None,
+        [],
         None,
     )
 
@@ -830,12 +883,12 @@ def _validate_warpgroup_launch(
     output_dir: str,
     *,
     warpgroup: int,
-    kernel_identity: tuple[str, str],
+    kernel_identities: Sequence[tuple[str, str]],
 ) -> Optional[str]:
     """Verify that a targeted warpgroup has at least one live warp at launch."""
     return _validate_target_launch(
         output_dir,
-        kernel_identity=kernel_identity,
+        kernel_identities=kernel_identities,
         warp=4 * warpgroup,
         cluster_rank=None,
         label=f"warpgroup {warpgroup}",
@@ -845,7 +898,7 @@ def _validate_warpgroup_launch(
 def _validate_target_launch(  # noqa: C901
     output_dir: str,
     *,
-    kernel_identity: tuple[str, str],
+    kernel_identities: Sequence[tuple[str, str]],
     warp: int,
     cluster_rank: Optional[int],
     label: str,
@@ -853,10 +906,14 @@ def _validate_target_launch(  # noqa: C901
     """Verify that a matching launch has CTA-local `warp` (and cluster rank).
 
     A target outside every launch makes the attempt inject nothing, so its
-    "not reproduced" would be meaningless.
+    "not reproduced" would be meaningless. Any eligible kernel may provide
+    the matching launch. An explicit cluster rank additionally needs a
+    multi-CTA cluster: cluster targeting delays no CTA of a one-CTA cluster,
+    so rank 0 of such a launch is not a perturbed target.
     """
-    _kernel_name, kernel_checksum = kernel_identity
+    kernel_checksums = {checksum for _name, checksum in kernel_identities}
     matched_launch = False
+    matched_without_cluster = False
     try:
         names = os.listdir(output_dir)
     except OSError as exc:
@@ -878,23 +935,28 @@ def _validate_target_launch(  # noqa: C901
                     if (
                         not isinstance(event, dict)
                         or event.get("type") != "kernel_launch"
-                        or event.get("kernel_checksum") != kernel_checksum
+                        or event.get("kernel_checksum") not in kernel_checksums
                     ):
                         continue
                     matched_launch = True
                     block_warps = _block_warps(event)
-                    if (
-                        block_warps is not None
-                        and warp < block_warps
-                        and (
-                            cluster_rank is None or cluster_rank < _cluster_size(event)
-                        )
-                    ):
+                    if block_warps is None or warp >= block_warps:
+                        continue
+                    if cluster_rank is None:
                         return None
+                    if _cluster_size(event) > 1 and cluster_rank < _cluster_size(event):
+                        return None
+                    if _cluster_size(event) <= 1:
+                        matched_without_cluster = True
         except (OSError, UnicodeError) as exc:
             read_errors.append(f"{name}: {exc}")
     if read_errors:
         return "kernel launch evidence is unreadable: " + "; ".join(read_errors)
+    if matched_without_cluster:
+        return (
+            f"{label} needs a multi-CTA cluster launch, but the matching "
+            "kernel launched with one CTA per cluster"
+        )
     if matched_launch:
         return f"{label} has no live warp in the matching kernel launch"
     return f"no matching kernel launch evidence was recorded for {label} targeting"
@@ -1063,7 +1125,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
             hangs=hangs,
         )
 
-    config_error, kernel_identity, enabled_point_count = _validate_delay_config(
+    config_error, kernel_identities, enabled_point_count = _validate_delay_config(
         config_path,
         delay_ns=delay_ns,
         expected_kernel_name=config.expected_kernel_name,
@@ -1080,13 +1142,13 @@ def _run_attempt_in_output_dir(  # noqa: C901
             rejected_config_path=rejected,
             hangs=hangs,
         )
-    assert kernel_identity is not None
+    assert kernel_identities
     assert enabled_point_count is not None
     targeting_error: Optional[str] = None
     if target is not None:
         targeting_error = _validate_target_launch(
             instrumentation_output_dir,
-            kernel_identity=kernel_identity,
+            kernel_identities=kernel_identities,
             warp=target.warp,
             cluster_rank=target.cluster_rank,
             label=target.label(),
@@ -1095,7 +1157,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
         targeting_error = _validate_warpgroup_launch(
             instrumentation_output_dir,
             warpgroup=warpgroup,
-            kernel_identity=kernel_identity,
+            kernel_identities=kernel_identities,
         )
     if targeting_error is not None:
         rejected = _preserve_rejected_config(config_path)
@@ -1287,8 +1349,8 @@ class _BaselineResult:
     infra_errors: int
     logs: List[str]
     hangs: int = 0
-    # Instrumented launch shape, recorded for isolate searches only.
-    geometry: Optional[_LaunchGeometry] = None
+    # Per-kernel instrumented launch shapes, recorded for isolate searches only.
+    geometries: List[_LaunchGeometry] = field(default_factory=list)
 
 
 def _run_baseline(
@@ -1316,7 +1378,7 @@ def _run_baseline(
     timed_out = 0
     infra_errors = 0
     hangs = 0
-    geometry: Optional[_LaunchGeometry] = None
+    geometries: List[_LaunchGeometry] = []
     logs: List[str] = []
     if config.baseline_runs <= 0:
         # A caller that opted out of the control arm must not pay for anything
@@ -1364,8 +1426,9 @@ def _run_baseline(
             error = f"baseline timed out: {exc}"
         watchdog = watchdog_terminations(run_dir, before=logs_before)
         if dump_path is not None:
-            launches = _instrumented_geometry(run_dir, dump_path)
-            geometry = launches.merge(geometry) if launches else geometry
+            geometries = _merge_geometries(
+                geometries, _instrumented_geometries(run_dir, dump_path)
+            )
             shutil.rmtree(run_dir, ignore_errors=True)
         hangs += 1 if watchdog else 0
         logs.append(
@@ -1405,7 +1468,7 @@ def _run_baseline(
         infra_errors=infra_errors,
         logs=logs,
         hangs=hangs,
-        geometry=geometry,
+        geometries=geometries,
     )
 
 
@@ -1488,7 +1551,7 @@ def run_stress(  # noqa: C901
                 "resuming an isolate search needs explicit isolate_ranks and "
                 "isolate_warps"
             )
-        targets = _isolate_targets(config, baseline.geometry)
+        targets = _isolate_targets(config, baseline.geometries)
     schedule = _trial_schedule(config, targets)
     planned_trials = len(schedule)
     if resume is not None:
