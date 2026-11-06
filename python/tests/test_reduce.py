@@ -9,6 +9,7 @@ Tests cover:
 - Report generation (report.py)
 """
 
+import copy
 import json
 import os
 import shutil
@@ -188,6 +189,33 @@ class DelayConfigMutatorTest(unittest.TestCase):
         cloned = mutator3.clone()
         mutator3.set_all_enabled(False)
         self.assertEqual(len(cloned.enabled_points), 3)  # Clone unaffected
+
+    def test_schema_accepts_the_seeds_cutracer_records(self):
+        """CUTracer writes the run's seed, and a per-point cluster seed in the
+        cluster delay modes."""
+        config = copy.deepcopy(SAMPLE_DELAY_CONFIG)
+        config["seed"] = 2**64 - 1
+        point = config["kernels"]["kernel_0_a1b2c3d4e5f60001"]["instrumentation_points"]
+        point["0x100"]["cluster_seed"] = 2**32 - 1
+        path = self.temp_dir / "seeded_config.json"
+        path.write_text(json.dumps(config))
+
+        mutator = DelayConfigMutator(str(path), validate=True)
+
+        self.assertEqual(len(mutator.delay_points), 4)
+        for bad in ({"seed": -1}, {"seed": "1"}, {"seed": 2**64}):
+            with self.subTest(bad=bad):
+                path.write_text(json.dumps(dict(SAMPLE_DELAY_CONFIG, **bad)))
+                with self.assertRaisesRegex(ValueError, "Invalid delay config"):
+                    DelayConfigMutator(str(path), validate=True)
+        overflow = copy.deepcopy(SAMPLE_DELAY_CONFIG)
+        overflow_point = overflow["kernels"]["kernel_0_a1b2c3d4e5f60001"][
+            "instrumentation_points"
+        ]
+        overflow_point["0x100"]["cluster_seed"] = 2**32
+        path.write_text(json.dumps(overflow))
+        with self.assertRaisesRegex(ValueError, "Invalid delay config"):
+            DelayConfigMutator(str(path), validate=True)
 
     def test_schema_validation(self):
         """Test schema validation for config files."""
