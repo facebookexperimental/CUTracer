@@ -728,8 +728,13 @@ static void check_kernel_timeout(CTXstate* ctx_state, uint64_t current_kernel_la
   time_t now = time(nullptr);
   time_t kernel_running_time = now - ctx_state->kernel_start_time;
   if (kernel_running_time >= static_cast<time_t>(kernel_timeout_s)) {
-    loprintf("Kernel timeout: running for %ld seconds (limit: %u seconds); sending SIGTERM.\n", kernel_running_time,
-             kernel_timeout_s);
+    std::string kernel_name;
+    {
+      std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+      kernel_name = ctx_state->kernel_start_name;
+    }
+    loprintf("Kernel timeout: running for %ld seconds (limit: %u seconds); sending SIGTERM. kernel=%s\n",
+             kernel_running_time, kernel_timeout_s, kernel_name.c_str());
     if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
       print_warp_status_summary(ctx_state, current_kernel_launch_id);
     }
@@ -911,9 +916,11 @@ void* recv_thread_fun(void* args) {
 
   // Used to detect when a new kernel begins.
   uint64_t last_seen_kernel_launch_id = UINT64_MAX;  // Initial invalid value
-  // A plan may send nothing before its kernel ends, so its kernel timeout
-  // counts from the launch of a captured kernel instead of its first data.
-  const bool plan_capture = cutracer::current_runtime_plan() != nullptr;
+  // A plan may send nothing before its kernel ends, and random_delay alone
+  // sends nothing at all, so their kernel timeout counts from the launch of a
+  // captured kernel instead of its first data.
+  const bool timeout_from_launch =
+      cutracer::current_runtime_plan() != nullptr || !has_channel_instrumentation_enabled();
 
   // Timer for periodic TraceWriter flush (ensures data reaches disk
   // even when json_buffer_ hasn't hit the 1MB threshold, e.g. during kernel hang).
@@ -1323,7 +1330,7 @@ void* recv_thread_fun(void* args) {
     }
 
     // Resource protection (independent, always active when configured)
-    if (kernel_timeout_s > 0 && (plan_capture || last_seen_kernel_launch_id != UINT64_MAX)) {
+    if (kernel_timeout_s > 0 && (timeout_from_launch || last_seen_kernel_launch_id != UINT64_MAX)) {
       check_kernel_timeout(ctx_state, last_seen_kernel_launch_id);
     }
     // No-data timeout: does NOT require last_seen_kernel_launch_id because
