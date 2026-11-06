@@ -17,6 +17,7 @@ import os
 import platform
 import secrets
 import shutil
+import signal
 import subprocess
 import tempfile
 from contextlib import ExitStack
@@ -524,6 +525,70 @@ def _run_with_environment(
         text=True,
         check=False,
     )
+
+
+def run_process_group(
+    command: str | Sequence[str],
+    *,
+    shell: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+    cwd: Optional[str] = None,
+    timeout: Optional[float] = None,
+    capture_output: bool = False,
+    text: bool = False,
+    check: bool = False,
+    kill_grace_s: float = 10.0,
+) -> "subprocess.CompletedProcess[str]":
+    """`subprocess.run` for a target that starts processes of its own.
+
+    `subprocess.run` kills only its direct child on timeout, so the workers of
+    a multi-process target (for example torch elastic ranks stuck in a hung
+    kernel) keep running and keep their GPUs. Here the target runs in a new
+    session: on timeout the whole session gets SIGTERM, then SIGKILL after
+    `kill_grace_s`, before `subprocess.TimeoutExpired` is raised, and processes
+    still left in the session after the target exits are killed as well. A
+    `RunTarget` for `run_instrumented_target`.
+    """
+    stdio = subprocess.PIPE if capture_output else None
+    with subprocess.Popen(
+        command,
+        shell=shell,
+        env=env,
+        cwd=cwd,
+        stdout=stdio,
+        stderr=stdio,
+        text=text,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _signal_session(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=kill_grace_s)
+            except subprocess.TimeoutExpired:
+                pass
+            _signal_session(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                process.args, timeout or 0, output=stdout, stderr=stderr
+            ) from None
+        finally:
+            _signal_session(process.pid, signal.SIGKILL)
+    result = subprocess.CompletedProcess(
+        process.args, process.returncode, stdout, stderr
+    )
+    if check:
+        result.check_returncode()
+    return result
+
+
+def _signal_session(session_id: int, sig: signal.Signals) -> None:
+    """Send `sig` to every process left in a session started by `run_process_group`."""
+    try:
+        os.killpg(session_id, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _print_config_summary(env: dict) -> None:
