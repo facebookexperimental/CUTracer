@@ -13,10 +13,10 @@ import os
 import shlex
 import shutil
 import sys
-from dataclasses import dataclass
 
 import click
 from cutracer.runner import resolve_cutracer_so
+from cutracer.stress.modes import get_mode
 from cutracer.stress.stress import (
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
@@ -48,23 +48,6 @@ def _parse_int_ranges(text: str) -> list[int]:
             raise ValueError(f"warp range {token!r} runs backwards")
         values.extend(range(start, end + 1))
     return values
-
-
-@dataclass(frozen=True)
-class _StrategyDefaults:
-    delay_ladder_ns: str
-    attempts_per_delay: int
-    kernel_timeout_s: int
-    hang_is_bug: bool
-
-
-# Isolate stalls one warp at a time: a single 1 ms rung lets a producer lap an
-# unreleasing consumer by many phases, every hang is a finding, and the kernel
-# timeout ends it.
-_DEFAULTS = {
-    STRATEGY_RANDOM: _StrategyDefaults("1000,5000,10000,50000,100000", 3, 0, False),
-    STRATEGY_ISOLATE: _StrategyDefaults("1000000", 1, 60, True),
-}
 
 
 @click.command(name="stress", context_settings={"ignore_unknown_options": True})
@@ -239,16 +222,18 @@ def stress_command(  # noqa: C901
             "Put stress options before `--` and the oracle command after it."
         )
 
-    isolate = strategy == STRATEGY_ISOLATE
+    defaults = get_mode(strategy)
+    isolate = defaults.isolates_targets
     if isolate and warpgroup_ids:
         raise click.UsageError("--warpgroup-ids applies to --strategy random only")
     if not isolate and (isolate_ranks or isolate_warps):
         raise click.UsageError(
             "--isolate-ranks and --isolate-warps need --strategy isolate"
         )
-    defaults = _DEFAULTS[strategy]
-    parsed_delays = _parse_int_list(
-        defaults.delay_ladder_ns if delay_ladder_ns is None else delay_ladder_ns
+    parsed_delays = (
+        list(defaults.delay_ladder_ns)
+        if delay_ladder_ns is None
+        else _parse_int_list(delay_ladder_ns)
     )
     if not parsed_delays:
         raise click.UsageError("--delay-ladder-ns must contain at least one value")

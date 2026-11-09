@@ -37,6 +37,7 @@ from cutracer.runner import (
     run_process_group,
     RunTarget,
 )
+from cutracer.stress.modes import get_mode, get_modes, ISOLATE, RANDOM
 from cutracer.stress.retention import (
     MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
     retain_oldest_and_newest,
@@ -54,13 +55,9 @@ SYMPTOM_FAILURE = "failure"
 # CUTracer's watchdog ended a hung kernel (requires `hang_is_bug`).
 SYMPTOM_HANG = "hang"
 
-STRATEGY_RANDOM = "random"
-STRATEGY_ISOLATE = "isolate"
-# Isolate searches delay mbarrier waits by default: a consumer that never
-# releases its slot misbehaves when it reaches its wait late (the parity it
-# waits for may then name a later phase), while arriving late at a load only
-# makes it read a newer value.
-ISOLATE_DEFAULT_PATTERNS = "SYNCS.PHASECHK"
+STRATEGY_RANDOM: str = RANDOM.name
+STRATEGY_ISOLATE: str = ISOLATE.name
+ISOLATE_DEFAULT_PATTERNS: str | None = ISOLATE.delay_patterns
 # CUTracer warp masks are 32 bits wide (CUDA allows 32 warps per CTA).
 _MAX_WARPS = 32
 
@@ -127,14 +124,14 @@ class StressConfig:
     # reproduction, whatever the oracle's exit code. Off by default: a large
     # delay can also slow a correct kernel past the timeout.
     hang_is_bug: bool = False
-    # STRATEGY_RANDOM: random per-thread delays at every candidate point, all
-    # warps at once or one warpgroup at a time (`warpgroup_ids`).
-    # STRATEGY_ISOLATE: one target (cluster rank, CTA-local warp) per attempt,
-    # with a fixed delay before each matching instruction (`enable_prob` is
-    # ignored) while every other warp runs at full speed. Random delays slow a
-    # producer down together with its consumers, so they cannot show that a
-    # consumer is missing from the release protocol; isolating that consumer
-    # lets the producer lap it.
+    # A mode of `cutracer.stress.modes`. STRATEGY_RANDOM: random per-thread
+    # delays at every candidate point, all warps at once or one warpgroup at a
+    # time (`warpgroup_ids`). STRATEGY_ISOLATE: one target (cluster rank,
+    # CTA-local warp) per attempt, with a fixed delay before each matching
+    # instruction (`enable_prob` is ignored) while every other warp runs at
+    # full speed. Random delays slow a producer down together with its
+    # consumers, so they cannot show that a consumer is missing from the
+    # release protocol; isolating that consumer lets the producer lap it.
     strategy: str = STRATEGY_RANDOM
     # Isolate targets: cluster ranks (tried high to low) and CTA-local warps.
     # None = every rank / warp of the instrumented launches the control arm
@@ -179,9 +176,9 @@ class StressConfig:
             raise ValueError(
                 f"kernel_timeout_s must be >= 0, got {self.kernel_timeout_s}"
             )
-        if self.strategy not in (STRATEGY_RANDOM, STRATEGY_ISOLATE):
+        if self.strategy not in get_modes():
             raise ValueError(f"unknown stress strategy {self.strategy!r}")
-        if self.strategy == STRATEGY_ISOLATE:
+        if get_mode(self.strategy).isolates_targets:
             if self.warpgroup_ids:
                 raise ValueError("warpgroup_ids do not apply to an isolate search")
         elif self.isolate_ranks is not None or self.isolate_warps is not None:
@@ -514,9 +511,7 @@ def _no_data_timeout_s(config: StressConfig) -> int:
 
 
 def _delay_patterns(config: StressConfig) -> Optional[str]:
-    if config.delay_patterns:
-        return config.delay_patterns
-    return ISOLATE_DEFAULT_PATTERNS if config.strategy == STRATEGY_ISOLATE else None
+    return config.delay_patterns or get_mode(config.strategy).delay_patterns
 
 
 def _replay_args(
@@ -825,7 +820,7 @@ def _trial_schedule(config: StressConfig, targets: List[DelayTarget]) -> List[_T
     whole ladder to run on every other target first.
     """
     attempts = range(config.attempts_per_delay)
-    if config.strategy == STRATEGY_ISOLATE:
+    if get_mode(config.strategy).isolates_targets:
         return [
             _Trial(delay_ns, attempt, target=target)
             for target in targets
@@ -1439,7 +1434,7 @@ def _run_baseline(
         # here -- including reading `delay_ladder_ns[0]`.
         return _BaselineResult(0, 0, 0, 0, 0, logs)
     delay_ns = config.delay_ladder_ns[0]
-    isolate = config.strategy == STRATEGY_ISOLATE
+    isolate = get_mode(config.strategy).isolates_targets
     for attempt in range(config.baseline_runs):
         run_dir = (
             tempfile.mkdtemp(prefix=".stress_baseline_", dir=config.output_dir)
@@ -1597,7 +1592,7 @@ def run_stress(  # noqa: C901
     stop = False
     targets: List[DelayTarget] = []
     restored_targets = False
-    if config.strategy == STRATEGY_ISOLATE:
+    if get_mode(config.strategy).isolates_targets:
         if resume is not None and resume.targets:
             # The checkpoint's recorded targets are the original schedule;
             # see `_restored_targets` for why they cannot be rebuilt from
