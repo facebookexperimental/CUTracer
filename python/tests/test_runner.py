@@ -18,6 +18,7 @@ from cutracer.runner import (
     _build_cutracer_env,
     _BundledCudaTools,
     _persist_extracted_cuda_tools,
+    _persist_extracted_so,
     _resolve_bundled_cuda_tools,
     InstrumentationConfig,
     resolve_cutracer_so,
@@ -362,6 +363,41 @@ class BuildCutracerEnvTest(unittest.TestCase):
         resolve_tools.assert_not_called()
         self.assertEqual(env["NVDISASM"], "/pinned/cuda/bin/nvdisasm")
         self.assertEqual(env["PATH"], "/pinned/cuda/bin:/usr/bin")
+
+
+class PersistExtractedSoTest(unittest.TestCase):
+    def test_so_outlives_extracted_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "extracted" / "cutracer.so"
+            src.parent.mkdir(parents=True)
+            src.write_bytes(b"cutracer-v1")
+            with patch("cutracer.runner.tempfile.gettempdir", return_value=tmpdir):
+                with patch("cutracer.runner.platform.machine", return_value="x86_64"):
+                    persisted = _persist_extracted_so(src)
+
+            shutil.rmtree(src.parent)
+            self.assertEqual(persisted.read_bytes(), b"cutracer-v1")
+            self.assertTrue(os.access(persisted, os.X_OK))
+            self.assertEqual(persisted.name, "cutracer.so")
+            self.assertIn("x86_64", persisted.parts)
+
+    def test_same_size_different_content_get_distinct_cache_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "cutracer.so"
+            src.write_bytes(b"aaaaaaaa")
+            with patch("cutracer.runner.tempfile.gettempdir", return_value=tmpdir):
+                with patch("cutracer.runner.platform.machine", return_value="x86_64"):
+                    first = _persist_extracted_so(src)
+                    src.write_bytes(b"bbbbbbbb")
+                    second = _persist_extracted_so(src)
+                    again = _persist_extracted_so(src)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(second, again)
+            self.assertEqual(first.read_bytes(), b"aaaaaaaa")
+            self.assertEqual(second.read_bytes(), b"bbbbbbbb")
 
 
 class PersistExtractedCudaToolsTest(unittest.TestCase):

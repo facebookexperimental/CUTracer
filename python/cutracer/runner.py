@@ -93,20 +93,45 @@ def _is_under_tempdir(path: Path) -> bool:
         return False
 
 
-def _persist_extracted_so(src: Path) -> Path:
-    cache_dir = Path(tempfile.gettempdir()) / "cutracer_so_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    dst = cache_dir / "cutracer.so"
-    src_size = src.stat().st_size
-    if not dst.is_file() or dst.stat().st_size != src_size:
-        shutil.copy2(src, dst)
-        dst.chmod(0o755)
-    return dst
-
-
 def _host_arch() -> str:
     machine = platform.machine().lower()
     return {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+
+
+def _persist_extracted_so(src: Path) -> Path:
+    """Copy a temporary cutracer.so into an immutable content-addressed cache.
+
+    ``importlib.resources.as_file`` removes files extracted from a zip/PEX when
+    its context exits. NVBit loads the library later in a child process via
+    CUDA_INJECTION64_PATH, so the library must outlive that context. The user
+    id, host architecture and content digest keep concurrent processes,
+    x86_64/aarch64 packages and CUTracer releases isolated: each version gets
+    its own file, so no process ever overwrites a library another process is
+    about to load. Publishing through a temporary file plus ``os.replace``
+    means readers only ever see a complete file.
+    """
+    digest = file_sha256(src)
+    cache_dir = (
+        Path(tempfile.gettempdir())
+        / f"cutracer_so_cache_{os.getuid()}"
+        / _host_arch()
+        / digest
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / "cutracer.so"
+    if dst.is_file() and file_sha256(dst) == digest:
+        return dst
+
+    fd, temporary_name = tempfile.mkstemp(prefix=".cutracer.so.", dir=str(cache_dir))
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copyfile(src, temporary)
+        temporary.chmod(0o755)
+        os.replace(temporary, dst)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return dst
 
 
 def _persist_extracted_cuda_tools(
