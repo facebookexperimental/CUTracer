@@ -20,6 +20,12 @@ from typing import Any
 
 import click
 from cutracer.runner import resolve_cutracer_so
+from cutracer.stress.confirm import (
+    confirm_finding,
+    Confirmation,
+    CONFIRMED,
+    confirmed_verdict,
+)
 from cutracer.stress.modes import get_mode, get_modes
 from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
 from cutracer.stress.stress import (
@@ -35,6 +41,8 @@ from cutracer.stress.stress import (
     StressConfig,
     StressResult,
     SYMPTOM_HANG,
+    Verdict,
+    VERDICT_FINDING,
 )
 
 STRATEGY_ALL = "all"
@@ -176,6 +184,15 @@ def _mode_config(
     "kernel_timeout_s, hang_is_bug. Repeatable.",
 )
 @click.option(
+    "--confirm/--no-confirm",
+    default=False,
+    show_default=True,
+    help="After a finding, reduce its triggering config to the delay points that "
+    "matter (bisect, 3-run majority, with the search's targeting) and replay the "
+    "minimal config once more. The verdict stays a finding only if both "
+    "reproduce; the report gets a `confirmation` and minimal_config.json.",
+)
+@click.option(
     "--budget-s",
     type=click.IntRange(min=1),
     default=None,
@@ -309,6 +326,7 @@ def _mode_config(
 def stress_command(  # noqa: C901
     strategy: str,
     mode_options: tuple[str, ...],
+    confirm: bool,
     budget_s: int | None,
     delay_ladder_ns: str | None,
     enable_prob: float,
@@ -420,6 +438,7 @@ def stress_command(  # noqa: C901
         _run_single(
             configs[0],
             sanitizer_so=sanitizer_so,
+            confirm=confirm,
             budget_s=budget_s,
             output_dir=output_dir,
             dump_path=dump_path,
@@ -430,6 +449,7 @@ def stress_command(  # noqa: C901
         _run_plan(
             configs,
             sanitizer_so=sanitizer_so,
+            confirm=confirm,
             budget_s=budget_s,
             stop_on_first=stop_on_first,
             output_dir=output_dir,
@@ -453,10 +473,50 @@ def _plan_line(config: StressConfig) -> str:
     )
 
 
+def _confirm(
+    config: StressConfig,
+    result: StressResult,
+    verdict: Verdict,
+    *,
+    sanitizer_so: str,
+    deadline: float | None,
+) -> tuple[Verdict, Confirmation | None]:
+    if verdict.status != VERDICT_FINDING:
+        return verdict, None
+    click.echo("Confirming: reduce, then replay the minimal config ...", err=True)
+    confirmation = confirm_finding(
+        config, result, cutracer_so=sanitizer_so, deadline=deadline
+    )
+    if confirmation.status == CONFIRMED:
+        points = "; ".join(
+            f"{p['sass']} (pc {p['pc']}, {p['kernel_name']})"
+            for p in confirmation.essential_points
+        )
+        click.echo(
+            f"Confirmed: {confirmation.reason}: {points} -> "
+            f"{confirmation.minimal_config_path}"
+        )
+    else:
+        click.echo(f"Not confirmed: {confirmation.reason}")
+    return confirmed_verdict(verdict, confirmation), confirmation
+
+
+def _report_extra(
+    verdict: Verdict, confirmation: Confirmation | None, confirm: bool
+) -> dict[str, Any] | None:
+    if not confirm:
+        return None
+    return {
+        "verdict": verdict.to_dict(),
+        "confirmation": None if confirmation is None else confirmation.to_dict(),
+    }
+
+
 def _run_single(
     config: StressConfig,
     *,
     sanitizer_so: str,
+    confirm: bool,
     budget_s: int | None,
     output_dir: str,
     dump_path: str | None,
@@ -475,9 +535,14 @@ def _run_single(
         raise click.ClickException(str(exc)) from exc
     if get_mode(config.strategy).isolates_targets:
         click.echo(f"Isolated {len(result.targets)} target(s).", err=True)
+    verdict, confirmation = result_verdict(result), None
+    if confirm:
+        verdict, confirmation = _confirm(
+            config, result, verdict, sanitizer_so=sanitizer_so, deadline=deadline
+        )
 
     report_out = report_path or f"{output_dir}/stress_report.json"
-    save_report(result, report_out)
+    save_report(result, report_out, _report_extra(verdict, confirmation, confirm))
     click.echo(f"Report: {report_out}", err=True)
 
     if result.triggering is not None and os.path.exists(result.triggering.config_path):
@@ -496,7 +561,6 @@ def _run_single(
             f"({result.infra_errors} infra error(s)). No triggering config saved."
         )
     _echo_notes(config, result)
-    verdict = result_verdict(result)
     _echo_verdict(verdict.status, verdict.reasons)
 
 
@@ -553,12 +617,14 @@ def _echo_verdict(status: str, reasons: list[str]) -> None:
     click.echo(f"Verdict: {status}" + (f" ({'; '.join(reasons)})" if reasons else ""))
 
 
-def _save_plan_report(plan: PlanResult, path: str) -> None:
+def _save_plan_report(
+    plan: PlanResult, path: str, extra: dict[str, Any] | None = None
+) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as output:
-        json.dump(plan.to_dict(), output, indent=2)
+        json.dump({**plan.to_dict(), **(extra or {})}, output, indent=2)
     os.replace(tmp, path)
 
 
@@ -566,6 +632,7 @@ def _run_plan(
     configs: list[StressConfig],
     *,
     sanitizer_so: str,
+    confirm: bool,
     budget_s: int | None,
     stop_on_first: bool,
     output_dir: str,
@@ -580,6 +647,7 @@ def _run_plan(
         + f" -- {' '.join(configs[0].oracle_argv)}",
         err=True,
     )
+    deadline = None if budget_s is None else time.monotonic() + budget_s
     try:
         plan = run_stress_plan(
             configs,
@@ -590,21 +658,30 @@ def _run_plan(
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    verdict, confirmation = plan.verdict, None
+    trigger = plan.triggering_run
+    if confirm and trigger is not None and trigger.result is not None:
+        verdict, confirmation = _confirm(
+            trigger.config,
+            trigger.result,
+            verdict,
+            sanitizer_so=sanitizer_so,
+            deadline=deadline,
+        )
     report_out = report_path or f"{output_dir}/stress_report.json"
-    _save_plan_report(plan, report_out)
+    _save_plan_report(plan, report_out, _report_extra(verdict, confirmation, confirm))
     for run in plan.runs:
         if run.status != MODE_RAN or run.result is None:
             click.echo(f"{run.mode}: {run.status} ({run.reason})", err=True)
             continue
-        verdict = result_verdict(run.result)
+        mode_verdict = result_verdict(run.result)
         click.echo(
-            f"{run.mode}: {verdict.status} after {run.result.completed_trials} "
-            f"trial(s) ({run.result.infra_errors} infra error(s)) -> "
-            f"{run.report_path}",
+            f"{run.mode}: {mode_verdict.status} after "
+            f"{run.result.completed_trials} trial(s) "
+            f"({run.result.infra_errors} infra error(s)) -> {run.report_path}",
             err=True,
         )
     click.echo(f"Report: {report_out}", err=True)
-    trigger = plan.triggering_run
     if trigger is not None and trigger.result is not None:
         result = trigger.result
         triggering = result.triggering
@@ -614,7 +691,7 @@ def _run_plan(
             shutil.copyfile(triggering.config_path, dump_out)
             _echo_reproduction(trigger.config, result, dump_out, oracle)
         _echo_notes(trigger.config, result)
-    _echo_verdict(plan.verdict.status, plan.verdict.reasons)
+    _echo_verdict(verdict.status, verdict.reasons)
 
 
 def _echo_reproduction(

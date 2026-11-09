@@ -1973,11 +1973,13 @@ def run_stress(  # noqa: C901
     )
 
 
-def save_report(result: StressResult, path: str) -> None:
-    """Atomically write the JSON stress report."""
+def save_report(
+    result: StressResult, path: str, extra: Optional[Mapping[str, Any]] = None
+) -> None:
+    """Atomically write the JSON stress report; `extra` keys override its own."""
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as fh:
-        json.dump(result.to_dict(), fh, indent=2)
+        json.dump({**result.to_dict(), **(extra or {})}, fh, indent=2)
     os.replace(tmp, path)
