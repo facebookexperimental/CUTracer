@@ -20,6 +20,7 @@ self-subprocessing.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -49,6 +51,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 MAX_REJECTED_CONFIGS = _MAX_REJECTED_CONFIGS
 # CUTracer's default no-data watchdog, kept when no kernel timeout is set.
 _DEFAULT_NO_DATA_TIMEOUT_S = 15
+# A run is not started with less time than this left before a deadline.
+MIN_RUN_BUDGET_S = 30
 
 # What the oracle observed in a reproduced attempt.
 SYMPTOM_FAILURE = "failure"
@@ -309,10 +313,17 @@ class StressResult:
     # reconstructed from older reports, which skip the check.
     delay_ladder_ns: Optional[List[int]] = None
     attempts_per_delay: Optional[int] = None
+    # Attempts the schedule held, and whether a deadline stopped the search
+    # before it ran them all (see `result_verdict`).
+    planned_trials: Optional[int] = None
+    budget_exhausted: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "strategy": self.strategy,
+            "verdict": result_verdict(self).to_dict(),
+            "planned_trials": self.planned_trials,
+            "budget_exhausted": self.budget_exhausted,
             "targets": list(self.targets),
             "delay_ladder_ns": (
                 None if self.delay_ladder_ns is None else list(self.delay_ladder_ns)
@@ -1383,6 +1394,15 @@ def _prepare_stress_log(
 
 
 @dataclass(frozen=True)
+class _BaselineRun:
+    """One control run: the oracle's exit code (None when the run timed out)
+    and whether CUTracer's watchdog ended a hung kernel in it."""
+
+    returncode: Optional[int]
+    hung: bool
+
+
+@dataclass(frozen=True)
 class _BaselineResult:
     """Outcome of the control arm.
 
@@ -1400,6 +1420,63 @@ class _BaselineResult:
     hangs: int = 0
     # Per-kernel instrumented launch shapes, recorded for isolate searches only.
     geometries: List[_LaunchGeometry] = field(default_factory=list)
+    # The raw runs, so that a control arm shared by several modes can be
+    # counted under each mode's own oracle contract (see `_baseline_from_runs`).
+    runs: List[_BaselineRun] = field(default_factory=list)
+
+
+def _baseline_from_runs(
+    config: StressConfig,
+    runs: Sequence[_BaselineRun],
+    *,
+    logs: List[str],
+    geometries: List[_LaunchGeometry],
+    requested: Optional[int] = None,
+) -> _BaselineResult:
+    """Count control runs under `config`'s oracle contract and hang rule."""
+    completed = reproduced = timed_out = infra_errors = hangs = 0
+    for run in runs:
+        hangs += 1 if run.hung else 0
+        if run.hung and config.hang_is_bug:
+            # The target hangs without any injected delay.
+            completed += 1
+            reproduced += 1
+        elif run.returncode is None:
+            timed_out += 1
+        elif run.returncode == 0:
+            completed += 1
+            reproduced += 1
+        elif (
+            not config.not_interesting_exit_codes
+            or run.returncode in config.not_interesting_exit_codes
+        ):
+            completed += 1
+        else:
+            # Same rule as the search arm: an exit code the oracle contract does
+            # not cover means the control run did not measure anything.
+            infra_errors += 1
+    return _BaselineResult(
+        requested=config.baseline_runs if requested is None else requested,
+        completed=completed,
+        reproductions=reproduced,
+        timed_out=timed_out,
+        infra_errors=infra_errors,
+        logs=logs,
+        hangs=hangs,
+        geometries=geometries,
+        runs=list(runs),
+    )
+
+
+def _remaining_s(deadline: Optional[float]) -> Optional[float]:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _run_timeout(config: StressConfig, remaining: Optional[float]) -> int:
+    """The per-run timeout, cut short so that a run ends by the deadline."""
+    if remaining is None:
+        return config.timeout
+    return max(1, min(config.timeout, int(remaining)))
 
 
 def _run_baseline(
@@ -1407,6 +1484,8 @@ def _run_baseline(
     *,
     cutracer_so: Optional[str],
     runner: Optional[RunTarget],
+    capture_geometry: Optional[bool] = None,
+    deadline: Optional[float] = None,
 ) -> _BaselineResult:
     """Run the control arm: instrumented, but with every delay point disabled.
 
@@ -1420,13 +1499,13 @@ def _run_baseline(
     worth keeping, and not writing one keeps the baseline out of the search's
     config namespace. An isolate search runs each control run in a scratch
     directory with a dump and kernel events, to learn which warps and cluster
-    ranks the instrumented launches have.
+    ranks the instrumented launches have; `capture_geometry` does the same for
+    a control arm that several modes share.
+
+    No run starts with less than `MIN_RUN_BUDGET_S` left before `deadline`;
+    the runs that do not start leave the control arm incomplete.
     """
-    completed = 0
-    reproduced = 0
-    timed_out = 0
-    infra_errors = 0
-    hangs = 0
+    runs: List[_BaselineRun] = []
     geometries: List[_LaunchGeometry] = []
     logs: List[str] = []
     if config.baseline_runs <= 0:
@@ -1434,14 +1513,21 @@ def _run_baseline(
         # here -- including reading `delay_ladder_ns[0]`.
         return _BaselineResult(0, 0, 0, 0, 0, logs)
     delay_ns = config.delay_ladder_ns[0]
-    isolate = get_mode(config.strategy).isolates_targets
+    capture = (
+        get_mode(config.strategy).isolates_targets
+        if capture_geometry is None
+        else capture_geometry
+    )
     for attempt in range(config.baseline_runs):
+        remaining = _remaining_s(deadline)
+        if remaining is not None and remaining < MIN_RUN_BUDGET_S:
+            break
         run_dir = (
             tempfile.mkdtemp(prefix=".stress_baseline_", dir=config.output_dir)
-            if isolate
+            if capture
             else config.output_dir
         )
-        dump_path = os.path.join(run_dir, "delay_config.json") if isolate else None
+        dump_path = os.path.join(run_dir, "delay_config.json") if capture else None
         logs_before = main_logs(run_dir)
         proc: Optional[subprocess.CompletedProcess[str]] = None
         error = "baseline (injection disabled)"
@@ -1461,11 +1547,11 @@ def _run_baseline(
                     delay_mode="random",
                     delay_patterns=_delay_patterns(config),
                     delay_dump_path=dump_path,
-                    kernel_events="nostack" if isolate else None,
+                    kernel_events="nostack" if capture else None,
                     kernel_timeout_s=config.kernel_timeout_s,
                     no_data_timeout_s=_no_data_timeout_s(config),
                     cwd=config.cwd,
-                    timeout=config.timeout,
+                    timeout=_run_timeout(config, remaining),
                     base_env=config.base_env,
                     use_bundled_cuda_tools=config.use_bundled_cuda_tools,
                 ),
@@ -1479,7 +1565,6 @@ def _run_baseline(
                 geometries, _instrumented_geometries(run_dir, dump_path)
             )
             shutil.rmtree(run_dir, ignore_errors=True)
-        hangs += 1 if watchdog else 0
         logs.append(
             _attempt_log(
                 delay_ns=delay_ns,
@@ -1491,34 +1576,10 @@ def _run_baseline(
                 watchdog=watchdog,
             )
         )
-        if watchdog and config.hang_is_bug:
-            # The target hangs without any injected delay.
-            completed += 1
-            reproduced += 1
-        elif proc is None:
-            timed_out += 1
-        elif proc.returncode == 0:
-            completed += 1
-            reproduced += 1
-        elif (
-            not config.not_interesting_exit_codes
-            or proc.returncode in config.not_interesting_exit_codes
-        ):
-            completed += 1
-        else:
-            # Same rule as the search arm: an exit code the oracle contract does
-            # not cover means the control run did not measure anything.
-            infra_errors += 1
-    return _BaselineResult(
-        requested=config.baseline_runs,
-        completed=completed,
-        reproductions=reproduced,
-        timed_out=timed_out,
-        infra_errors=infra_errors,
-        logs=logs,
-        hangs=hangs,
-        geometries=geometries,
-    )
+        runs.append(
+            _BaselineRun(None if proc is None else proc.returncode, bool(watchdog))
+        )
+    return _baseline_from_runs(config, runs, logs=logs, geometries=geometries)
 
 
 def _attribution(
@@ -1549,11 +1610,109 @@ def _attribution(
     return ATTRIBUTION_ATTRIBUTED
 
 
+# What a search shows (see `result_verdict`).
+VERDICT_FINDING = "finding"
+VERDICT_SUSPECT = "suspect"
+VERDICT_CLEAN = "clean"
+VERDICT_INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    status: str
+    reasons: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "reasons": list(self.reasons)}
+
+
+def _unattributed_reason(result: StressResult) -> str:
+    if result.baseline_reproductions:
+        return (
+            f"the control arm reproduced {result.baseline_reproductions} of "
+            f"{result.baseline_completed} run(s) with injection disabled"
+        )
+    if result.attribution == ATTRIBUTION_NO_BASELINE:
+        return "reproduced, but no control arm ran"
+    return (
+        f"reproduced, but only {result.baseline_completed} of "
+        f"{result.baseline_requested} control run(s) produced a sample"
+    )
+
+
+def _incomplete_reasons(result: StressResult) -> List[str]:
+    reasons: List[str] = []
+    if result.baseline_completed < result.baseline_requested:
+        reasons.append(
+            f"only {result.baseline_completed} of {result.baseline_requested} "
+            "control run(s) produced a sample"
+        )
+    if result.infra_errors:
+        reasons.append(f"{result.infra_errors} attempt(s) were infra errors")
+    if result.timed_out:
+        reasons.append(f"{result.timed_out} attempt(s) timed out")
+    if result.hangs:
+        reasons.append(
+            f"CUTracer's watchdog ended a hung kernel in {result.hangs} attempt(s)"
+        )
+    attempted = result.completed_trials + result.infra_errors + result.timed_out
+    if result.budget_exhausted:
+        reasons.append(
+            f"the time budget ran out after {attempted} of "
+            f"{result.planned_trials} planned attempt(s)"
+        )
+    elif result.planned_trials is not None and attempted < result.planned_trials:
+        reasons.append(
+            f"only {attempted} of {result.planned_trials} planned attempt(s) ran"
+        )
+    return reasons
+
+
+def result_verdict(result: StressResult) -> Verdict:
+    """Classify one search.
+
+    - finding: an attempt reproduced the bug and the control arm never did, so
+      the injected delay is what made the difference.
+    - suspect: the bug reproduced, but not attributably to an injected delay:
+      it also reproduced with injection disabled, or in an attempt that
+      injected nothing, or without a complete control arm.
+    - clean: every planned attempt ran and measured something (no infra error,
+      timeout or unexplained hang), after a complete control arm if one was
+      requested, and nothing reproduced. It covers only the attempts made.
+    - incomplete: anything else.
+    """
+    triggering = result.triggering
+    if triggering is not None:
+        if result.attribution == ATTRIBUTION_ATTRIBUTED:
+            return Verdict(
+                VERDICT_FINDING,
+                [
+                    f"reproduced ({triggering.symptom}) at "
+                    f"delay_ns={triggering.delay_ns}"
+                ],
+            )
+        return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
+    if result.baseline_reproductions:
+        return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
+    if result.unattributed_reproductions:
+        return Verdict(
+            VERDICT_SUSPECT,
+            [
+                f"{result.unattributed_reproductions} attempt(s) reported the bug "
+                "while injecting no delay"
+            ],
+        )
+    reasons = _incomplete_reasons(result)
+    return Verdict(VERDICT_INCOMPLETE, reasons) if reasons else Verdict(VERDICT_CLEAN)
+
+
 def run_stress(  # noqa: C901
     config: StressConfig,
     *,
     cutracer_so: Optional[str] = None,
     runner: Optional[RunTarget] = None,
+    baseline: Optional[_BaselineResult] = None,
+    deadline: Optional[float] = None,
 ) -> StressResult:
     """Run the planned attempts (see `_trial_schedule`) until the oracle reproduces.
 
@@ -1562,6 +1721,12 @@ def run_stress(  # noqa: C901
     counted as an infra error), AND at least one enabled injection point in that
     config (otherwise the attempt injected nothing and cannot have caused the
     failure -- counted as an unattributed reproduction).
+
+    `baseline` is a control arm that already ran with this search's
+    instrumentation (see `cutracer.stress.plan`); it is counted under this
+    search's oracle contract instead of running the control arm again. No
+    attempt starts with less than `MIN_RUN_BUDGET_S` left before `deadline`
+    (a `time.monotonic()` value); the result then says `budget_exhausted`.
     """
     os.makedirs(config.output_dir, exist_ok=True)
     resume = config.resume_result
@@ -1571,10 +1736,22 @@ def run_stress(  # noqa: C901
     timed_out = 0 if resume is None else resume.timed_out
     hangs = 0 if resume is None else resume.hangs
     unattributed = 0 if resume is None else resume.unattributed_reproductions
-    baseline = (
-        _run_baseline(config, cutracer_so=cutracer_so, runner=runner)
-        if resume is None
-        else _BaselineResult(
+    if baseline is not None:
+        if resume is not None:
+            raise ValueError("a shared control arm cannot resume a search")
+        baseline = _baseline_from_runs(
+            config,
+            baseline.runs,
+            logs=[],
+            geometries=baseline.geometries,
+            requested=baseline.requested,
+        )
+    elif resume is None:
+        baseline = _run_baseline(
+            config, cutracer_so=cutracer_so, runner=runner, deadline=deadline
+        )
+    else:
+        baseline = _BaselineResult(
             requested=resume.baseline_requested,
             completed=resume.baseline_completed,
             reproductions=resume.baseline_reproductions,
@@ -1583,7 +1760,6 @@ def run_stress(  # noqa: C901
             logs=[],
             hangs=resume.baseline_hangs,
         )
-    )
     rejected_config_paths: List[str] = _bounded_rejected_config_paths(
         [] if resume is None else list(resume.rejected_config_paths),
         owned_root=config.output_dir,
@@ -1671,6 +1847,7 @@ def run_stress(  # noqa: C901
         )
     if triggering is not None and config.stop_on_first:
         stop = True
+    budget_exhausted = False
 
     def progress_result(log_path: Optional[str]) -> StressResult:
         return StressResult(
@@ -1702,13 +1879,25 @@ def run_stress(  # noqa: C901
             targets=[target.to_dict() for target in targets],
             delay_ladder_ns=list(config.delay_ladder_ns),
             attempts_per_delay=config.attempts_per_delay,
+            planned_trials=planned_trials,
+            budget_exhausted=budget_exhausted,
         )
 
     for trial in schedule[attempted_trials:]:
         if stop:
             break
+        remaining = _remaining_s(deadline)
+        if remaining is not None and remaining < MIN_RUN_BUDGET_S:
+            budget_exhausted = True
+            break
         outcome = _run_attempt(
-            config,
+            (
+                config
+                if remaining is None or remaining >= config.timeout
+                else dataclasses.replace(
+                    config, timeout=_run_timeout(config, remaining)
+                )
+            ),
             delay_ns=trial.delay_ns,
             warpgroup=trial.warpgroup,
             attempt=trial.attempt,
@@ -1779,6 +1968,8 @@ def run_stress(  # noqa: C901
         targets=[target.to_dict() for target in targets],
         delay_ladder_ns=list(config.delay_ladder_ns),
         attempts_per_delay=config.attempts_per_delay,
+        planned_trials=planned_trials,
+        budget_exhausted=budget_exhausted,
     )
 
 

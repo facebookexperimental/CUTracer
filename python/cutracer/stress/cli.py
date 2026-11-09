@@ -9,19 +9,25 @@ data race or a hang, which ``cutracer reduce`` can then minimize.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
 import sys
+import time
+from collections.abc import Callable
+from typing import Any
 
 import click
 from cutracer.runner import resolve_cutracer_so
-from cutracer.stress.modes import get_mode
+from cutracer.stress.modes import get_mode, get_modes
+from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
 from cutracer.stress.stress import (
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
     ATTRIBUTION_NO_BASELINE,
     reduce_args,
+    result_verdict,
     run_stress,
     save_report,
     STRATEGY_ISOLATE,
@@ -30,6 +36,8 @@ from cutracer.stress.stress import (
     StressResult,
     SYMPTOM_HANG,
 )
+
+STRATEGY_ALL = "all"
 
 
 def _parse_int_list(text: str) -> list[int]:
@@ -50,23 +58,137 @@ def _parse_int_ranges(text: str) -> list[int]:
     return values
 
 
+def _parse_bool(text: str) -> bool:
+    lowered = text.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"expected true or false, got {text!r}")
+
+
+# `--mode-option MODE.KEY=VALUE`: the StressConfig fields one mode of a search
+# may set, and how each value is parsed.
+_MODE_OPTIONS: dict[str, Callable[[str], Any]] = {
+    "delay_ladder_ns": _parse_int_list,
+    "attempts_per_delay": int,
+    "delay_patterns": str,
+    "enable_prob": float,
+    "warpgroup_ids": _parse_int_list,
+    "isolate_ranks": _parse_int_list,
+    "isolate_warps": _parse_int_ranges,
+    "kernel_timeout_s": int,
+    "hang_is_bug": _parse_bool,
+}
+
+
+def _parse_modes(strategy: str) -> list[str]:
+    """`all`, or comma-separated mode names, in the order they run."""
+    known = list(get_modes())
+    if strategy.strip() == STRATEGY_ALL:
+        return known
+    names = [name.strip() for name in strategy.split(",") if name.strip()]
+    unknown = [name for name in names if name not in known]
+    if not names or unknown:
+        raise click.UsageError(
+            f"--strategy {strategy!r}: expected {STRATEGY_ALL!r} or a "
+            f"comma-separated list of {', '.join(known)}"
+        )
+    if len(set(names)) != len(names):
+        raise click.UsageError(f"--strategy {strategy!r} names a mode twice")
+    return names
+
+
+def _parse_mode_options(
+    values: tuple[str, ...], modes: list[str]
+) -> dict[str, dict[str, Any]]:
+    overrides: dict[str, dict[str, Any]] = {}
+    for value in values:
+        target, equals, text = value.partition("=")
+        mode, dot, key = target.partition(".")
+        if not equals or not dot:
+            raise click.UsageError(f"--mode-option {value!r}: expected MODE.KEY=VALUE")
+        if mode not in modes:
+            raise click.UsageError(
+                f"--mode-option {value!r}: {mode!r} is not a mode of this search "
+                f"({', '.join(modes)})"
+            )
+        if key not in _MODE_OPTIONS:
+            raise click.UsageError(
+                f"--mode-option {value!r}: unknown key {key!r}; known: "
+                f"{', '.join(_MODE_OPTIONS)}"
+            )
+        try:
+            overrides.setdefault(mode, {})[key] = _MODE_OPTIONS[key](text)
+        except ValueError as exc:
+            raise click.UsageError(f"--mode-option {value!r}: {exc}") from exc
+    return overrides
+
+
+def _mode_config(
+    name: str, shared: dict[str, Any], options: dict[str, Any]
+) -> StressConfig:
+    """One mode's search: its table defaults, then the shared and per-mode
+    options."""
+    mode = get_mode(name)
+    fields: dict[str, Any] = {
+        "strategy": mode.name,
+        "delay_ladder_ns": list(mode.delay_ladder_ns),
+        "attempts_per_delay": mode.attempts_per_delay,
+        "kernel_timeout_s": mode.kernel_timeout_s,
+        "hang_is_bug": mode.hang_is_bug,
+        **shared,
+        **options,
+    }
+    if not fields["delay_ladder_ns"]:
+        raise click.UsageError(
+            f"{name}: --delay-ladder-ns must contain at least one value"
+        )
+    try:
+        return StressConfig(**fields)
+    except ValueError as exc:
+        raise click.UsageError(f"{name}: {exc}") from exc
+
+
 @click.command(name="stress", context_settings={"ignore_unknown_options": True})
 @click.option(
     "--strategy",
-    type=click.Choice([STRATEGY_RANDOM, STRATEGY_ISOLATE]),
-    default=STRATEGY_RANDOM,
+    default=STRATEGY_ALL,
     show_default=True,
-    help="'random': random per-thread delays at every candidate point, all warps "
-    "at once or one warpgroup at a time. 'isolate': stall one (cluster rank, "
+    help="Delay modes to search with, in order: 'all', or a comma-separated list "
+    "of 'random' (random per-thread delays at every candidate point, all warps "
+    "at once or one warpgroup at a time) and 'isolate' (stall one (cluster rank, "
     "CTA-local warp) per attempt with a fixed delay before each mbarrier wait "
     "while every other warp runs at full speed; finds a warp the protocol does "
-    "not wait for, such as a consumer that never releases its ring slot.",
+    "not wait for, such as a consumer that never releases its ring slot). With "
+    "several modes, each writes its own report under <output-dir>/<mode>, modes "
+    "with the same instrumentation share one control arm, and the search stops "
+    "at the first mode that reproduces.",
+)
+@click.option(
+    "--mode-option",
+    "mode_options",
+    multiple=True,
+    metavar="MODE.KEY=VALUE",
+    help="Set one option of one mode, e.g. 'random.delay_ladder_ns=10000,100000' "
+    "or 'isolate.isolate_warps=0-7'. Keys: delay_ladder_ns, attempts_per_delay, "
+    "delay_patterns, enable_prob, warpgroup_ids, isolate_ranks, isolate_warps, "
+    "kernel_timeout_s, hang_is_bug. Repeatable.",
+)
+@click.option(
+    "--budget-s",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Wall-clock budget (s) for the whole search, control arms included. No "
+    "run starts with less than 30 s left; the report then says the search is "
+    "incomplete.",
 )
 @click.option(
     "--delay-ladder-ns",
     default=None,
-    help="Comma-separated delay values (ns) to sweep. Default: "
-    "1000,5000,10000,50000,100000 (random), 1000000 (isolate).",
+    help="Comma-separated delay values (ns) to sweep, for a search with one mode "
+    "(else use --mode-option). Default: 1000,5000,10000,50000,100000 (random), "
+    "1000000 (isolate).",
 )
 @click.option(
     "--enable-prob",
@@ -96,14 +218,16 @@ def _parse_int_ranges(text: str) -> list[int]:
 @click.option(
     "--delay-patterns",
     default=None,
-    help="Comma-separated SASS substrings to delay at. Default: SYNCS.PHASECHK "
-    "(mbarrier waits) for isolate, CUTracer's built-in patterns for random.",
+    help="Comma-separated SASS substrings to delay at, for a search with one mode "
+    "(else use --mode-option). Default: SYNCS.PHASECHK (mbarrier waits) for "
+    "isolate, CUTracer's built-in patterns for random.",
 )
 @click.option(
     "--attempts-per-delay",
     type=click.IntRange(min=1),
     default=None,
-    help="Attempts per delay (and per target). Default: 3 (random), 1 (isolate).",
+    help="Attempts per delay (and per target), for a search with one mode (else "
+    "use --mode-option). Default: 3 (random), 1 (isolate).",
 )
 @click.option(
     "--baseline-runs",
@@ -135,7 +259,8 @@ def _parse_int_ranges(text: str) -> list[int]:
     type=click.Path(),
     default=".",
     show_default=True,
-    help="Directory for per-attempt delay configs, the report, and stress.log.",
+    help="Directory for per-attempt delay configs, the report, and stress.log "
+    "(with several modes, one subdirectory per mode).",
 )
 @click.option(
     "-m",
@@ -183,6 +308,8 @@ def _parse_int_ranges(text: str) -> list[int]:
 @click.argument("oracle", nargs=-1, type=click.UNPROCESSED, required=True)
 def stress_command(  # noqa: C901
     strategy: str,
+    mode_options: tuple[str, ...],
+    budget_s: int | None,
     delay_ladder_ns: str | None,
     enable_prob: float,
     warpgroup_ids: str,
@@ -209,7 +336,10 @@ def stress_command(  # noqa: C901
     exit 0 when the bug reproduced and non-zero otherwise (same convention as
     ``cutracer reduce -t``); with --hang-is-bug a hang that CUTracer's watchdog
     ends also counts. On the first reproduction whose delay config is captured,
-    that config is saved for deterministic replay / ``cutracer reduce``.
+    that config is saved for deterministic replay / ``cutracer reduce``. The
+    report's `verdict` says whether the search found a bug the injected delay
+    caused (finding), a failure it cannot credit to the delay (suspect), ran
+    every planned attempt without one (clean), or neither (incomplete).
 
     \b
     Examples:
@@ -221,70 +351,129 @@ def stress_command(  # noqa: C901
             f"First token of the oracle command looks like a flag: {oracle[0]!r}. "
             "Put stress options before `--` and the oracle command after it."
         )
-
-    defaults = get_mode(strategy)
-    isolate = defaults.isolates_targets
-    if isolate and warpgroup_ids:
+    modes = _parse_modes(strategy)
+    single = modes[0] if len(modes) == 1 else None
+    if warpgroup_ids and STRATEGY_RANDOM not in modes:
         raise click.UsageError("--warpgroup-ids applies to --strategy random only")
-    if not isolate and (isolate_ranks or isolate_warps):
+    if (isolate_ranks or isolate_warps) and STRATEGY_ISOLATE not in modes:
         raise click.UsageError(
             "--isolate-ranks and --isolate-warps need --strategy isolate"
         )
-    parsed_delays = (
-        list(defaults.delay_ladder_ns)
-        if delay_ladder_ns is None
-        else _parse_int_list(delay_ladder_ns)
-    )
-    if not parsed_delays:
-        raise click.UsageError("--delay-ladder-ns must contain at least one value")
-
-    sanitizer_so = resolve_cutracer_so(cutracer_so)
+    per_mode_flags = {
+        "--delay-ladder-ns": delay_ladder_ns,
+        "--attempts-per-delay": attempts_per_delay,
+        "--delay-patterns": delay_patterns,
+    }
+    if single is None:
+        for flag, value in per_mode_flags.items():
+            if value is not None:
+                raise click.UsageError(
+                    f"{flag} applies to one mode; with several modes use "
+                    f"--mode-option MODE.{flag[2:].replace('-', '_')}=VALUE"
+                )
     try:
-        config = StressConfig(
-            oracle_argv=list(oracle),
-            delay_ladder_ns=parsed_delays,
-            enable_prob=enable_prob,
-            warpgroup_ids=_parse_int_list(warpgroup_ids),
-            attempts_per_delay=(
-                defaults.attempts_per_delay
-                if attempts_per_delay is None
-                else attempts_per_delay
-            ),
-            stop_on_first=stop_on_first,
-            not_interesting_exit_codes=_parse_int_list(not_interesting_exit_codes),
-            baseline_runs=baseline_runs,
-            kernel_filters=kernel_filters,
-            output_dir=output_dir,
-            timeout=timeout,
-            kernel_timeout_s=(
-                defaults.kernel_timeout_s
-                if kernel_timeout_s is None
-                else kernel_timeout_s
-            ),
-            hang_is_bug=defaults.hang_is_bug if hang_is_bug is None else hang_is_bug,
-            strategy=strategy,
-            isolate_ranks=_parse_int_list(isolate_ranks) if isolate_ranks else None,
-            isolate_warps=_parse_int_ranges(isolate_warps) if isolate_warps else None,
-            delay_patterns=delay_patterns,
-        )
+        flags: dict[str, dict[str, Any]] = {name: {} for name in modes}
+        if delay_ladder_ns is not None:
+            flags[modes[0]]["delay_ladder_ns"] = _parse_int_list(delay_ladder_ns)
+        if attempts_per_delay is not None:
+            flags[modes[0]]["attempts_per_delay"] = attempts_per_delay
+        if delay_patterns is not None:
+            flags[modes[0]]["delay_patterns"] = delay_patterns
+        if STRATEGY_RANDOM in modes:
+            flags[STRATEGY_RANDOM]["warpgroup_ids"] = _parse_int_list(warpgroup_ids)
+        if isolate_ranks:
+            flags[STRATEGY_ISOLATE]["isolate_ranks"] = _parse_int_list(isolate_ranks)
+        if isolate_warps:
+            flags[STRATEGY_ISOLATE]["isolate_warps"] = _parse_int_ranges(isolate_warps)
+        not_interesting = _parse_int_list(not_interesting_exit_codes)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
-    if isolate:
+    overrides = _parse_mode_options(mode_options, modes)
+    shared: dict[str, Any] = {
+        "oracle_argv": list(oracle),
+        "enable_prob": enable_prob,
+        "stop_on_first": stop_on_first,
+        "not_interesting_exit_codes": not_interesting,
+        "baseline_runs": baseline_runs,
+        "kernel_filters": kernel_filters,
+        "timeout": timeout,
+    }
+    if kernel_timeout_s is not None:
+        shared["kernel_timeout_s"] = kernel_timeout_s
+    if hang_is_bug is not None:
+        shared["hang_is_bug"] = hang_is_bug
+    configs = [
+        _mode_config(
+            name,
+            {
+                **shared,
+                "output_dir": (
+                    output_dir if single is not None else os.path.join(output_dir, name)
+                ),
+            },
+            {**flags[name], **overrides.get(name, {})},
+        )
+        for name in modes
+    ]
+    sanitizer_so = resolve_cutracer_so(cutracer_so)
+    if single is not None:
+        _run_single(
+            configs[0],
+            sanitizer_so=sanitizer_so,
+            budget_s=budget_s,
+            output_dir=output_dir,
+            dump_path=dump_path,
+            report_path=report_path,
+            oracle=oracle,
+        )
+    else:
+        _run_plan(
+            configs,
+            sanitizer_so=sanitizer_so,
+            budget_s=budget_s,
+            stop_on_first=stop_on_first,
+            output_dir=output_dir,
+            dump_path=dump_path,
+            report_path=report_path,
+            oracle=oracle,
+        )
+    # Exit 0 whenever the search itself ran; callers read the report/config to
+    # learn whether the bug reproduced (a non-zero exit means the search failed).
+    sys.exit(0)
+
+
+def _plan_line(config: StressConfig) -> str:
+    if get_mode(config.strategy).isolates_targets:
         placements = "targets"
     else:
         placements = f"{len(config.warpgroup_ids) or 1} warpgroup(s)"
-    click.echo(
-        f"Running stress ({strategy}): {config.baseline_runs} baseline + "
+    return (
         f"{len(config.delay_ladder_ns)} delays x {placements} x "
-        f"{config.attempts_per_delay} attempts -- {' '.join(config.oracle_argv)}",
-        err=True,
+        f"{config.attempts_per_delay} attempts"
     )
 
+
+def _run_single(
+    config: StressConfig,
+    *,
+    sanitizer_so: str,
+    budget_s: int | None,
+    output_dir: str,
+    dump_path: str | None,
+    report_path: str | None,
+    oracle: tuple[str, ...],
+) -> None:
+    click.echo(
+        f"Running stress ({config.strategy}): {config.baseline_runs} baseline + "
+        f"{_plan_line(config)} -- {' '.join(config.oracle_argv)}",
+        err=True,
+    )
+    deadline = None if budget_s is None else time.monotonic() + budget_s
     try:
-        result = run_stress(config, cutracer_so=sanitizer_so)
+        result = run_stress(config, cutracer_so=sanitizer_so, deadline=deadline)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    if isolate:
+    if get_mode(config.strategy).isolates_targets:
         click.echo(f"Isolated {len(result.targets)} target(s).", err=True)
 
     report_out = report_path or f"{output_dir}/stress_report.json"
@@ -306,6 +495,12 @@ def stress_command(  # noqa: C901
             f"Not reproduced across {result.completed_trials} trial(s) "
             f"({result.infra_errors} infra error(s)). No triggering config saved."
         )
+    _echo_notes(config, result)
+    verdict = result_verdict(result)
+    _echo_verdict(verdict.status, verdict.reasons)
+
+
+def _echo_notes(config: StressConfig, result: StressResult) -> None:
     if result.hangs and not config.hang_is_bug:
         click.echo(
             f"NOTE: CUTracer's watchdog ended a hung kernel in {result.hangs} "
@@ -352,9 +547,74 @@ def stress_command(  # noqa: C901
             f"baseline before trusting a triggering config.",
             err=True,
         )
-    # Exit 0 whenever the search itself ran; callers read the report/config to
-    # learn whether the bug reproduced (a non-zero exit means the search failed).
-    sys.exit(0)
+
+
+def _echo_verdict(status: str, reasons: list[str]) -> None:
+    click.echo(f"Verdict: {status}" + (f" ({'; '.join(reasons)})" if reasons else ""))
+
+
+def _save_plan_report(plan: PlanResult, path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as output:
+        json.dump(plan.to_dict(), output, indent=2)
+    os.replace(tmp, path)
+
+
+def _run_plan(
+    configs: list[StressConfig],
+    *,
+    sanitizer_so: str,
+    budget_s: int | None,
+    stop_on_first: bool,
+    output_dir: str,
+    dump_path: str | None,
+    report_path: str | None,
+    oracle: tuple[str, ...],
+) -> None:
+    click.echo(
+        f"Running stress ({','.join(c.strategy for c in configs)}): "
+        f"{configs[0].baseline_runs} baseline per instrumentation, then "
+        + "; ".join(f"{c.strategy}: {_plan_line(c)}" for c in configs)
+        + f" -- {' '.join(configs[0].oracle_argv)}",
+        err=True,
+    )
+    try:
+        plan = run_stress_plan(
+            configs,
+            output_dir=output_dir,
+            budget_s=budget_s,
+            stop_on_first=stop_on_first,
+            cutracer_so=sanitizer_so,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    report_out = report_path or f"{output_dir}/stress_report.json"
+    _save_plan_report(plan, report_out)
+    for run in plan.runs:
+        if run.status != MODE_RAN or run.result is None:
+            click.echo(f"{run.mode}: {run.status} ({run.reason})", err=True)
+            continue
+        verdict = result_verdict(run.result)
+        click.echo(
+            f"{run.mode}: {verdict.status} after {run.result.completed_trials} "
+            f"trial(s) ({run.result.infra_errors} infra error(s)) -> "
+            f"{run.report_path}",
+            err=True,
+        )
+    click.echo(f"Report: {report_out}", err=True)
+    trigger = plan.triggering_run
+    if trigger is not None and trigger.result is not None:
+        result = trigger.result
+        triggering = result.triggering
+        assert triggering is not None
+        if os.path.exists(triggering.config_path):
+            dump_out = dump_path or f"{output_dir}/triggering_config.json"
+            shutil.copyfile(triggering.config_path, dump_out)
+            _echo_reproduction(trigger.config, result, dump_out, oracle)
+        _echo_notes(trigger.config, result)
+    _echo_verdict(plan.verdict.status, plan.verdict.reasons)
 
 
 def _echo_reproduction(

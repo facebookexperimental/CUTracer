@@ -140,10 +140,30 @@ The delay config file has the following structure:
 
 `cutracer stress` runs an oracle (exit 0 = bug reproduced) many times under delay injection, after a matched control arm (`--baseline-runs`: the same instrumentation with every delay off), and saves the first delay config that reproduces the bug for replay and `cutracer reduce`.
 
-| Strategy | What one attempt delays | Finds |
-|----------|-------------------------|-------|
-| `random` (default) | Random per-thread delays at every candidate point, or in one warpgroup (`--warpgroup-ids`) | Races that a perturbed schedule exposes |
+| Mode | What one attempt delays | Finds |
+|------|-------------------------|-------|
+| `random` | Random per-thread delays at every candidate point, or in one warpgroup (`--warpgroup-ids`) | Races that a perturbed schedule exposes |
 | `isolate` | One CTA-local warp on one cluster rank: a fixed delay before each of its mbarrier waits (`SYNCS.PHASECHK`), while every other warp runs at full speed | A warp the synchronization protocol does not wait for, such as a consumer that reads a ring slot it never releases |
+
+By default (`--strategy all`) a search runs every mode, in the order above; `--strategy random`, `--strategy isolate` or a comma-separated list picks modes. With several modes:
+
+- Each mode keeps its own defaults (`cutracer/stress/modes.py`) and writes its own `stress_report.json`, `stress.log` and delay configs under `<output-dir>/<mode>/`. `--mode-option MODE.KEY=VALUE` sets one option of one mode (for example `random.delay_ladder_ns=10000,100000` or `isolate.isolate_warps=0-7`); `--delay-ladder-ns`, `--attempts-per-delay` and `--delay-patterns` apply only to a search with one mode, while `--kernel-timeout-s` and `--hang-is-bug` apply to every mode.
+- Modes that instrument the same points the same way (delay patterns, kernel filter, timeouts) share one control arm, which runs once; each mode counts it under its own hang rule. Random and isolate delay at different points, so each has its own.
+- The search stops at the first mode that reproduces (`--no-stop-on-first` runs them all). A mode that does not apply is skipped: isolate on kernels whose launches have no mbarrier wait to delay.
+- `--budget-s` bounds the whole search, control arms included; no run starts with less than 30 s left.
+
+`<output-dir>/stress_report.json` then holds the verdict, each mode's own report under `modes`, and the same top-level keys as a single-mode report (`reproduced`, `triggering_config`, the summed trial counts), plus `triggering_mode`.
+
+Every report carries a `verdict`, with `reasons`:
+
+| `verdict.status` | Meaning |
+|------------------|---------|
+| `finding` | An attempt reproduced the bug and the control arm never did, so the injected delay made the difference |
+| `suspect` | The bug reproduced, but not attributably to a delay: it also reproduced with injection disabled, in an attempt that injected nothing, or without a complete control arm |
+| `clean` | Every planned attempt ran and measured something (no infra error, timeout or unexplained hang), after a complete control arm, and nothing reproduced. It covers only the attempts made |
+| `incomplete` | Anything else, including a mode that did not run and a search the budget cut short |
+
+The exit code stays 0 whenever the search itself ran; read the report for the outcome.
 
 Random delays slow a producer down along with its consumers, so they rarely let the producer lap a consumer that is missing from the release protocol. `--strategy isolate` tries one target per attempt (per instrumented kernel in first-launch order, cluster ranks high to low and then warps within each kernel, taken from every instrumented launch shape of the control arm, or from `--isolate-ranks` and `--isolate-warps`) and stops at the first that fails. A consumer that reaches its wait two phases late waits on the parity of a phase that may never complete, so isolate counts a hang ended by CUTracer's kernel timeout as a reproduction (`--hang-is-bug`, with `--kernel-timeout-s 60`) and reports it as `"symptom": "hang"`. By default each target gets one 1 ms delay: a clean kernel with W warps per CTA and clusters of C CTAs costs W × C attempts.
 
@@ -215,7 +235,7 @@ several subcommands. Run any of them with `--help` for full details.
 | `cutracer validate` | Validate the structure / schema of an NDJSON, Zstd-NDJSON, or text trace file |
 | `cutracer query` | Inspect a trace file with row-level filters (`--filter "warp=24;pc=0x43d0"`), `--head` / `--tail` / `--all-lines`, and `--group-by … --count` aggregation |
 | `cutracer sass` | Disassemble a `.cubin` to SASS via `nvdisasm` (see "SASS Extraction" above) |
-| `cutracer stress` | Search for a delay config that triggers a bug: random delays, or `--strategy isolate` to stall one warp of one cluster rank at a time (see "Searching for a Triggering Config" above) |
+| `cutracer stress` | Search for a delay config that triggers a bug, with every delay mode by default (random delays, then stalling one warp of one cluster rank at a time), and report a verdict (see "Searching for a Triggering Config" above) |
 | `cutracer reduce` | Post-process a trace into a smaller summary report (see `cutracer reduce --help`) |
 | `cutracer compare` | Diff two traces / validation reports and surface deltas |
 | `cutracer analyze` | Analysis subgroup. Includes `cutracer analyze warp-summary <trace>`; internal builds expose additional analyses (e.g. data-race, deadlock, MMA/TMA dataflow) under the same group |
