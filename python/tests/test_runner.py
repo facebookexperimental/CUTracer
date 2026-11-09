@@ -5,6 +5,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -213,6 +214,43 @@ class BuildCutracerEnvTest(unittest.TestCase):
 
         self.assertEqual(seed(9), "9")
         self.assertIsNone(seed(None))
+
+    def test_warp_mask_drops_an_inherited_warpgroup_selector(self) -> None:
+        env = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters=None,
+            instr_categories=None,
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=10000,
+            delay_warp_mask="0x4",
+            base_env={"CUTRACER_DELAY_WARPGROUP_ID": "0"},
+            use_bundled_cuda_tools=False,
+        )
+        self.assertEqual(env["CUTRACER_DELAY_WARP_MASK"], "0x4")
+        self.assertNotIn("CUTRACER_DELAY_WARPGROUP_ID", env)
+
+        explicit = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument="random_delay",
+            analysis="random_delay",
+            kernel_filters=None,
+            instr_categories=None,
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=10000,
+            delay_warp_mask="0x4",
+            delay_warpgroup_id=1,
+            base_env={"CUTRACER_DELAY_WARPGROUP_ID": "0"},
+            use_bundled_cuda_tools=False,
+        )
+        self.assertEqual(explicit["CUTRACER_DELAY_WARPGROUP_ID"], "1")
 
     @patch("cutracer.runner.resources")
     def test_sets_targeted_trace_filters(self, mock_resources: MagicMock) -> None:
@@ -636,6 +674,191 @@ class RunProcessGroupTest(unittest.TestCase):
             with open(pid_file) as fh:
                 worker = int(fh.read())
         self.assertTrue(_gone_within(worker, 10))
+
+    def test_timeout_kills_a_worker_that_left_the_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            worker = (
+                "import os, time\n"
+                "os.setpgrp()\n"
+                f"open({pid_file!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(300)\n"
+            )
+            parent = (
+                "import os, subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {worker!r}])\n"
+                f"while not os.path.exists({pid_file!r}):\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(300)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_process_group(
+                    [sys.executable, "-c", parent],
+                    timeout=1,
+                    capture_output=True,
+                    text=True,
+                    kill_grace_s=1,
+                )
+            with open(pid_file) as fh:
+                worker_pid = int(fh.read())
+        self.assertTrue(_gone_within(worker_pid, 10))
+
+    def test_timeout_kills_a_worker_behind_a_same_group_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            worker = (
+                "import os, time\n"
+                "os.setpgrp()\n"
+                f"open({pid_file!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(300)\n"
+            )
+            launcher = (
+                "import os, subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {worker!r}])\n"
+                f"while not os.path.exists({pid_file!r}):\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(300)\n"
+            )
+            parent = (
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {launcher!r}])\n"
+                "time.sleep(300)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_process_group(
+                    [sys.executable, "-c", parent],
+                    timeout=1,
+                    capture_output=True,
+                    text=True,
+                    kill_grace_s=1,
+                )
+            with open(pid_file) as fh:
+                worker_pid = int(fh.read())
+        self.assertTrue(_gone_within(worker_pid, 10))
+
+    def test_timeout_kills_a_double_forked_worker_in_the_same_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            worker = (
+                "import os, time\n"
+                "os.setpgrp()\n"
+                f"open({pid_file!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(300)\n"
+            )
+            # The intermediate child exits at once, so the worker is
+            # reparented out of the target's process tree and leaves its
+            # process group, but stays in the target's session.
+            parent = (
+                "import os, subprocess, sys, time\n"
+                "if os.fork() == 0:\n"
+                f"    subprocess.Popen([sys.executable, '-c', {worker!r}])\n"
+                "    os._exit(0)\n"
+                f"while not os.path.exists({pid_file!r}):\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(300)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_process_group(
+                    [sys.executable, "-c", parent],
+                    timeout=1,
+                    capture_output=True,
+                    text=True,
+                    kill_grace_s=1,
+                )
+            with open(pid_file) as fh:
+                worker_pid = int(fh.read())
+        self.assertTrue(_gone_within(worker_pid, 10))
+
+    def test_timeout_preserves_binary_output_when_the_drain_times_out(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            worker = (
+                "import os, time\n"
+                "os.setsid()\n"
+                f"open({pid_file!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(300)\n"
+            )
+            # The intermediate child exits at once, so the worker holds the
+            # captured stdout pipe from outside the target's process tree,
+            # process group, and session.
+            parent = (
+                "import os, subprocess, sys, time\n"
+                "if os.fork() == 0:\n"
+                f"    subprocess.Popen([sys.executable, '-c', {worker!r}])\n"
+                "    os._exit(0)\n"
+                f"while not os.path.exists({pid_file!r}):\n"
+                "    time.sleep(0.01)\n"
+                "os.write(1, b'\\xff\\xfeout\\n')\n"
+                "time.sleep(300)\n"
+            )
+            worker_pid = None
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                    run_process_group(
+                        [sys.executable, "-c", parent],
+                        timeout=1,
+                        capture_output=True,
+                        text=False,
+                        kill_grace_s=1,
+                    )
+                self.assertEqual(raised.exception.output, b"\xff\xfeout\n")
+                self.assertIsInstance(raised.exception.stderr, bytes)
+                with open(pid_file) as fh:
+                    worker_pid = int(fh.read())
+            finally:
+                if worker_pid is not None:
+                    try:
+                        os.kill(worker_pid, 9)
+                    except ProcessLookupError:
+                        pass
+
+    def test_timeout_returns_when_an_escaped_worker_holds_the_output_pipe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "worker.pid")
+            worker = (
+                "import os, time\n"
+                "os.setsid()\n"
+                f"open({pid_file!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(300)\n"
+            )
+            # The intermediate child exits at once, so the worker is
+            # reparented out of the target's process tree, group, and session
+            # while still holding the captured stdout pipe.
+            parent = (
+                "import os, subprocess, sys, time\n"
+                "if os.fork() == 0:\n"
+                f"    subprocess.Popen([sys.executable, '-c', {worker!r}])\n"
+                "    os._exit(0)\n"
+                f"while not os.path.exists({pid_file!r}):\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(300)\n"
+            )
+            worker_pid = None
+            started = time.monotonic()
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_process_group(
+                        [sys.executable, "-c", parent],
+                        timeout=1,
+                        capture_output=True,
+                        text=True,
+                        kill_grace_s=1,
+                    )
+                self.assertLess(time.monotonic() - started, 30)
+                with open(pid_file) as fh:
+                    worker_pid = int(fh.read())
+            finally:
+                if worker_pid is not None:
+                    try:
+                        os.kill(worker_pid, 9)
+                    except ProcessLookupError:
+                        pass
 
     def test_processes_left_after_the_target_exits_are_killed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

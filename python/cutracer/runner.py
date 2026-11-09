@@ -23,7 +23,7 @@ import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence, TypeVar
+from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar
 
 import click
 from cutracer.file_utils import file_sha256
@@ -366,6 +366,11 @@ def build_cutracer_env(
         env["CUTRACER_CLUSTER_CTA_ID"] = str(delay_cluster_cta_id)
     if delay_warpgroup_id is not None:
         env["CUTRACER_DELAY_WARPGROUP_ID"] = str(delay_warpgroup_id)
+    elif delay_warp_mask is not None:
+        # A warp mask is a complete warp selector, and the device resolves a
+        # set warpgroup id over it. An inherited warpgroup must therefore not
+        # survive an explicit mask (for example a stress isolate attempt's).
+        env.pop("CUTRACER_DELAY_WARPGROUP_ID", None)
     if delay_warp_mask is not None:
         env["CUTRACER_DELAY_WARP_MASK"] = delay_warp_mask
     if delay_patterns is not None:
@@ -543,11 +548,15 @@ def run_process_group(
 
     `subprocess.run` kills only its direct child on timeout, so the workers of
     a multi-process target (for example torch elastic ranks stuck in a hung
-    kernel) keep running and keep their GPUs. Here the target runs in a new
-    session: on timeout the whole session gets SIGTERM, then SIGKILL after
-    `kill_grace_s`, before `subprocess.TimeoutExpired` is raised, and processes
-    still left in the session after the target exits are killed as well. A
-    `RunTarget` for `run_instrumented_target`.
+    kernel) keep running and keep their GPUs. Here the target runs in its own
+    process group: on timeout the group and the target's live descendants get
+    SIGTERM, then SIGKILL after `kill_grace_s`, before
+    `subprocess.TimeoutExpired` is raised, and processes still left in the
+    group after the target exits are killed as well. A descendant that leaves
+    the group, the target's process tree, and its session (for example a
+    daemon that double-forks and calls `setsid()`) can outlive the target; it
+    cannot block the timeout, because the final output drain is bounded by
+    `kill_grace_s` as well. A `RunTarget` for `run_instrumented_target`.
     """
     stdio = subprocess.PIPE if capture_output else None
     with subprocess.Popen(
@@ -563,18 +572,22 @@ def run_process_group(
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _signal_session(process.pid, signal.SIGTERM)
+            related = _related_pids(process.pid)
+            _signal_process_group(process.pid, signal.SIGTERM)
+            _signal_pids(related, signal.SIGTERM)
             try:
                 process.wait(timeout=kill_grace_s)
             except subprocess.TimeoutExpired:
                 pass
-            _signal_session(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
+            related |= _related_pids(process.pid)
+            _signal_process_group(process.pid, signal.SIGKILL)
+            _signal_pids(related, signal.SIGKILL)
+            stdout, stderr = _drain_output(process, kill_grace_s, text=text)
             raise subprocess.TimeoutExpired(
                 process.args, timeout or 0, output=stdout, stderr=stderr
             ) from None
         finally:
-            _signal_session(process.pid, signal.SIGKILL)
+            _signal_process_group(process.pid, signal.SIGKILL)
     result = subprocess.CompletedProcess(
         process.args, process.returncode, stdout, stderr
     )
@@ -583,12 +596,116 @@ def run_process_group(
     return result
 
 
-def _signal_session(session_id: int, sig: signal.Signals) -> None:
-    """Send `sig` to every process left in a session started by `run_process_group`."""
+def _signal_process_group(process_id: int, sig: signal.Signals) -> None:
+    """Send `sig` to the process group led by a `run_process_group` target."""
     try:
-        os.killpg(session_id, sig)
+        os.killpg(process_id, sig)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _signal_pids(process_ids: set[int], sig: signal.Signals) -> None:
+    for process_id in process_ids:
+        try:
+            os.kill(process_id, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _related_pids(root_pid: int) -> set[int]:
+    """Live descendants of `root_pid` and the members of its group and session.
+
+    Descendants matter because a worker can leave the target's process group
+    with `setpgrp()` while staying in its process tree; the group alone would
+    then miss it. Session members matter for the same reason after a double
+    fork: the worker leaves both the group and the process tree (it is
+    reparented) while staying in the session the target was started in with
+    `start_new_session`, which no outside process can join. Only a worker
+    that also leaves the session with `setsid()` escapes this collection.
+    Read from `/proc` where available (Linux targets).
+    """
+    related: set[int] = set()
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return related
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as stat_file:
+                stat = stat_file.read()
+            fields = stat[stat.rindex(b")") + 2 :].split()
+            parent_pid, process_group, session = (
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3]),
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(parent_pid, []).append(pid)
+        if pid != root_pid and (process_group == root_pid or session == root_pid):
+            related.add(pid)
+    pending = list(children.get(root_pid, ()))
+    pending.extend(
+        child for group_pid in related for child in children.get(group_pid, ())
+    )
+    visited: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid == root_pid or pid in visited:
+            continue
+        visited.add(pid)
+        related.add(pid)
+        pending.extend(children.get(pid, ()))
+    return related
+
+
+def _decode_drained_output(data: Optional[Any], stream: Optional[Any]) -> Optional[Any]:
+    """Decode output `communicate` collected before it timed out.
+
+    `TimeoutExpired` carries raw bytes even for a text-mode process, so decode
+    with the stream's encoding and apply the universal-newline translation a
+    completed text-mode `communicate` would have done.
+    """
+    if not isinstance(data, bytes):
+        return data
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    return (
+        data.decode(encoding, errors="replace")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+
+def _drain_output(
+    process: "subprocess.Popen[str]", grace_s: float, *, text: bool = False
+) -> tuple[Optional[Any], Optional[Any]]:
+    """Collect a killed target's output, bounded by `grace_s`.
+
+    A descendant that escaped cleanup can hold the captured output pipes
+    open, which would otherwise keep `communicate` waiting for an EOF that
+    only that descendant can produce.
+    """
+    try:
+        return process.communicate(timeout=max(grace_s, 0.1))
+    except subprocess.TimeoutExpired as exc:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        try:
+            process.wait(timeout=max(grace_s, 0.1))
+        except subprocess.TimeoutExpired:
+            _signal_process_group(process.pid, signal.SIGKILL)
+            process.wait()
+        if not text:
+            return exc.output, exc.stderr
+        return (
+            _decode_drained_output(exc.output, process.stdout),
+            _decode_drained_output(exc.stderr, process.stderr),
+        )
 
 
 def _print_config_summary(env: dict) -> None:

@@ -1966,6 +1966,21 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     if (!runtime_launch.is_null()) metadata["runtime_identity"] = runtime_launch;
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+      // A graph node launch is an actual kernel execution (unlike the direct
+      // launches skipped during stream capture / graph build above), so it
+      // starts the kernel timeout exactly as a direct launch does. Delay-only
+      // instrumentation sends no trace records for the recv thread to learn
+      // the launch from, so without this a hung graph kernel is bounded only
+      // by the caller's outer timeout and never by CUTRACER_KERNEL_TIMEOUT_S.
+      // The timeout state is a single global, cleared only once the whole
+      // graph completes, so graph timing is scoped to the graph execution:
+      // only the first node records the start and the name (marked as a
+      // graph), and later nodes do not move the timer or rename it.
+      if (ctx_state->kernel_start_time == 0) {
+        ctx_state->kernel_start_time = time(nullptr);
+        ctx_state->kernel_start_name = meta.unmangled_name + " (graph)";
+      }
+      ctx_state->last_data_received_time = 0;
       auto& writer = create_trace_writer_locked(ctx_state, kernel_launch_id, base_filename, metadata);
       if (runtime_plan_requested.load()) {
         writer.write_metadata(plan_applied);

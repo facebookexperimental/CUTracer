@@ -580,6 +580,93 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(hang.outcome, ReplayOutcome.INTERESTING)
         self.assertEqual(plain.outcome, ReplayOutcome.TIMED_OUT)
 
+    def test_replay_timeout_after_a_watchdog_hang_validates_kernel_identity(self):
+        def runner_for(checksum):
+            def runner(argv, **kwargs):
+                output_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "cutracer_main_1.log").write_text(
+                    "Kernel timeout: running for 61 seconds (limit: 60 "
+                    "seconds); sending SIGTERM. kernel=k\n"
+                )
+                if checksum is not None:
+                    event = {
+                        "type": "kernel_launch",
+                        "kernel_name": "observed_kernel",
+                        "kernel_checksum": checksum,
+                    }
+                    (output_dir / "cutracer_kernel_events_test.ndjson").write_text(
+                        json.dumps(event) + "\n"
+                    )
+                raise subprocess.TimeoutExpired(argv, 1)
+
+            return runner
+
+        config_fields = {
+            "hang_is_bug": True,
+            "expected_kernel_name": "matmul_kernel",
+            "expected_kernel_checksum": "a1b2c3d4e5f60001",
+        }
+        mismatched = run_replay(
+            str(self.config_path),
+            self._replay_config(**config_fields),
+            runner=runner_for("different"),
+        )
+        unverifiable = run_replay(
+            str(self.config_path),
+            self._replay_config(
+                output_dir=str(self.temp_dir / "unverifiable"), **config_fields
+            ),
+            runner=runner_for(None),
+        )
+        matching = run_replay(
+            str(self.config_path),
+            self._replay_config(
+                output_dir=str(self.temp_dir / "matching"), **config_fields
+            ),
+            runner=runner_for("a1b2c3d4e5f60001"),
+        )
+
+        self.assertEqual(mismatched.outcome, ReplayOutcome.STALE_INPUT)
+        self.assertEqual(unverifiable.outcome, ReplayOutcome.INFRA_ERROR)
+        self.assertEqual(matching.outcome, ReplayOutcome.INTERESTING)
+
+    def test_replay_hang_uses_the_output_dir_from_base_env(self):
+        for label, env_output_dir, cwd in (
+            ("absolute", str(self.temp_dir / "from-base-env"), None),
+            ("relative", "logs", str(self.temp_dir / "work")),
+        ):
+            with self.subTest(label=label):
+                if cwd is not None:
+                    os.makedirs(cwd)
+
+                def runner(argv, **kwargs):
+                    env_dir = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+                    if not env_dir.is_absolute():
+                        env_dir = Path(kwargs["cwd"]) / env_dir
+                    env_dir.mkdir(parents=True, exist_ok=True)
+                    (env_dir / "cutracer_main_1.log").write_text(
+                        "Kernel timeout: running for 61 seconds (limit: 60 "
+                        "seconds); sending SIGTERM. kernel=k\n"
+                    )
+                    return subprocess.CompletedProcess(argv, -15, "", "")
+
+                result = run_replay(
+                    str(self.config_path),
+                    ReplayConfig(
+                        oracle_argv=["./oracle"],
+                        cutracer_so=str(self.cutracer_so),
+                        hang_is_bug=True,
+                        cwd=cwd,
+                        base_env={
+                            "PATH": "/bin",
+                            "CUTRACER_OUTPUT_DIR": env_output_dir,
+                        },
+                    ),
+                    runner=runner,
+                )
+                self.assertEqual(result.outcome, ReplayOutcome.INTERESTING)
+
     def test_replay_ignores_watchdog_lines_of_earlier_replays(self):
         config = self._replay_config(hang_is_bug=True)
         run_replay(str(self.config_path), config, runner=self._hang_runner())

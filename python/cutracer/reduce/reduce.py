@@ -357,13 +357,26 @@ def _run_replay_once(  # noqa: C901
     output_dir: Optional[str],
     runner: Optional[RunTarget] = None,
 ) -> ReplayResult:
-    # Without an output directory, CUTracer writes its main logs to
-    # CUTRACER_OUTPUT_DIR when the caller's environment sets one (the runner
-    # only overrides it for an explicit output dir), else to the target's
-    # working directory.
-    log_dir = (
-        output_dir or os.environ.get("CUTRACER_OUTPUT_DIR") or config.cwd or os.getcwd()
-    )
+    # Without an output directory, CUTracer writes its main logs to the
+    # effective environment's CUTRACER_OUTPUT_DIR (the runner builds that
+    # environment from `base_env` when one is given, not from the caller's
+    # environment; the runner only overrides it for an explicit output dir),
+    # else to the target's working directory. A relative output path in the
+    # environment resolves against the target's working directory, which is
+    # where the child runs.
+    if output_dir is not None:
+        log_dir = output_dir
+    else:
+        effective_env = config.base_env if config.base_env is not None else os.environ
+        env_output_dir = effective_env.get("CUTRACER_OUTPUT_DIR")
+        if env_output_dir:
+            log_dir = (
+                env_output_dir
+                if os.path.isabs(env_output_dir)
+                else os.path.join(config.cwd or os.getcwd(), env_output_dir)
+            )
+        else:
+            log_dir = config.cwd or os.getcwd()
     logs_before = main_logs(log_dir) if config.hang_is_bug else set()
 
     def hang_lines() -> list[str]:
@@ -408,6 +421,21 @@ def _run_replay_once(  # noqa: C901
     except subprocess.TimeoutExpired as exc:
         watchdog = hang_lines()
         if watchdog:
+            if config.expected_kernel_name is not None:
+                assert config.expected_kernel_checksum is not None
+                assert output_dir is not None
+                identity_failure = _validate_replay_kernel_identity(
+                    output_dir,
+                    expected_name=config.expected_kernel_name,
+                    expected_checksum=config.expected_kernel_checksum,
+                )
+                if identity_failure is not None:
+                    outcome, reason = identity_failure
+                    return ReplayResult(
+                        outcome=outcome,
+                        returncode=None,
+                        error=reason,
+                    )
             return ReplayResult(
                 outcome=ReplayOutcome.INTERESTING,
                 returncode=None,
