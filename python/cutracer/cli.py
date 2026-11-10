@@ -11,6 +11,7 @@ import sys
 import click
 from cutracer.analyze.cli import analyze_command
 from cutracer.compute_sanitizer.cli import compute_sanitizer_command
+from cutracer.oracle.cli import oracle_command
 from cutracer.query.cli import query_command, sass_command
 from cutracer.reduce.cli import reduce_command
 from cutracer.runtime_version import get_runtime_version
@@ -80,6 +81,7 @@ main.add_command(diagnose_run_resume_command)
 main.add_command(diagnose_run_advance_command)
 main.add_command(diagnose_run_status_command)
 main.add_command(diagnose_run_result_command)
+main.add_command(oracle_command)
 main.add_command(query_command)
 main.add_command(reduce_command)
 main.add_command(sass_command)

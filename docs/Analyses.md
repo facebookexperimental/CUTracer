@@ -167,6 +167,23 @@ Every report carries a `verdict`, with `reasons`:
 
 The exit code stays 0 whenever the search itself ran; read the report for the outcome.
 
+#### A pytest node as the oracle (`cutracer oracle pytest`)
+
+Stress and reduce read the oracle's exit code: 0 reproduced, `--not-interesting-exit-codes` (usually 1) passed, anything else measured nothing. `cutracer oracle pytest` turns one pytest node into that contract without a wrapper script:
+
+```bash
+cutracer stress -k my_kernel --not-interesting-exit-codes 1 --confirm -o /tmp/s -- \
+    cutracer oracle pytest --python .venv/bin/python --rootdir . \
+    --nodeid tests/test_attn.py::test_bitwise --assertion-site tests/test_attn.py::check_bitwise \
+    -k my_kernel --signature-file /tmp/s/signature -o /tmp/s/oracle
+```
+
+- Exit 0 only for an `AssertionError` whose innermost frame under `--rootdir` (installed packages excluded) is one of the `--assertion-site FILE::FUNCTION`s (any, if none is given); 1 when the node passes; 2 for a setup or collection error, a skip or xfail, another exception, a wrong selection, a `--timeout`, or a crash. A run that measured nothing never reads as a pass. A torchelastic test is judged by its first failed worker's own traceback, which needs torchelastic's `@record` on the worker's entry point.
+- An injected run must also have launched a kernel matching `-k` with delay points in its delay config (it turns on kernel events and always keeps the dump), so a filter that matches nothing exits 2 instead of passing every attempt. `--plain` runs without CUTracer, for a preflight.
+- `--signature-file` pins the first reproduction's signature (node and assertion site); later runs, such as the replays of `--confirm`, count only that failure. An empty file pins nothing yet.
+- The node runs in a child of `--python`, the project's interpreter, which inherits CUTracer's injection; the oracle itself never loads CUDA. `-o` keeps each run's report, log, delay config and `outcome.json` in an `attempt-*` directory; every run also prints its exit code and the reason on one stderr line. `--pytest-arg=ARG` (repeatable) adds pytest arguments after the defaults `-p no:timeout -o addopts=`.
+- The oracle is one standalone script (standard library only, plus pytest in the child). A search runs its oracle for every attempt and control run, and starting CUTracer each time costs seconds, so CI should write the script out once with `cutracer oracle export /tmp/s/oracle.py` and use `.venv/bin/python /tmp/s/oracle.py --rootdir . --nodeid ...` as the oracle (`--python` then defaults to that interpreter).
+
 Random delays slow a producer down along with its consumers, so they rarely let the producer lap a consumer that is missing from the release protocol. `--strategy isolate` tries one target per attempt (per instrumented kernel in first-launch order, cluster ranks high to low and then warps within each kernel, taken from every instrumented launch shape of the control arm, or from `--isolate-ranks` and `--isolate-warps`) and stops at the first that fails. A consumer that reaches its wait two phases late waits on the parity of a phase that may never complete, so isolate counts a hang ended by CUTracer's kernel timeout as a reproduction (`--hang-is-bug`, with `--kernel-timeout-s 60`) and reports it as `"symptom": "hang"`. By default each target gets one 1 ms delay: a clean kernel with W warps per CTA and clusters of C CTAs costs W × C attempts.
 
 ```bash
