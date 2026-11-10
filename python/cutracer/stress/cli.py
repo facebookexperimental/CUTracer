@@ -145,6 +145,7 @@ def _mode_config(
         "strategy": mode.name,
         "delay_ladder_ns": list(mode.delay_ladder_ns),
         "attempts_per_delay": mode.attempts_per_delay,
+        "enable_prob": mode.enable_prob,
         "kernel_timeout_s": mode.kernel_timeout_s,
         "hang_is_bug": mode.hang_is_bug,
         **shared,
@@ -166,11 +167,13 @@ def _mode_config(
     default=STRATEGY_ALL,
     show_default=True,
     help="Delay modes to search with, in order: 'all', or a comma-separated list "
-    "of 'random' (random per-thread delays at every candidate point, all warps "
-    "at once or one warpgroup at a time) and 'isolate' (stall one (cluster rank, "
-    "CTA-local warp) per attempt with a fixed delay before each mbarrier wait "
-    "while every other warp runs at full speed; finds a warp the protocol does "
-    "not wait for, such as a consumer that never releases its ring slot). With "
+    "of 'lds' (random per-thread delays before shared-memory loads only), "
+    "'random' (random per-thread delays at a random tenth of CUTracer's built-in "
+    "points, all warps at once or one warpgroup at a time) and 'isolate' (stall "
+    "one (cluster rank, CTA-local warp) per attempt with a fixed delay before "
+    "each mbarrier wait while every other warp runs at full speed; finds a warp "
+    "the protocol does not wait for, such as a consumer that never releases its "
+    "ring slot). With "
     "several modes, each writes its own report under <output-dir>/<mode>, modes "
     "with the same instrumentation share one control arm, and the search stops "
     "at the first mode that reproduces.",
@@ -212,9 +215,9 @@ def _mode_config(
 @click.option(
     "--enable-prob",
     type=float,
-    default=1.0,
-    show_default=True,
-    help="Per-point enable probability (random only; isolate enables every point).",
+    default=None,
+    help="Per-point enable probability. Default: the mode's (lds 1.0, random "
+    "0.1); isolate enables every point.",
 )
 @click.option(
     "--warpgroup-ids",
@@ -331,7 +334,7 @@ def stress_command(  # noqa: C901
     confirm: bool,
     budget_s: int | None,
     delay_ladder_ns: str | None,
-    enable_prob: float,
+    enable_prob: float | None,
     warpgroup_ids: str,
     isolate_ranks: str,
     isolate_warps: str,
@@ -383,6 +386,7 @@ def stress_command(  # noqa: C901
         "--delay-ladder-ns": delay_ladder_ns,
         "--attempts-per-delay": attempts_per_delay,
         "--delay-patterns": delay_patterns,
+        "--enable-prob": enable_prob,
     }
     if single is None:
         for flag, value in per_mode_flags.items():
@@ -399,6 +403,8 @@ def stress_command(  # noqa: C901
             flags[modes[0]]["attempts_per_delay"] = attempts_per_delay
         if delay_patterns is not None:
             flags[modes[0]]["delay_patterns"] = delay_patterns
+        if enable_prob is not None:
+            flags[modes[0]]["enable_prob"] = enable_prob
         if STRATEGY_RANDOM in modes:
             flags[STRATEGY_RANDOM]["warpgroup_ids"] = _parse_int_list(warpgroup_ids)
         if isolate_ranks:
@@ -411,7 +417,6 @@ def stress_command(  # noqa: C901
     overrides = _parse_mode_options(mode_options, modes)
     shared: dict[str, Any] = {
         "oracle_argv": list(oracle),
-        "enable_prob": enable_prob,
         "stop_on_first": stop_on_first,
         "not_interesting_exit_codes": not_interesting,
         "baseline_runs": baseline_runs,

@@ -710,6 +710,30 @@ def _instrumented_geometries(
     return list(by_checksum.values())
 
 
+def _launched_instrumented_kernels(output_dir: str, config_path: str) -> set[str]:
+    """Checksums of the launched kernels the run's delay dump lists, whether or
+    not the delay patterns matched any of their instructions."""
+    try:
+        with open(config_path) as source:
+            kernels = json.load(source).get("kernels", {})
+        listed = {
+            kernel.get("kernel_checksum")
+            for kernel in kernels.values()
+            if isinstance(kernel, dict)
+        }
+    except (AttributeError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "cannot read the control run's delay dump %s: %s", config_path, exc
+        )
+        return set()
+    return {
+        checksum
+        for event in _kernel_launch_events(output_dir)
+        if isinstance(checksum := event.get("kernel_checksum"), str)
+        and checksum in listed
+    }
+
+
 def _merge_geometries(
     geometries: List[_LaunchGeometry], new: List[_LaunchGeometry]
 ) -> List[_LaunchGeometry]:
@@ -1463,6 +1487,10 @@ class _BaselineResult:
     # The raw runs, so that a control arm shared by several modes can be
     # counted under each mode's own oracle contract (see `_baseline_from_runs`).
     runs: List[_BaselineRun] = field(default_factory=list)
+    # Checksums of the launched kernels CUTracer instrumented, with or without
+    # delay points (recorded with `geometries`): instrumented launches but no
+    # geometry mean the delay patterns match nothing in those kernels.
+    instrumented_kernels: set[str] = field(default_factory=set)
 
 
 def _baseline_from_runs(
@@ -1472,6 +1500,7 @@ def _baseline_from_runs(
     logs: List[str],
     geometries: List[_LaunchGeometry],
     requested: Optional[int] = None,
+    instrumented_kernels: Optional[set[str]] = None,
 ) -> _BaselineResult:
     """Count control runs under `config`'s oracle contract and hang rule."""
     completed = reproduced = timed_out = infra_errors = hangs = 0
@@ -1505,6 +1534,7 @@ def _baseline_from_runs(
         hangs=hangs,
         geometries=geometries,
         runs=list(runs),
+        instrumented_kernels=set(instrumented_kernels or ()),
     )
 
 
@@ -1547,6 +1577,7 @@ def _run_baseline(
     """
     runs: List[_BaselineRun] = []
     geometries: List[_LaunchGeometry] = []
+    instrumented: set[str] = set()
     logs: List[str] = []
     if config.baseline_runs <= 0:
         # A caller that opted out of the control arm must not pay for anything
@@ -1604,6 +1635,7 @@ def _run_baseline(
             geometries = _merge_geometries(
                 geometries, _instrumented_geometries(run_dir, dump_path)
             )
+            instrumented |= _launched_instrumented_kernels(run_dir, dump_path)
             shutil.rmtree(run_dir, ignore_errors=True)
         logs.append(
             _attempt_log(
@@ -1619,7 +1651,13 @@ def _run_baseline(
         runs.append(
             _BaselineRun(None if proc is None else proc.returncode, bool(watchdog))
         )
-    return _baseline_from_runs(config, runs, logs=logs, geometries=geometries)
+    return _baseline_from_runs(
+        config,
+        runs,
+        logs=logs,
+        geometries=geometries,
+        instrumented_kernels=instrumented,
+    )
 
 
 def _attribution(
@@ -1795,6 +1833,7 @@ def run_stress(  # noqa: C901
             logs=[],
             geometries=baseline.geometries,
             requested=baseline.requested,
+            instrumented_kernels=baseline.instrumented_kernels,
         )
     elif resume is None:
         baseline = _run_baseline(

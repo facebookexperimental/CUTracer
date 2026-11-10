@@ -186,6 +186,48 @@ def _explicit_targets(config: StressConfig) -> bool:
     return config.isolate_ranks is not None and config.isolate_warps is not None
 
 
+def _not_searched(run: ModeRun, baseline: _BaselineResult) -> Optional[tuple[str, str]]:
+    """Why `run`'s mode should not search, as (status, reason), from what its
+    control arm learned about the instrumented launches; None to search."""
+    needs_targets = get_mode(run.mode).isolates_targets
+    if needs_targets and _explicit_targets(run.config):
+        return None
+    if not baseline.requested:
+        if needs_targets:
+            return (
+                MODE_NOT_RUN,
+                "it discovers its targets from the control arm, and none ran",
+            )
+        return None
+    if baseline.geometries:
+        return None
+    if baseline.instrumented_kernels:
+        return (
+            MODE_SKIPPED,
+            "no instrumented launch has a delay point for this mode: its delay "
+            "patterns match no instruction of the launched kernels (for example, "
+            "isolate on kernels without mbarrier waits, or lds on kernels "
+            "without shared-memory loads)",
+        )
+    completed = _baseline_from_runs(
+        run.config, baseline.runs, logs=[], geometries=[]
+    ).completed
+    if not completed:
+        # Failed or timed-out control runs launched nothing to learn from;
+        # that is not a kernel without delay points.
+        return (
+            MODE_NOT_RUN,
+            "its control arm produced no sample to learn the instrumented "
+            "launches from",
+        )
+    return (
+        MODE_NOT_RUN,
+        "its control arm recorded no launch of an instrumented kernel: the kernel "
+        "filter matched nothing, or the delay dump or the launch events were "
+        "missing or unreadable (see the log)",
+    )
+
+
 def plan_verdict(runs: Sequence[ModeRun]) -> Verdict:
     """The plan's verdict: a finding in any mode, else a suspect failure in any
     mode, else clean only if every mode that applied ran clean."""
@@ -288,9 +330,11 @@ def run_stress_plan(  # noqa: C901
                 run.config,
                 cutracer_so=cutracer_so,
                 runner=runner,
-                capture_geometry=any(
-                    get_mode(member.mode).isolates_targets for member in sharing
-                ),
+                # Every control arm records the instrumented launches and their
+                # delay points: isolate takes its targets from them, and a mode
+                # whose patterns match nothing in the launched kernels does not
+                # apply.
+                capture_geometry=True,
                 deadline=deadline,
             )
             log_path = None
@@ -303,30 +347,11 @@ def run_stress_plan(  # noqa: C901
                 _baseline_summary([m.mode for m in sharing], baseline, log_path)
             )
         baseline = baselines[profile]
-        if (
-            get_mode(run.mode).isolates_targets
-            and not _explicit_targets(run.config)
-            and not baseline.geometries
-        ):
-            if not baseline.requested:
-                run.reason = (
-                    "it discovers its targets from the control arm, and none ran"
-                )
-            elif not _baseline_from_runs(
-                run.config, baseline.runs, logs=[], geometries=[]
-            ).completed:
-                # Failed or timed-out control runs launched nothing to learn
-                # from; that is not a kernel without mbarrier waits.
-                run.reason = (
-                    "its control arm produced no sample to discover targets from"
-                )
-            else:
-                run.status = MODE_SKIPPED
-                run.reason = (
-                    "no instrumented launch has a delay point for this mode "
-                    "(for example, the kernels have no mbarrier wait)"
-                )
+        held = _not_searched(run, baseline)
+        if held is not None:
+            run.status, run.reason = held
             continue
+
         run.result = run_stress(
             run.config,
             cutracer_so=cutracer_so,
