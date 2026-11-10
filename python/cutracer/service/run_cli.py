@@ -149,7 +149,7 @@ def _existing(run_id: str, operation: str, **options: Any) -> None:
 @click.argument("request_path", type=click.Path(exists=True, dir_okay=False))
 @_backend_options
 def diagnose_run_command(request_path: str, **options: Any) -> None:
-    """Run a frozen request in the foreground, returning a RunResult.
+    """Distributed Run: run a frozen request now.
 
     Exits 1 after printing the result when the Run failed, expired, or could
     not publish its output.
@@ -161,7 +161,7 @@ def diagnose_run_command(request_path: str, **options: Any) -> None:
 @click.argument("request_path", type=click.Path(exists=True, dir_okay=False))
 @_backend_options
 def diagnose_submit_command(request_path: str, **options: Any) -> None:
-    """Submit a hosted request and return its RunHandle."""
+    """Distributed Run: submit a hosted request."""
     _start(request_path, submit=True, **options)
 
 
@@ -169,7 +169,7 @@ def diagnose_submit_command(request_path: str, **options: Any) -> None:
 @click.argument("run_id")
 @_backend_options
 def diagnose_run_resume_command(run_id: str, **options: Any) -> None:
-    """Resume this same Run in the foreground without resetting its deadline.
+    """Distributed Run: resume a Run in the foreground.
 
     Exits 1 after printing the result when the Run failed, expired, or could
     not publish its output.
@@ -181,7 +181,7 @@ def diagnose_run_resume_command(run_id: str, **options: Any) -> None:
 @click.argument("run_id")
 @_backend_options
 def diagnose_run_advance_command(run_id: str, **options: Any) -> None:
-    """Explicitly advance a Run when the caller owns scheduling.
+    """Distributed Run: advance a caller-scheduled Run.
 
     Exits 1 after printing the summary when the Run failed, expired, or could
     not publish its output.
@@ -193,7 +193,7 @@ def diagnose_run_advance_command(run_id: str, **options: Any) -> None:
 @click.argument("run_id")
 @_backend_options
 def diagnose_run_status_command(run_id: str, **options: Any) -> None:
-    """Read Run state without executing GPU or model work."""
+    """Distributed Run: read Run state only."""
     _existing(run_id, "status", **options)
 
 
@@ -201,7 +201,7 @@ def diagnose_run_status_command(run_id: str, **options: Any) -> None:
 @click.argument("run_id")
 @_backend_options
 def diagnose_run_result_command(run_id: str, **options: Any) -> None:
-    """Read available reports, including failed and incomplete child status."""
+    """Distributed Run: read available Run reports."""
     _existing(run_id, "result", **options)
 
 

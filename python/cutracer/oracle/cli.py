@@ -44,8 +44,11 @@ def pytest_oracle() -> Iterator[ModuleType]:
 
 @click.group(name="oracle")
 def oracle_command() -> None:
-    """Turn a test into an oracle: exit 0 when the bug reproduced, 1 when the
-    test passed, 2 when the run measured nothing."""
+    """Turn a test into a stress/reduce oracle.
+
+    The oracle exits 0 when the bug reproduced, 1 when the test passed, and 2
+    when the run measured nothing.
+    """
 
 
 @oracle_command.command(

@@ -85,7 +85,7 @@ def compute_sanitizer_command(
     env_pairs: tuple[str, ...],
     cmd: tuple[str, ...],
 ) -> None:
-    """Run a command under NVIDIA Compute Sanitizer (capture mode).
+    """Run NVIDIA Compute Sanitizer on a command.
 
     \b
     Examples:

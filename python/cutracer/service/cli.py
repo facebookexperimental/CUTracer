@@ -590,7 +590,7 @@ def diagnose_command(
     preset: Optional[str],
     preset_registry: Optional[str],
 ) -> None:
-    """Run a bounded sanitizer, stress, trace, and reasoning session."""
+    """Run a bounded diagnosis session locally or hosted."""
     target = _resolve_work_unit(
         inputs,
         command_mode=bool(ctx.meta.get(_COMMAND_MODE_KEY)),
@@ -665,7 +665,7 @@ def diagnose_status_command(
     distributed_config: str,
     out: Optional[str],
 ) -> None:
-    """Read one durable distributed diagnosis session without mutating it."""
+    """Read a distributed diagnosis session."""
     _emit_json(
         _run_distributed_status(
             config_path=distributed_config,
@@ -691,7 +691,10 @@ def diagnose_resume_command(
     result_limit: int,
     out: Optional[str],
 ) -> None:
-    """Run one idempotent reconciliation pass for a distributed session."""
+    """Resume a distributed diagnosis session.
+
+    Runs one idempotent reconciliation pass over the session.
+    """
     _emit_json(
         _run_distributed_resume(
             config_path=distributed_config,

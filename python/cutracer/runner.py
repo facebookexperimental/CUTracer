@@ -1026,7 +1026,7 @@ def trace_command(
     no_data_timeout_s: int,
     cmd: tuple,
 ) -> None:
-    """Trace a CUDA application with CUTracer instrumentation.
+    """Trace a CUDA application with CUTracer.
 
     Sets up CUTracer environment variables and runs the specified command.
     cutracer.so comes from --cutracer-so, a copy bundled with the package if

@@ -171,7 +171,7 @@ def compare_command(
     quiet: bool,
     json_output: bool,
 ) -> None:
-    """Compare text and JSON trace formats for cross-format consistency.
+    """Compare text and JSON traces for consistency.
 
     Validates both files and compares record counts and statistical content
     (unique CTAs, warps, SASS instructions).

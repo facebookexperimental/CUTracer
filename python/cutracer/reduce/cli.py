@@ -216,7 +216,7 @@ def reduce_command(
     no_validate_schema: bool,
 ) -> None:
     """
-    Reduce delay injection config to find minimal race trigger.
+    Reduce a delay config to the minimal race trigger.
 
     Uses delta debugging to find the minimal set of delay points
     that trigger a data race.

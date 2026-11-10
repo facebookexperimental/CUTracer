@@ -95,7 +95,7 @@ class ReduceCliTest(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("Reduce delay injection config", result.output)
+        self.assertIn("Reduce a delay config", result.output)
         self.assertIn("--config", result.output)
         self.assertIn("--test", result.output)
 
