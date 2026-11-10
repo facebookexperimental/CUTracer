@@ -85,6 +85,8 @@ _MODE_OPTIONS: dict[str, Callable[[str], Any]] = {
     "warpgroup_ids": _parse_int_list,
     "isolate_ranks": _parse_int_list,
     "isolate_warps": _parse_int_ranges,
+    "isolate_max_targets": int,
+    "isolate_rotation": int,
     "kernel_timeout_s": int,
     "hang_is_bug": _parse_bool,
 }

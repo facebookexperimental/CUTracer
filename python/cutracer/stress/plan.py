@@ -214,7 +214,17 @@ def plan_verdict(runs: Sequence[ModeRun]) -> Verdict:
     ]
     if not verdicts:
         reasons.append("no mode ran")
-    return Verdict(VERDICT_INCOMPLETE, reasons) if reasons else Verdict(VERDICT_CLEAN)
+    if reasons:
+        return Verdict(VERDICT_INCOMPLETE, reasons)
+    # A clean mode can still qualify what it covered (an isolate window).
+    return Verdict(
+        VERDICT_CLEAN,
+        [
+            f"{mode}: {reason}"
+            for mode, verdict in verdicts
+            for reason in verdict.reasons
+        ],
+    )
 
 
 def _baseline_summary(

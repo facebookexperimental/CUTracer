@@ -142,6 +142,12 @@ class StressConfig:
     # observed, which needs `baseline_runs >= 1`.
     isolate_ranks: Optional[List[int]] = None
     isolate_warps: Optional[List[int]] = None
+    # Isolate only: try at most this many targets, a window of the full target
+    # list that `isolate_rotation` moves (window k starts at target
+    # k * isolate_max_targets and wraps around), so that successive searches
+    # with an increasing rotation cover every target.
+    isolate_max_targets: Optional[int] = None
+    isolate_rotation: int = 0
     # SASS substrings to delay at (CUTRACER_DELAY_PATTERNS). None = mbarrier
     # waits for isolate, CUTracer's built-in patterns for random.
     delay_patterns: Optional[str] = None
@@ -155,7 +161,7 @@ class StressConfig:
     exact_kernel_name: Optional[str] = None
     exact_kernel_checksum: Optional[str] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         # The `cutracer stress` CLI rejects an empty ladder with a UsageError,
         # but programmatic callers (the service, which builds this straight from
         # a spec) reach the search loop directly. An empty ladder means the
@@ -185,8 +191,20 @@ class StressConfig:
         if get_mode(self.strategy).isolates_targets:
             if self.warpgroup_ids:
                 raise ValueError("warpgroup_ids do not apply to an isolate search")
-        elif self.isolate_ranks is not None or self.isolate_warps is not None:
-            raise ValueError("isolate_ranks and isolate_warps need strategy isolate")
+        elif (
+            self.isolate_ranks is not None
+            or self.isolate_warps is not None
+            or self.isolate_max_targets is not None
+            or self.isolate_rotation
+        ):
+            raise ValueError(
+                "isolate_ranks, isolate_warps, isolate_max_targets and "
+                "isolate_rotation need strategy isolate"
+            )
+        if self.isolate_max_targets is not None and self.isolate_max_targets < 1:
+            raise ValueError("isolate_max_targets must be >= 1")
+        if self.isolate_rotation < 0:
+            raise ValueError("isolate_rotation must be >= 0")
         if self.isolate_ranks is not None and not self.isolate_ranks:
             raise ValueError("isolate_ranks must name at least one cluster rank")
         if self.isolate_warps is not None and not self.isolate_warps:
@@ -307,6 +325,9 @@ class StressResult:
     strategy: str = STRATEGY_RANDOM
     # The isolate targets in search order (`DelayTarget.to_dict()`).
     targets: List[Dict[str, Any]] = field(default_factory=list)
+    # How many targets the kernels had, when `isolate_max_targets` limited the
+    # search to a window of them; None otherwise.
+    targets_total: Optional[int] = None
     # Schedule shape the counts were accumulated against, recorded by
     # `run_stress`. A resume locates the remaining trials by counting the
     # ones already run, so it must reuse this shape; None for results
@@ -325,6 +346,7 @@ class StressResult:
             "planned_trials": self.planned_trials,
             "budget_exhausted": self.budget_exhausted,
             "targets": list(self.targets),
+            "targets_total": self.targets_total,
             "delay_ladder_ns": (
                 None if self.delay_ladder_ns is None else list(self.delay_ladder_ns)
             ),
@@ -780,6 +802,18 @@ def _isolate_targets(  # noqa: C901
     return targets
 
 
+def _target_window(
+    config: StressConfig, targets: List[DelayTarget]
+) -> List[DelayTarget]:
+    """The rotating window of `targets` a search with `isolate_max_targets`
+    tries; all of them without a cap or when they fit."""
+    limit = config.isolate_max_targets
+    if limit is None or len(targets) <= limit:
+        return targets
+    start = config.isolate_rotation * limit % len(targets)
+    return [targets[(start + i) % len(targets)] for i in range(limit)]
+
+
 def _restored_targets(checkpoint: Sequence[Mapping[str, Any]]) -> List[DelayTarget]:
     """The isolate targets a checkpoint recorded, in their original order.
 
@@ -974,6 +1008,7 @@ def _validate_target_launch(  # noqa: C901
     kernel_checksums = {checksum for _name, checksum in kernel_identities}
     matched_launch = False
     matched_without_cluster = False
+    multi_cta_without_warp = False
     try:
         names = os.listdir(output_dir)
     except OSError as exc:
@@ -1001,6 +1036,9 @@ def _validate_target_launch(  # noqa: C901
                     matched_launch = True
                     block_warps = _block_warps(event)
                     if block_warps is None or warp >= block_warps:
+                        multi_cta_without_warp |= (
+                            cluster_rank is not None and _cluster_size(event) > 1
+                        )
                         continue
                     if cluster_rank is None:
                         return None
@@ -1012,6 +1050,8 @@ def _validate_target_launch(  # noqa: C901
             read_errors.append(f"{name}: {exc}")
     if read_errors:
         return "kernel launch evidence is unreadable: " + "; ".join(read_errors)
+    if multi_cta_without_warp:
+        return f"{label} has no live warp in the matching multi-CTA kernel launch"
     if matched_without_cluster:
         return (
             f"{label} needs a multi-CTA cluster launch, but the matching "
@@ -1703,7 +1743,17 @@ def result_verdict(result: StressResult) -> Verdict:
             ],
         )
     reasons = _incomplete_reasons(result)
-    return Verdict(VERDICT_INCOMPLETE, reasons) if reasons else Verdict(VERDICT_CLEAN)
+    if reasons:
+        return Verdict(VERDICT_INCOMPLETE, reasons)
+    if result.targets_total is not None:
+        return Verdict(
+            VERDICT_CLEAN,
+            [
+                f"isolate covered {len(result.targets)} of {result.targets_total} "
+                "targets (a rotating window)"
+            ],
+        )
+    return Verdict(VERDICT_CLEAN)
 
 
 def run_stress(  # noqa: C901
@@ -1767,6 +1817,7 @@ def run_stress(  # noqa: C901
     triggering = None if resume is None else resume.triggering
     stop = False
     targets: List[DelayTarget] = []
+    targets_total: Optional[int] = None if resume is None else resume.targets_total
     restored_targets = False
     if get_mode(config.strategy).isolates_targets:
         if resume is not None and resume.targets:
@@ -1800,7 +1851,10 @@ def run_stress(  # noqa: C901
                     "resuming an isolate search needs explicit isolate_ranks and "
                     "isolate_warps"
                 )
-            targets = _isolate_targets(config, baseline.geometries)
+            discovered = _isolate_targets(config, baseline.geometries)
+            targets = _target_window(config, discovered)
+            if len(targets) < len(discovered):
+                targets_total = len(discovered)
     schedule = _trial_schedule(config, targets)
     planned_trials = len(schedule)
     if resume is not None:
@@ -1877,6 +1931,7 @@ def run_stress(  # noqa: C901
             rejected_config_paths=list(rejected_config_paths),
             strategy=config.strategy,
             targets=[target.to_dict() for target in targets],
+            targets_total=targets_total,
             delay_ladder_ns=list(config.delay_ladder_ns),
             attempts_per_delay=config.attempts_per_delay,
             planned_trials=planned_trials,
@@ -1966,6 +2021,7 @@ def run_stress(  # noqa: C901
         rejected_config_paths=list(rejected_config_paths),
         strategy=config.strategy,
         targets=[target.to_dict() for target in targets],
+        targets_total=targets_total,
         delay_ladder_ns=list(config.delay_ladder_ns),
         attempts_per_delay=config.attempts_per_delay,
         planned_trials=planned_trials,
