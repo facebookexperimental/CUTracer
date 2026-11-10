@@ -726,10 +726,23 @@ def _drain_output(
             _signal_process_group(process.pid, signal.SIGKILL)
             process.wait()
         if not text:
-            return exc.output, exc.stderr
+            # `TimeoutExpired` leaves a stream with no collected data as
+            # None; a captured stream must still read as bytes (as it does
+            # when `communicate` returns normally), or callers checking
+            # `isinstance(exc.stderr, bytes)` see a spurious None.
+            return (
+                bytes(exc.output)
+                if isinstance(exc.output, (bytes, bytearray))
+                else (b"" if process.stdout is not None else None),
+                bytes(exc.stderr)
+                if isinstance(exc.stderr, (bytes, bytearray))
+                else (b"" if process.stderr is not None else None),
+            )
         return (
-            _decode_drained_output(exc.output, process.stdout),
-            _decode_drained_output(exc.stderr, process.stderr),
+            _decode_drained_output(exc.output, process.stdout)
+            or ("" if process.stdout is not None else None),
+            _decode_drained_output(exc.stderr, process.stderr)
+            or ("" if process.stderr is not None else None),
         )
 
 
