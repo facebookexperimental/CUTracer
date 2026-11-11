@@ -126,6 +126,40 @@ def text_failure(callstack: str, rootdir: Path) -> tuple[str, Optional[List[Any]
     return exception, None
 
 
+def _drop_modules_under(rootdir: Path) -> None:
+    """Remove modules loaded from `rootdir` from `sys.modules`.
+
+    `pytest.main` leaves the test module (and anything it imported from
+    under the root, such as a helper in an installed-package tree in the
+    root) in `sys.modules`, keyed by module name alone. A second worker
+    run in the same process for a different root that has a file with the
+    same name (a plain `test_x.py` is the common case) would then reuse
+    the stale module and judge the previous project's file instead of
+    the one pytest just collected. Dropping the root's modules after a
+    run lets the next run import its own files.
+    """
+    root = Path(rootdir).resolve()
+    for name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        candidates: List[Any] = [getattr(module, "__file__", None)]
+        module_path = getattr(module, "__path__", None)
+        if isinstance(module_path, (str, os.PathLike)):
+            candidates.append(module_path)
+        elif module_path is not None:
+            candidates.extend(module_path)
+        for candidate in candidates:
+            if not isinstance(candidate, (str, os.PathLike)):
+                continue
+            try:
+                path = Path(candidate).resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if path.is_relative_to(root):
+                sys.modules.pop(name, None)
+                break
+
+
 def child_failure(error: BaseException, rootdir: Path) -> Optional[tuple[str, Any]]:
     """For a torchelastic launch whose child failed (`ChildFailedError`), the
     first failed child's exception type and assertion site, from the
@@ -489,20 +523,27 @@ def run_worker(args: argparse.Namespace) -> int:
                 }
             )
 
-    code = pytest.main(
-        [
-            "--rootdir",
-            str(args.rootdir),
-            f"--import-mode={args.import_mode}",
-            "-q",
-            "-s",
-            "-p",
-            "no:cacheprovider",
-            *args.pytest_args,
-            str(args.rootdir / args.nodeid),
-        ],
-        plugins=[Outcomes()],
-    )
+    # A previous in-process run (or the host process) may have left this
+    # root's test modules in `sys.modules` under names the new collection
+    # would reuse for changed files; start from the files on disk.
+    _drop_modules_under(args.rootdir)
+    try:
+        code = pytest.main(
+            [
+                "--rootdir",
+                str(args.rootdir),
+                f"--import-mode={args.import_mode}",
+                "-q",
+                "-s",
+                "-p",
+                "no:cacheprovider",
+                *args.pytest_args,
+                str(args.rootdir / args.nodeid),
+            ],
+            plugins=[Outcomes()],
+        )
+    finally:
+        _drop_modules_under(args.rootdir)
     state["pytest_exit"] = int(code)
     _write_json(args.worker_report, state)
     return int(code)
