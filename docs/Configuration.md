@@ -41,7 +41,7 @@ When an analysis auto-enables an instrumentation type, you do **not** need to re
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `CUTRACER_OUTPUT_DIR` | path | `""` (current working directory) | Output directory for trace files. Must already exist, be a directory (not a file), and be writable |
+| `CUTRACER_OUTPUT_DIR` | path | `""` (current working directory) | Output directory for trace files. Created, with its parents, if it does not exist; must be a writable directory |
 | `CUTRACER_TRACE_FORMAT` | string or int | `ndjson` (`2`) | Trace output format. Accepts string names (case-insensitive) or numeric values. See values below |
 | `CUTRACER_ZSTD_LEVEL` | int | `9` | Zstd compression level (1–22). Only takes effect when format is `zstd` (`1`) |
 
@@ -79,7 +79,7 @@ Unrecognized string names or out-of-range numeric values cause a fatal error.
 |----------|---------------------------|-------------|
 | `mma` | HGMMA, UTCHMMA, UTCIMMA, UTCQMMA, UTCOMMA | Matrix Multiply-Accumulate |
 | `tma` | UTMALDG, UTMASTG, UTMAREDG | Tensor Memory Access |
-| `sync` | WARPGROUP.DEPBAR | Synchronization |
+| `sync` | WARPGROUP.DEPBAR, SYNCS.\*, BAR.SYNC, BAR.ARV, DEPBAR.\* | Synchronization |
 
 - Case-insensitive
 - Empty or unset means all instructions are instrumented (no filtering)
@@ -96,6 +96,23 @@ python3 your_kernel.py
 
 ---
 
+## Targeted Capture
+
+These variables narrow a trace capture to one kernel, one launch, some warps or some instructions. `cutracer trace` has no flags for them but passes them through from the environment, and the diagnosis service sets them for its follow-up traces. Every `kernel_metadata` header records the trace selectors in effect.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CUTRACER_EXACT_KERNEL_NAME` | string | unset | Instrument only the launch root whose mangled or unmangled name is exactly this and whose checksum is `CUTRACER_EXACT_KERNEL_CHECKSUM`, plus its device callees. Set both or neither: one without the other is a fatal error. `KERNEL_FILTERS` is ignored while they are set |
+| `CUTRACER_EXACT_KERNEL_CHECKSUM` | string | unset | Kernel checksum of that launch root, as in trace file names (`kernel_<checksum>_...`) |
+| `CUTRACER_TRACE_LAUNCH_ID` | uint64 | unset (all launches) | Write `reg_trace`, `mem_addr_trace` and `mem_value_trace` records only for the launch with this `kernel_launch_id` |
+| `CUTRACER_TRACE_WARP_MASK` | uint32 (hex or decimal) | `0` (all warps) | Write those records only for the CTA-local warps whose bits are set, e.g. `0xF` for warps 0–3 |
+| `CUTRACER_TRACE_PC_OFFSETS` | string (comma-separated, hex or decimal) | `""` (all instructions) | Instrument only the instructions at these function-relative SASS PC offsets, at most 32. An invalid token or more than 32 offsets disables trace records |
+| `CUTRACER_TRACE_INSTR_CATEGORIES` | string (comma-separated) | `""` (all instructions) | Instrument only instructions of these categories (`mma`, `tma`, `sync`), on top of `CUTRACER_INSTR_CATEGORIES` |
+
+Random-delay targeting has its own variables (`CUTRACER_DELAY_WARPGROUP_ID`, `CUTRACER_DELAY_WARP_MASK`); these selectors do not change where delays are injected.
+
+---
+
 ## Delay Injection Configuration (random_delay analysis)
 
 | Variable | Type | Default | Description |
@@ -106,13 +123,15 @@ python3 your_kernel.py
 | `CUTRACER_CLUSTER_CTA_ID` | int | `-1` (disabled) | Restrict delay injection to a specific CTA ID (used with `cluster*` modes). Setting this together with `CUTRACER_DELAY_LOAD_PATH` produces non-bit-identical replays |
 | `CUTRACER_DELAY_WARP_MASK` | uint32 | `0` (disabled) | Delay only the CTA-local warps whose bits are set (hex or decimal), with a fixed delay. With a `cluster*` mode, only those warps of the selected CTA of each cluster are delayed |
 | `CUTRACER_DELAY_WARPGROUP_ID` | int | `-1` (disabled) | Delay only warpgroup N (warps `[4N..4N+3]`); wins over `CUTRACER_DELAY_WARP_MASK`. Combines with `cluster*` modes the same way |
+| `CUTRACER_DELAY_ENABLE_PROB` | float | `0.5` | Probability that each instrumentation point is enabled while recording (0.0–1.0; a value outside the range is FATAL). Use `1.0` with warp targeting. No effect in replay mode |
+| `CUTRACER_DELAY_PATTERNS` | string (comma-separated) | `""` (built-in patterns) | SASS instruction substrings to inject delays before, replacing the built-in patterns. `*` matches every instruction |
 | `CUTRACER_DELAY_DUMP_PATH` | path | `""` (disabled) | Output path for delay config JSON (dump mode — records random delay pattern) |
 | `CUTRACER_DELAY_LOAD_PATH` | path | `""` (disabled) | Input path for delay config JSON (replay mode — deterministically reproduces a recorded pattern) |
 | `CUTRACER_DELAY_SEED` | uint64 | random | Seed of the per-point on/off choices. Processes that share it make the same choices and merge their writes to `CUTRACER_DELAY_DUMP_PATH`; `cutracer trace --delay-dump-path` and `cutracer stress` set one per run |
 
 > ⚠️ `CUTRACER_DELAY_DUMP_PATH` and `CUTRACER_DELAY_LOAD_PATH` are **mutually exclusive**. Setting both causes a FATAL exit.
 
-See [Analyses](Analyses.md#data-race-detection-random_delay) for full usage details including dump/replay workflow.
+See [Analyses](Analyses.md#data-race-detection-random_delay-) for full usage details including dump/replay workflow.
 
 ---
 
@@ -220,14 +239,18 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_CLUSTER_CTA_ID` | Delay Injection |
 | `CUTRACER_CPU_CALLSTACK` | Advanced — Callstack |
 | `CUTRACER_DELAY_DUMP_PATH` | Delay Injection |
+| `CUTRACER_DELAY_ENABLE_PROB` | Delay Injection |
 | `CUTRACER_DELAY_LOAD_PATH` | Delay Injection |
 | `CUTRACER_DELAY_MIN_NS` | Delay Injection |
 | `CUTRACER_DELAY_MODE` | Delay Injection |
 | `CUTRACER_DELAY_NS` | Delay Injection |
+| `CUTRACER_DELAY_PATTERNS` | Delay Injection |
 | `CUTRACER_DELAY_SEED` | Delay Injection |
 | `CUTRACER_DELAY_WARP_MASK` | Delay Injection |
 | `CUTRACER_DELAY_WARPGROUP_ID` | Delay Injection |
 | `CUTRACER_DUMP_CUBIN` | Debug |
+| `CUTRACER_EXACT_KERNEL_CHECKSUM` | Targeted Capture |
+| `CUTRACER_EXACT_KERNEL_NAME` | Targeted Capture |
 | `CUTRACER_INSTR_CATEGORIES` | Instruction Category Filtering |
 | `CUTRACER_INSTRUMENTATION_PLAN` | Advanced — Instrumentation Plans |
 | `CUTRACER_INSTRUMENT` | Core |
@@ -240,7 +263,11 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_RUN_ID` | Advanced — Runtime Identity |
 | `CUTRACER_RUNTIME_IDENTITY` | Advanced — Runtime Identity |
 | `CUTRACER_TRACE_FORMAT` | Output |
+| `CUTRACER_TRACE_INSTR_CATEGORIES` | Targeted Capture |
+| `CUTRACER_TRACE_LAUNCH_ID` | Targeted Capture |
+| `CUTRACER_TRACE_PC_OFFSETS` | Targeted Capture |
 | `CUTRACER_TRACE_SIZE_LIMIT_MB` | Advanced — Runtime Limits |
+| `CUTRACER_TRACE_WARP_MASK` | Targeted Capture |
 | `CUTRACER_WORKER_ID` | Advanced — Runtime Identity |
 | `CUTRACER_ZSTD_LEVEL` | Output |
 | `INSTR_BEGIN` | Core |

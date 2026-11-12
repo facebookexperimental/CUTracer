@@ -1,14 +1,10 @@
 # CUTracer Python Module
 
-Python tools for CUTracer trace validation, parsing, and analysis.
+The `cutracer` Python package is the `cutracer` command and the Python APIs behind it.
 
 ## Overview
 
-The `cutracer` Python package provides a comprehensive framework for working with CUTracer trace files. This module is designed to be:
-- **Reusable**: Import and use in your own Python scripts
-- **Testable**: Full unittest suite with real trace data
-- **Type-safe**: Type hints and mypy compatibility
-- **Extensible**: Plugin architecture for future enhancements
+The package captures traces by running a program under `cutracer.so`; reads, queries and validates the traces; drives random-delay stress, oracles and reduction; runs NVIDIA Compute Sanitizer; and hosts the automated diagnosis service behind `cutracer diagnose`. It does not contain `cutracer.so`: build that from the repository root as the [main README](https://github.com/facebookexperimental/CUTracer#installation) describes.
 
 ## Installation
 
@@ -26,42 +22,45 @@ cd /path/to/CUTracer/python
 pip install .
 ```
 
+`pip install cutracer` installs the latest release from PyPI instead, and `pip install --pre cutracer` the nightly build.
+
 ### Optional CLP Support
 
-`cutracer query` on `.clp` archives needs the `clp` extra. Its
-`yscope_clp_core` dependency only ships x86_64 wheels, so the extra cannot be
-installed on aarch64:
+`cutracer query` on `.clp` archives needs the `clp` extra. Its `yscope_clp_core` dependency only ships x86_64 wheels, so the extra cannot be installed on aarch64:
 
 ```bash
 pip install ".[clp]"
 ```
 
-## Features
+## Package Layout
 
-### Trace Validation (Current)
-
-- **JSON Validation**: Validate NDJSON trace files (mode 2) for syntax and schema compliance
-- **Text Validation**: Validate text-format trace files (mode 0) for format compliance
-- **Cross-Format Consistency**: Compare different trace formats for data consistency
-
-### Planned Features
-
-- **Trace Parsing**: Parse trace files into structured Python objects
-- **Analysis Tools**: Instruction histograms, performance metrics, trace comparison
-- **Format Conversion**: Convert between different trace formats
-- **Compression Support**: Handle zstd-compressed traces (mode 1)
+| Module | Contents |
+|--------|----------|
+| `cutracer.cli` | Entry point of the `cutracer` command |
+| `cutracer.runner` | `cutracer trace`: finds `cutracer.so`, sets its environment variables and runs the target |
+| `cutracer.query` | Trace readers (NDJSON, Zstd, CLP), `cutracer query`, the SASS dumper behind `cutracer sass`, and the warp summary |
+| `cutracer.validation` | JSON Schemas and the validators behind `cutracer validate` and `cutracer compare` |
+| `cutracer.analyze` | The `cutracer analyze` group (`warp-summary`) |
+| `cutracer.stress` | `cutracer stress`: delay-injection search with control runs and verdicts |
+| `cutracer.oracle` | `cutracer oracle`: runs a pytest node as a stress or reduce oracle |
+| `cutracer.reduce` | `cutracer reduce`: delta debugging of delay configs |
+| `cutracer.compute_sanitizer` | `cutracer compute-sanitizer` and the racecheck log parser |
+| `cutracer.service` | The automated diagnosis service behind `cutracer diagnose` and the `diagnose-*` commands |
+| `cutracer.debugger` | Hang analysis of `cuda-gdb` samples: warp states and the instruction each warp is blocked on |
+| `cutracer.isa` | Instruction decoders, including the AMDGPU replay helpers in `cutracer.isa.amdgcn` |
+| `cutracer.watchdog` | Recognizes runs that CUTracer's own watchdog ended |
+| `cutracer.kernel_config` | Kernel-level configuration extracted from trace metadata |
+| `cutracer.file_utils`, `cutracer.runtime_version`, `cutracer.types`, `cutracer.shared_vars`, `cutracer.cutracer_logger` | Shared helpers: file identities, the runtime version, type definitions, build detection and logging |
 
 ## Usage
 
 ### CLI
 
-After installation, the `cutracer` command provides a unified interface for
-tracing, querying, and analyzing CUDA traces:
+After installation, the `cutracer` command traces, queries, validates and analyzes CUDA kernels. The [main README](https://github.com/facebookexperimental/CUTracer#commands) lists every command, and `cutracer <command> --help` shows its flags:
 
 ```bash
-# Trace a CUDA application (requires cutracer.so — see main README for build)
-export CUTRACER_LIB_PATH=/path/to/CUTracer/lib
-cutracer trace -i tma_trace -- python test.py
+# Trace a CUDA application (needs cutracer.so; run from the repository root or pass --cutracer-so)
+cutracer trace --cutracer-so /path/to/CUTracer/lib/cutracer.so -i reg_trace -- python test.py
 
 # Validate trace files
 cutracer validate kernel_trace.ndjson
@@ -71,6 +70,12 @@ cutracer query trace.ndjson --filter "warp=24"
 
 # Analyze traces
 cutracer analyze warp-summary trace.ndjson
+
+# Search for a delay config that triggers a bug
+cutracer stress -k my_kernel -o /tmp/stress -- ./oracle.sh
+
+# Run NVIDIA Compute Sanitizer
+cutracer compute-sanitizer --tool racecheck -- python test.py
 ```
 
 ### Python API
@@ -104,39 +109,7 @@ else:
     print(f"✗ Inconsistencies found: {result['differences']}")
 ```
 
-## Module Structure
-
-```
-python/
-├── cutracer/                        # Main package
-│   ├── __init__.py                  # Package entry point with version
-│   └── validation/                  # Validation framework
-│       ├── __init__.py              # Validation API exports
-│       ├── schema_loader.py         # JSON Schema loader
-│       ├── json_validator.py        # JSON syntax & schema validation
-│       ├── text_validator.py        # Text format validation
-│       ├── consistency.py           # Cross-format consistency checks
-│       └── schemas/                 # JSON Schema definitions
-│           ├── __init__.py
-│           ├── reg_trace.schema.json
-│           ├── mem_trace.schema.json
-│           ├── opcode_only.schema.json
-│           └── delay_config.schema.json
-├── tests/                           # Unit tests
-│   ├── __init__.py
-│   ├── test_base.py                 # Base test class and utilities
-│   ├── test_schemas.py              # Schema loading tests
-│   ├── test_json_validator.py       # JSON validation tests
-│   ├── test_text_validator.py       # Text validation tests
-│   ├── test_consistency.py          # Consistency check tests
-│   └── example_inputs/              # Real trace data for tests
-│       ├── reg_trace_sample.ndjson
-│       ├── reg_trace_sample.log
-│       ├── invalid_syntax.ndjson
-│       └── invalid_schema.ndjson
-├── pyproject.toml                   # Modern Python project config
-└── README.md                        # This file
-```
+Trace capture, stress, replay and Compute Sanitizer runs also have typed configs for driving CUTracer without its command line: `cutracer.runner.InstrumentationConfig`, `cutracer.stress.stress.StressConfig`, `cutracer.reduce.reduce.ReplayConfig` and `cutracer.compute_sanitizer.run.ComputeSanitizerConfig`. The diagnosis service uses them.
 
 ## Development
 
@@ -212,6 +185,8 @@ The consistency validator compares:
 - **Timestamp Order**: Consistent ordering between formats
 
 ## Trace Format Reference
+
+[Outputs and File Formats](https://github.com/facebookexperimental/CUTracer/blob/main/docs/Outputs-and-File-Formats.md) documents every record type and field. The two most common formats look like this.
 
 ### JSON Format (NDJSON - Mode 2)
 

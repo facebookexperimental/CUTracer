@@ -1,333 +1,236 @@
+<p align="center"><img src="logo.svg" alt="CUTracer logo" width="120"></p>
+
 # CUTracer
 
-CUTracer is a CUDA binary instrumentation tool built on [NVBit](https://github.com/NVlabs/NVBit). It cleanly separates lightweight data collection (instrumentation) from host-side processing (analysis). Typical workflows include per-warp instruction histograms (delimited by GPU clock reads) and kernel hang detection.
+[![PyPI](https://img.shields.io/pypi/v/cutracer)](https://pypi.org/project/cutracer/)
 
-## Features
+CUTracer is a debugging toolkit for NVIDIA GPU kernels. Its runtime library, `cutracer.so`, uses [NVBit](https://github.com/NVlabs/NVBit) to instrument CUDA kernels at the SASS level as they load, so the application does not have to be rebuilt. The `cutracer` command runs a program under that library to record per-warp traces, to inject delays that make timing-dependent races fail visibly, or to stop a hung kernel and report what each warp was doing. It also runs NVIDIA Compute Sanitizer, searches for and shrinks delay configs that trigger a race, and queries and validates traces.
 
--   NVBit-powered, runtime attach via `CUDA_INJECTION64_PATH` (no app rebuild needed)
--   Multiple instrumentation modes: opcode-only, register trace, memory trace, random delay
--   Built-in analyses:
-    -   Instruction Histogram (for Proton/Triton workflows)
-    -   Deadlock/Hang Detection
-    -   Data Race Detection
--   CUDA Graph and stream-capture aware flows
--   Deterministic kernel log file naming and CSV outputs
+CUTracer supports Hopper (SM90), Blackwell (SM100) and later GPUs. Analyzing saved traces needs no GPU.
+
+## What it is for
+
+| Problem | Start with |
+|---|---|
+| A kernel hangs | `cutracer trace -a deadlock_detection` classifies each warp as waiting at a barrier, looping or progressing, prints a warp report and ends the run |
+| Results change between runs, or a race is suspected | `cutracer stress` injects delays until a test fails and saves the delay config that made it fail; `cutracer reduce` shrinks that config to the delay points that matter |
+| Out-of-bounds or misaligned accesses, shared-memory races, uninitialized reads, barrier misuse | `cutracer compute-sanitizer` runs NVIDIA Compute Sanitizer's memcheck, racecheck, initcheck or synccheck |
+| A failing test needs a first diagnosis | `cutracer diagnose` runs Compute Sanitizer (and stress, given a correctness oracle) on it, follows up with traces and writes one report |
+| A kernel computes wrong values | `cutracer trace -i reg_trace` or `-i mem_value_trace` records what each instruction read or wrote, and `cutracer query` filters the records |
+| You want the instruction mix of a Triton kernel region | `cutracer trace -a proton_instr_histogram` counts SASS instructions per warp between clock reads (see [Triton/Proton Integration](docs/Triton_Proton-Integration.md)) |
 
 ## Requirements
 
-All requirements are aligned with NVBit.
-
-Unique requirements:
-- **libzstd**: Required for trace compression
+- Linux on x86_64 or aarch64, with a Hopper or newer NVIDIA GPU for capture
+- A CUDA toolkit with `nvcc` to build `cutracer.so`; [`scripts/install_cuda.sh`](scripts/install_cuda.sh) installs one without root (see [Quickstart](docs/Quickstart.md))
+- libzstd, preferably with its static library so that `cutracer.so` is self-contained
+- NVBit 1.8.1 or newer, which `./install_third_party.sh` downloads
+- Python 3.10 or newer for the `cutracer` command
+- NVIDIA Compute Sanitizer, part of the CUDA toolkit, for `cutracer compute-sanitizer` and `cutracer diagnose`
 
 ## Installation
 
-1. Clone the repository:
+### 1. Build `cutracer.so`
 
 ```bash
-cd ~
-git clone git@github.com:facebookexperimental/CUTracer.git
+git clone https://github.com/facebookexperimental/CUTracer.git
 cd CUTracer
-```
 
-2. Install system dependencies (libzstd static library for self-contained builds):
-
-```bash
-# Ubuntu/Debian
-# On most Ubuntu/Debian systems, libzstd-dev provides both shared and static libs (libzstd.a).
-# You can verify this with: dpkg -L libzstd-dev | grep 'libzstd.a'
-# If your distribution does not ship the static library in libzstd-dev, you may need to
-# build zstd from source or install a distro-specific static libzstd package.
+# libzstd on Ubuntu/Debian (libzstd-dev normally includes libzstd.a)
 sudo apt-get install libzstd-dev
-
-# CentOS/RHEL/Fedora (static library for portable builds)
+# libzstd on CentOS/RHEL/Fedora
 sudo dnf install libzstd-static
 
-# If static library is not available, the build will fall back to dynamic linking
-# and display a warning. The resulting binary will not be self-contained.
+./install_third_party.sh   # NVBit, nlohmann/json, RapidJSON, PicoSHA2
+make -j$(nproc)            # writes lib/cutracer.so
 ```
 
-3. Download third-party dependencies:
+`make` builds for every GPU architecture; `make ARCH=sm_90` builds for one and is faster. Without the static libzstd, the build links libzstd dynamically and prints a warning.
+
+### 2. Install the `cutracer` command
+
+The [`cutracer`](https://pypi.org/project/cutracer/) package on PyPI holds the Python command only, not `cutracer.so`. Trace files are versioned with the `cutracer.so` that wrote them, so use a command from the same version:
 
 ```bash
-./install_third_party.sh
+pip install --pre cutracer   # nightly build, for a cutracer.so built from main
+pip install cutracer         # latest release, for a cutracer.so built from its tag (git checkout v<version>)
+pip install ./python         # the command from this checkout
 ```
 
-This will download:
-- NVBit (NVIDIA Binary Instrumentation Tool)
-- nlohmann/json (JSON library for C++)
-- RapidJSON (JSON serialization headers)
-- PicoSHA2 1.0.1 (SHA-256 headers, checksum-verified and shared with the internal build)
+`cutracer --version` prints the installed version. Reading CLP archives (`--trace-format clp`) needs `pip install 'cutracer[clp]'`, which is available on x86_64 only.
 
-4. Build the tool:
+### 3. Smoke test
+
+`cutracer trace` finds `lib/cutracer.so` when it runs from the repository root; from anywhere else, pass `--cutracer-so /path/to/CUTracer/lib/cutracer.so`. From the repository root:
 
 ```bash
-make -j$(nproc)
-```
-
-## Quickstart
-
-### 1. Install the Python packages from PyPI
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate   # Python 3.10-3.13
-
 pip install torch==2.13.0 numpy --index-url https://download.pytorch.org/whl/cu130
-
-# fbtriton is Meta's Triton fork with TLX. It ships the same `triton` package
-# as the upstream Triton that torch pulls in, so swap one for the other.
-pip uninstall -y triton
-pip install --no-deps fbtriton
-
-# Nightly CLI: matches the trace format of a cutracer.so built from main.
-pip install --pre cutracer
-```
-
-The `cutracer` wheel contains the CLI only; `cutracer.so` still has to be
-built from this repo (see [Installation](#installation)). The latest stable
-release, `cutracer==0.3.0`, cannot validate traces from a `cutracer.so` built
-from main. To use it, build `cutracer.so` from the `v0.3.0` tag instead.
-
-To use the CLI from a source checkout instead: `cd ~/CUTracer/python && pip install .`
-
-Smoke test from the repo root:
-
-```bash
-cutracer trace -i mem_addr_trace -k triton_poi_fused -o /tmp/ct_quickstart \
-  -- python tests/py_add/test_add.py
+cutracer trace -i mem_addr_trace -k triton_poi_fused -o /tmp/ct_quickstart -- python tests/py_add/test_add.py
 cutracer validate "$(ls /tmp/ct_quickstart/*.ndjson | head -1)"
 ```
 
-### 2. Run your CUDA app with CUTracer
+The test compiles a small kernel with `torch.compile`, and `-k triton_poi_fused` selects it.
+
+## Usage
+
+### Trace a kernel
+
+`cutracer trace [flags] -- <command>` runs the command with `cutracer.so` injected. `-i` selects what to record:
+
+| Mode | Records |
+|---|---|
+| `opcode_only` | PC and opcode per warp |
+| `reg_trace` | Register values, before the instruction executes |
+| `mem_addr_trace` | The 32 lane addresses of each memory instruction |
+| `mem_value_trace` | Addresses and the values loaded or stored, after the instruction executes |
+| `tma_trace` | The descriptor address and transfer parameters of each TMA instruction |
+| `random_delay` | Nothing; it injects delays before synchronization instructions (see below) |
+
+Without `-i`, CUTracer only logs kernel launches (name, grid and block dimensions, shared memory) and writes no trace files.
 
 ```bash
-# Option A: Set CUTRACER_LIB_PATH once (recommended)
-export CUTRACER_LIB_PATH=~/CUTracer/lib
-cutracer trace -i tma_trace -- ./your_app
-
-# Option B: Specify cutracer.so explicitly
-cutracer trace -i tma_trace --cutracer-so ~/CUTracer/lib/cutracer.so -- ./your_app
-
-# Option C: Run from the CUTracer project root (auto-discovers ./lib/cutracer.so)
-cd ~/CUTracer
-cutracer trace -i tma_trace -- ./your_app
-
-# Option D: Kernel launch logger only (no instrumentation, no trace files)
-cutracer trace -- ./your_app
+cutracer trace -i reg_trace -k my_kernel -o traces -- python my_test.py
+cutracer query traces/<trace>.ndjson --filter "warp=24"
+cutracer query traces/<trace>.ndjson --group-by sass --count --top 20
 ```
 
-### 3. Analyze the output
+Each launch of a matching kernel writes `kernel_<checksum>_iter<N>_pid<pid>_<name>.ndjson`, next to the kernel's `.cubin` (`cutracer sass` disassembles it) and CUTracer's log, `cutracer_main_<time>_<pid>.log`. `-k` takes comma-separated kernel name substrings. `--instr-categories mma,tma,sync`, `INSTR_BEGIN`/`INSTR_END` and the targeted capture variables in [Configuration](docs/Configuration.md) narrow a capture further. An [instrumentation plan](docs/Instrumentation-Plans.md) captures chosen registers at exact PCs of a known CUBIN (SM100a), and `CUTRACER_RUNTIME_IDENTITY=1` writes a manifest that binds each launch to its process, module and CUBIN.
+
+### Debug a hang
 
 ```bash
-cutracer analyze warp-summary output.ndjson
-cutracer query output.ndjson --filter "warp=24"
-cutracer validate output.ndjson
+cutracer trace -a deadlock_detection --channel-records 1 -k my_kernel -o hang -- python my_test.py
+cutracer analyze warp-summary hang/<trace>.ndjson
 ```
 
-> **Note**: You can also use CUTracer without the Python CLI by setting the
-> `CUDA_INJECTION64_PATH` environment variable directly:
-> ```bash
-> CUDA_INJECTION64_PATH=~/CUTracer/lib/cutracer.so ./your_app
-> ```
+`-a deadlock_detection` turns on `reg_trace`, classifies each warp as `BARRIER`, `LOOPING` or `PROGRESSING`, prints a warp report and ends a hung run with SIGTERM, then SIGKILL (exit status 241 or 247). `--channel-records 1` flushes every record, so the trace reaches the moment of the hang. Without this analysis, `--no-data-timeout-s` (default 15 s) still ends a run whose kernels stop sending records, and `--kernel-timeout-s` ends a kernel that runs too long; `0` turns either off.
+
+### Find and shrink a data race
+
+A data race depends on timing, so a buggy kernel can pass by luck. `random_delay` injects random per-thread delays before synchronization instructions, which makes such races fail visibly. `cutracer stress` automates the search: it runs an oracle command (exit 0 when the bug reproduced, non-zero otherwise) under several delay strategies, after control runs with every delay turned off, and saves the first delay config that reproduces the bug.
+
+```bash
+cutracer stress -k my_kernel --confirm -o /tmp/stress -- ./oracle.sh
+```
+
+`/tmp/stress/stress_report.json` gives the verdict: `finding` when the injected delay made the difference, `suspect` when the failure cannot be credited to the delay (for example, it also happens without one), `clean` when every planned attempt ran and none reproduced, and `incomplete` otherwise. `--confirm` checks a finding by shrinking it to the delay points that matter and replaying the result, and `cutracer stress` prints the `cutracer reduce` command for the saved config. `cutracer oracle pytest` turns one pytest node into an oracle without a wrapper script.
+
+To record, replay and shrink a delay config by hand:
+
+```bash
+cutracer trace -a random_delay --delay-ns 10000 --delay-dump-path cfg.json -- ./app   # record which delay points were on
+cutracer trace -a random_delay --delay-ns 10000 --delay-load-path cfg.json -- ./app   # replay the same points
+cutracer reduce -c cfg.json -t ./oracle.sh --strategy bisect --confidence-runs 3      # keep only the points that trigger the bug
+```
+
+[Analyses](docs/Analyses.md) describes the delay modes, the stress strategies and the config format.
+
+### Run Compute Sanitizer
+
+```bash
+cutracer compute-sanitizer --tool memcheck -o /tmp/sani -- python my_test.py
+```
+
+`--tool` is `racecheck` (the default), `memcheck`, `initcheck` or `synccheck`, and the log goes to `/tmp/sani/memcheck.log`. Compute Sanitizer and NVBit cannot share a process, so this is a separate run from `cutracer trace`. Pass the target's environment with `--env KEY=VAL`, because the command runs without a shell.
+
+### Diagnose a failing test
+
+```bash
+cutracer diagnose --toolchain-version <toolchain-id> --arch sm_100a --source-revision <commit> --out report.json -- python my_test.py
+```
+
+`cutracer diagnose` finds the kernels the command launches (up to `--max-kernels`, default 32) and gives each its own session: all four Compute Sanitizer tools by default, random-delay stress when the target has a correctness oracle, and follow-up traces, replays and reductions. When the `claude` CLI is on `PATH`, an AI turn plans each follow-up; without it, the session falls back to deterministic decisions. Suppressions and per-scope baselines (`--baseline-dir`) limit AI turns to new findings and stress reproductions. A target can also be a work-unit JSON file or an approved `--preset`. See [Automated Diagnosis Service](docs/Automated-Diagnosis-Service.md).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `trace` | Run a command with CUTracer injected: record traces, inject delays, detect hangs or log kernel launches |
+| `query` | Filter, group and format trace records and kernel events |
+| `validate` | Check the syntax and schema of a trace file |
+| `compare` | Check that a text trace and an NDJSON trace of the same run agree |
+| `sass` | Disassemble a dumped `.cubin` with `nvdisasm` |
+| `analyze warp-summary` | List the completed, in-progress and missing warps of a trace |
+| `stress` | Search for a delay config that triggers a bug |
+| `oracle` | Run a pytest node as a `stress` or `reduce` oracle (`oracle pytest`), or write that oracle out as a script (`oracle export`) |
+| `reduce` | Shrink a delay config to the delay points that trigger a bug |
+| `compute-sanitizer` | Run NVIDIA Compute Sanitizer on a command |
+| `diagnose` | Run a bounded diagnosis session on a command, a work unit or a preset |
+| `diagnose-submit`, `diagnose-run`, `diagnose-status`, `diagnose-resume`, `diagnose-run-*` | Submit, run and inspect distributed diagnosis runs |
+
+`cutracer <command> --help` shows a command's flags and examples, and `cutracer analyze --help` lists the analyses in your build.
+
+## Configuration
+
+Most `cutracer trace` flags set an environment variable that `cutracer.so` reads. Some features exist only as variables; `cutracer trace` passes them through to the command. The ones you are most likely to need:
+
+| Variable | Flag | Purpose |
+|---|---|---|
+| `CUTRACER_INSTRUMENT` | `-i` | Instrumentation modes |
+| `CUTRACER_ANALYSIS` | `-a` | `deadlock_detection`, `random_delay` or `proton_instr_histogram` |
+| `KERNEL_FILTERS` | `-k` | Kernel name substrings to instrument |
+| `CUTRACER_OUTPUT_DIR` | `-o` | Output directory, created if missing |
+| `CUTRACER_TRACE_FORMAT` | `--trace-format` | `ndjson` (default), `zstd`, `text` or `clp` |
+| `CUTRACER_NO_DATA_TIMEOUT_S`, `CUTRACER_KERNEL_TIMEOUT_S` | `--no-data-timeout-s`, `--kernel-timeout-s` | Hang watchdogs |
+| `CUTRACER_DELAY_*`, `CUTRACER_CLUSTER_CTA_ID` | `--delay-*` | Delay injection, dump and replay |
+| `INSTR_BEGIN`, `INSTR_END` | | Instrument only a range of static instruction indices |
+| `CUTRACER_EXACT_KERNEL_NAME`, `CUTRACER_EXACT_KERNEL_CHECKSUM` | | Instrument exactly one kernel, by full name and checksum |
+| `CUTRACER_TRACE_LAUNCH_ID`, `CUTRACER_TRACE_WARP_MASK`, `CUTRACER_TRACE_PC_OFFSETS` | | Record only one launch, some warps or some PCs |
+| `CUTRACER_INSTRUMENTATION_PLAN` | | Capture registers at the points a plan file names |
+| `CUTRACER_RUNTIME_IDENTITY` | | `1` writes the runtime identity manifest |
+
+[Configuration](docs/Configuration.md) lists every variable and its default. To run without the `cutracer` command, set `CUDA_INJECTION64_PATH=/path/to/CUTracer/lib/cutracer.so` and the variables yourself. `cutracer trace` sets `CUDA_INJECTION64_PATH` itself, and without `--cutracer-so` it refuses to start when the variable is already set.
 
 ## Agent skills
 
-Reusable CUTracer workflows for Codex, Claude, Muse, and other coding agents
-live under [`agentic/skills/`](agentic/README.md). The directory is the
-canonical source. Agents install or register matching skills with their own
-supported loader before use.
+Reusable CUTracer workflows for Codex, Claude, Muse, and other coding agents live under [`agentic/skills/`](agentic/README.md). The directory is the canonical source. Agents install or register matching skills with their own supported loader before use.
 
-## Configuration (env vars)
-
--   `CUTRACER_INSTRUMENT`: comma-separated modes: `opcode_only`, `reg_trace`, `mem_trace`, `random_delay`
--   `CUTRACER_ANALYSIS`: comma-separated analyses: `proton_instr_histogram`, `deadlock_detection`, `random_delay`
-    -   Enabling `proton_instr_histogram` auto-enables `opcode_only`
-    -   Enabling `deadlock_detection` auto-enables `reg_trace`
-    -   Enabling `random_delay` auto-enables `random_delay` instrumentation; also requires `CUTRACER_DELAY_NS` to be set
--   `KERNEL_FILTERS`: comma-separated substrings matching unmangled or mangled kernel names
--   `INSTR_BEGIN`, `INSTR_END`: static instruction index gate during instrumentation
--   `TOOL_VERBOSE`: 0/1/2
--   `CUTRACER_TRACE_FORMAT`: trace output format. Accepts string names or numeric values (replaces the legacy `TRACE_FORMAT_NDJSON` env var, which is still accepted for backward compatibility)
-    -   **ndjson** or 2 (default): NDJSON uncompressed (`.ndjson`)
-    -   text (or 0): Plain text (`.log`, legacy format, verbose)
-    -   zstd (or 1): NDJSON+Zstd compressed (`.ndjson.zst`, ~12x compression, 92% space savings)
-    -   clp (or 3): CLP Archive (`.clp`); `cutracer query` on it needs `pip install 'cutracer[clp]'` (x86_64 only)
--   `CUTRACER_ZSTD_LEVEL`: Zstd compression level (1-22, default 9)
-    -   Lower values (1-3): Faster compression, slightly larger output
-    -   Higher values (19-22): Maximum compression, slower but smallest output
-    -   Default of 9 provides balanced compression speed and ratio
-- `CUTRACER_DELAY_NS`: Max delay value in nanoseconds for `random_delay` analysis (required when `random_delay` is enabled)
-- `CUTRACER_DELAY_MIN_NS`: Minimum delay in nanoseconds — floor for random mode (default: 0). Must be ≤ `CUTRACER_DELAY_NS`
-- `CUTRACER_DELAY_MODE`: Delay mode: `random` (per-thread random, default), `fixed` (same for all threads), `cluster` (one CTA per cluster), `cluster_fixed` (fixed delay, one CTA per cluster)
-- `CUTRACER_DELAY_DUMP_PATH`: Output path for delay config JSON file (for recording instrumentation patterns)
-- `CUTRACER_DELAY_LOAD_PATH`: Input path for delay config JSON file (for replay mode - deterministic reproduction)
-- `CUTRACER_DELAY_SEED`: Seed of the per-point on/off choices (random if unset). Processes that share it make the same choices and merge their writes to `CUTRACER_DELAY_DUMP_PATH`
-- `CUTRACER_DELAY_PATTERNS`: Comma-separated SASS instruction substrings for delay injection (overrides built-in patterns). Use `"*"` to match all instructions
-- `CUTRACER_DELAY_ENABLE_PROB`: Per-PC enable probability (0.0-1.0, default: 0.5). Use `1.0` with warp targeting
-- `CUTRACER_DELAY_WARPGROUP_ID`: Warp-targeted delay: warpgroup index (>= 0 selects warps `[4N..4N+3]`, -1 = disabled)
-- `CUTRACER_DELAY_WARP_MASK`: Warp-targeted delay: hex bitmask of CTA-local warp IDs (e.g. `0xF` for warps 0-3, 0 = disabled)
-- `CUTRACER_OUTPUT_DIR`: Output directory for all CUTracer files (trace files and log files). Defaults to the current directory. The directory must exist and be writable.
-- `CUTRACER_CPU_CALLSTACK`: CPU call stack capture mode at each kernel launch (default: `auto`)
-    - `auto` (default): Prefer PyTorch CapturedTraceback for Python frames, fallback to C++ backtrace if Python/PyTorch is unavailable
-    - `pytorch`: Force PyTorch CapturedTraceback only (returns empty if unavailable)
-    - `backtrace`: Force C++ backtrace only (original behavior)
-    - `1`: Same as `auto` (backward compatible)
-    - `0`: Disable call stack capture
-    - When enabled, the `kernel_metadata` trace event includes a `cpu_callstack` array and a `cpu_callstack_source` field (`"pytorch"` or `"backtrace"`) indicating the capture method used
-- `CUTRACER_KERNEL_TIMEOUT_S`: Kernel execution time limit in seconds (default: 0 = disabled)
-    - Terminates the process with SIGTERM when a kernel runs longer than this value
-    - Acts as a general safety valve, independent of deadlock detection (does not require `-a deadlock_detection`)
-- `CUTRACER_NO_DATA_TIMEOUT_S`: No-data hang detection timeout in seconds (default: 15)
-    - Terminates the process with SIGTERM when no trace data arrives for this duration
-    - Acts as a general safety valve, independent of deadlock detection (does not require `-a deadlock_detection`)
-    - Catches "silent" hangs where all warps are blocked on synchronization primitives with zero trace output
-    - Works whether the kernel went silent after producing some data, or never produced any data at all
-    - When `-a deadlock_detection` is also active, prints detailed warp status summary before termination
-    - Set to 0 to disable
-- `CUTRACER_TRACE_SIZE_LIMIT_MB`: Maximum trace file size in MB (default: 0 = disabled)
-    - When any trace file exceeds this limit, tracing is stopped for that kernel; kernel execution continues normally
-    - Useful for preventing runaway trace files from filling disk (e.g., during deadlocked kernels)
-
-**Notes:**
-- The tool sets `CUDA_MANAGED_FORCE_DEVICE_ALLOC=1` to simplify channel memory handling.
-- Multiple analyses can be combined (e.g., `CUTRACER_ANALYSIS=proton_instr_histogram,deadlock_detection`). Each analysis auto-enables its required instrumentation mode.
-
-## Analyses
-
-### Instruction Histogram (proton_instr_histogram)
-
--   Counts SASS instruction mnemonics per warp within regions delimited by clock reads (start/stop model; nested regions not supported)
--   Output: one CSV per kernel launch with columns `warp_id,region_id,instruction,count`
-
-Example (Triton/Proton + IPC):
-
-```bash
-cd ~/CUTracer/tests/proton_tests
-
-# 1) Collect histogram with CUTracer
-CUDA_INJECTION64_PATH=~/CUTracer/lib/cutracer.so \
-CUTRACER_ANALYSIS=proton_instr_histogram \
-KERNEL_FILTERS=add_kernel \
-python ./vector-add-instrumented.py
-
-# 2) Run without CUTracer to generate a clean Chrome trace
-python ./vector-add-instrumented.py
-
-# 3) Merge and compute IPC
-python ~/CUTracer/scripts/parse_instr_hist_trace.py \
-  --chrome-trace ./vector.chrome_trace \
-  --cutracer-trace ./kernel_*_add_kernel_hist.csv \
-  --cutracer-log ./cutracer_main_*.log \
-  --output vectoradd_ipc.csv
-```
-
-### Deadlock / Hang Detection (deadlock_detection)
-
--   Detects sustained hangs by identifying warps stuck in stable PC loops; logs and issues SIGTERM→SIGKILL if sustained
--   Requires `reg_trace` (auto-enabled)
-
-Example (intentional loop):
-
-```bash
-cd ~/CUTracer/tests/hang_test
-CUDA_INJECTION64_PATH=~/CUTracer/lib/cutracer.so \
-CUTRACER_ANALYSIS=deadlock_detection \
-python ./test_hang.py
-```
-
-### Data Race Detection (random_delay)
-
--   Data races depend on thread scheduling and timing — buggy code may appear correct by luck.
-    This analysis exposes hidden races by injecting random delays before **synchronization-related SASS instructions** (e.g., `BAR`, `MEMBAR`, `ATOM`, `RED`), disrupting the normal timing and forcing latent races to manifest as observable failures.
--   Each instrumentation point is randomly enabled/disabled (50% probability)
--   Two delay modes:
-    -   **`random` (default):** Each thread gets a random delay in `[0, CUTRACER_DELAY_NS]` using GPU-side xorshift32 PRNG seeded with `threadIdx/blockIdx/clock`. Creates per-thread timing skew that amplifies data races. **Recommended.**
-    -   **`fixed`:** All threads get the same delay. Preserves relative timing between threads and often *masks* races rather than exposing them. Not recommended for race detection.
--   Requires `CUTRACER_DELAY_NS` to be set. The `random_delay` instrumentation mode is auto-enabled.
-
-Example:
-
-```bash
-CUTRACER_DELAY_NS=100000 \
-CUTRACER_ANALYSIS=random_delay \
-CUDA_INJECTION64_PATH=~/CUTracer/lib/cutracer.so \
-python3 your_kernel.py
-```
-
-#### Delay Dump and Replay
-
-CUTracer supports dumping delay configurations to JSON for deterministic reproduction of data races:
-
-- **Dump mode**: Set `CUTRACER_DELAY_DUMP_PATH` to save the random instrumentation pattern to a JSON file
-- **Replay mode**: Set `CUTRACER_DELAY_LOAD_PATH` to load a saved config and reproduce the exact same delay pattern
-
-**Note**: You cannot use both at the same time.
-
-**Workflow**:
-1. Run with `CUTRACER_DELAY_DUMP_PATH=/tmp/config.json` to record the delay pattern
-2. When a failure occurs, save the config file
-3. Replay with `CUTRACER_DELAY_LOAD_PATH=/tmp/config.json` to reproduce deterministically
-4. Reduce with `cutracer reduce` to find the minimal set of delay points (see below)
-
-#### Reduce (Delta Debugging)
-
-The `reduce` subcommand finds the minimal set of delay injection points that trigger a data race. Two strategies:
-
--   **`linear`**: Tests each point one by one. O(N) test runs. Simple but slow.
--   **`bisect`**: ddmin-style bisection. Splits points in half and recursively narrows down. Typically O(log N) iterations. **Recommended for large configs.**
-
-Use `--confidence-runs N` (odd number) for majority voting when the race is probabilistic.
-
-```bash
-# Bisection reduction (fast)
-cutracer reduce -c config.json -t ./test_race.sh --strategy bisect --confidence-runs 3
-```
-
-The test script convention follows `llvm-reduce`: exit 0 = interesting (race occurred), exit 1+ = not interesting (no race).
+| Skill | Use it when |
+|---|---|
+| [`investigate-kernel`](agentic/skills/investigate-kernel/SKILL.md) | A GPU kernel misbehaves and no workflow has been chosen yet; it routes to the matching skill |
+| [`debug-hanging-kernel`](agentic/skills/debug-hanging-kernel/SKILL.md) | A kernel hangs or never returns |
+| [`debug-illegal-access`](agentic/skills/debug-illegal-access/SKILL.md) | A kernel faults with CUDA error 700 or an illegal or misaligned address |
+| [`audit-memory-model`](agentic/skills/audit-memory-model/SKILL.md) | A kernel (NVIDIA Hopper or Blackwell, AMD CDNA3 or CDNA4) must be checked against the vendor memory model without a failing run |
+| [`report-case-study`](agentic/skills/report-case-study/SKILL.md) | An investigation is complete and needs an auditable, reusable report |
 
 ## Examples
 
-The [`examples/`](examples/) directory contains reference outputs and
-reproducers for common workflows:
+[`examples/`](examples/) holds reproducers and reference outputs of real investigations:
 
--   **[Proton Trace](examples/proton_trace/)** -- sample instruction histogram CSV, CUTracer log, and a README explaining the end-to-end proton instrumentation workflow for a Triton vector-add kernel
--   **[TLX TMEM WAR](examples/tlx_tmem_war/)** -- matched failing and fixed reproducer for an aliased-TMEM race in the 2-CTA attention-backward kernel
--   **[TLX CLC GEMM](examples/tlx_gemm_clc/)** -- matched affected and fixed setup for a missing async-proxy fence after the CLC response read in the TLX Blackwell GEMM, with three blind agent audits using the `audit-memory-model` skill
--   **[CK FMHA K/V LDS WAR](examples/ck_fmha_kv_lds_war/)** -- matched affected and fixed builds of the Composable Kernel FMHA forward example on MI350, a delay patch that exposes a missing workgroup barrier before the V tile reuses the K buffer in LDS, and three blind agent audits using the `audit-memory-model` skill
+| Example | What it shows |
+|---|---|
+| [Proton trace](examples/proton_trace/) | The instruction histogram workflow for a Triton vector-add kernel, with a sample histogram CSV and CUTracer log |
+| [Conv backward-weight IMA](examples/conv_bwd_weight_ima/) | An illegal memory access in a TorchInductor convolution kernel, localized to one SASS instruction, with the bad address traced back to its source registers and the bug pinned on `ptxas` |
+| [TLX named-barrier deadlock](examples/tlx_named_barrier_deadlock/) | A kernel hang in a TLX compiler whose named-barrier lowering was later fixed |
+| [TLX TMEM WAR](examples/tlx_tmem_war/) | Matched failing and fixed reproducers for an aliased-TMEM race in the 2-CTA attention-backward kernel |
+| [TLX CLC GEMM](examples/tlx_gemm_clc/) | A missing async-proxy fence after the CLC response read in the TLX Blackwell GEMM, with three blind agent audits using `audit-memory-model` |
+| [CK FMHA K/V LDS WAR](examples/ck_fmha_kv_lds_war/) | A missing workgroup barrier before the V tile reuses the K buffer in LDS, in the Composable Kernel FMHA forward example on MI350, with a delay patch that exposes it and three blind agent audits |
+
+Each example's README lists its setup. The TLX examples need a Triton with TLX, such as Meta's `fbtriton` package on PyPI, installed in place of the `triton` package that PyTorch brings.
 
 ## Troubleshooting
 
--   No CSV/log: check `CUDA_INJECTION64_PATH`, `KERNEL_FILTERS`, and write permissions
--   Empty histogram: ensure kernels emit clock instructions (e.g., Triton `pl.scope`)
--   High overhead: prefer opcode-only; narrow filters; use `INSTR_BEGIN/INSTR_END`
--   CUDA Graph/stream capture: data is flushed at `cuGraphLaunch` exit; ensure stream sync
--   IPC merge issues: resolve warp mismatches and kernel hash ambiguity with parser flags
+- No trace files: `-i` was not given (CUTracer then only logs launches), or `-k` matched no kernel. Run once without `-i` to see the names of the kernels that launch.
+- The run ends with exit status 241 or 247: CUTracer ended it as hung, through `deadlock_detection` or a timeout. A slow but healthy kernel can need a larger `--no-data-timeout-s` or `--kernel-timeout-s`; `0` turns either off.
+- `cutracer validate` rejects a new trace: check that the `cutracer` command and `cutracer.so` come from the same version.
+- High overhead: `opcode_only` is the lightest mode; narrow the capture with `-k`, `--instr-categories` or `INSTR_BEGIN`/`INSTR_END`.
+
+[Troubleshooting](docs/Troubleshooting.md) and the [FAQ](docs/FAQ.md) cover more cases.
+
+## Documentation
+
+The full documentation lives in [`docs/`](docs/) and is synced to the [GitHub Wiki](https://github.com/facebookexperimental/CUTracer/wiki) on every push to `main` by [`.github/workflows/sync-wiki.yml`](.github/workflows/sync-wiki.yml). Edit `docs/*.md`, not the wiki: the next sync overwrites direct wiki edits.
+
+- Getting started: [Quickstart](docs/Quickstart.md), [Concepts](docs/Concepts.md), [Examples](docs/Examples.md)
+- Reference: [Configuration](docs/Configuration.md), [Instrumentation Modes](docs/Instrumentation-Modes.md), [Instrumentation Plans](docs/Instrumentation-Plans.md), [Outputs and File Formats](docs/Outputs-and-File-Formats.md), [API and Data Structures](docs/API-and-Data-Structures.md)
+- Workflows: [Analyses](docs/Analyses.md), [Automated Diagnosis Service](docs/Automated-Diagnosis-Service.md), [Post-processing: IPC Merge](docs/Post-processing-IPC-Merge.md), [Triton/Proton Integration](docs/Triton_Proton-Integration.md)
+- Development: [Architecture](docs/Architecture.md), [Developer Guide](docs/Developer-Guide.md), [Build, Test, and CI](docs/Build-Test-and-CI.md), [Code Formatting](docs/Code-Formatting.md), [Python package](python/README.md)
+- Help: [Troubleshooting](docs/Troubleshooting.md), [FAQ](docs/FAQ.md)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
 This repository contains code under the MIT license (Meta) and the BSD-3-Clause license (NVIDIA). See [LICENSE](LICENSE) and [LICENSE-BSD](LICENSE-BSD) for details.
-
-## 📚 Documentation
-
-For trace capture, validation, and queries, see the [Python CLI guide](python/README.md#cli). Run `cutracer analyze --help` to see the analysis workflows available in your installed build.
-
-The full project documentation lives in [`docs/`](docs/) and is automatically
-synced to the [GitHub Wiki](https://github.com/facebookexperimental/CUTracer/wiki)
-on every push to `main` via
-[`.github/workflows/sync-wiki.yml`](.github/workflows/sync-wiki.yml).
-
-**Edit `docs/*.md`, not the wiki directly** — direct wiki edits will be
-overwritten on the next sync.
-
-Key topics: [Quickstart](docs/Quickstart.md), [Concepts](docs/Concepts.md),
-[Configuration](docs/Configuration.md),
-[Instrumentation Modes](docs/Instrumentation-Modes.md),
-[Outputs and File Formats](docs/Outputs-and-File-Formats.md),
-[API and Data Structures](docs/API-and-Data-Structures.md),
-[Analyses](docs/Analyses.md),
-[Post-processing: IPC Merge](docs/Post-processing-IPC-Merge.md),
-[Triton/Proton Integration](docs/Triton_Proton-Integration.md),
-[Architecture](docs/Architecture.md),
-[Developer Guide](docs/Developer-Guide.md),
-[Build, Test, and CI](docs/Build-Test-and-CI.md),
-[Troubleshooting](docs/Troubleshooting.md), [FAQ](docs/FAQ.md).

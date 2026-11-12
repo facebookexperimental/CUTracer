@@ -1,34 +1,38 @@
+CUTracer is a debugging toolkit for NVIDIA GPU kernels, built on NVBit. Its runtime library instruments CUDA kernels at the SASS level without rebuilding the application. The `cutracer` command records per-warp traces, exposes data races with delay injection (`stress`, `reduce`), stops hung kernels with a per-warp report, runs NVIDIA Compute Sanitizer, and diagnoses a failing test end to end (`diagnose`).
 
-CUTracer is an NVBit-based CUDA binary instrumentation tool. It cleanly separates lightweight data collection (instrumentation) from host-side processing (analysis). Typical workflows include per-warp instruction histograms between clock-cycle markers and kernel hang detection.
-
-🎯 Start here:
+🎯 Get started:
 
 - [Quickstart](Quickstart.md)
 - [Concepts](Concepts.md)
-- [Analyses](Analyses.md)
-- [Post-processing: IPC Merge](Post-processing-IPC-Merge.md)
+- [Examples](Examples.md)
 
-📚 Configuration and reference:
+📚 Reference:
 
 - [Configuration](Configuration.md)
 - [Instrumentation Modes](Instrumentation-Modes.md)
+- [Instrumentation Plans](Instrumentation-Plans.md)
 - [Outputs and File Formats](Outputs-and-File-Formats.md)
 - [API and Data Structures](API-and-Data-Structures.md)
+
+🔬 Analyses and workflows:
+
+- [Analyses](Analyses.md)
+- [Automated Diagnosis Service](Automated-Diagnosis-Service.md)
+- [Post-processing: IPC Merge](Post-processing-IPC-Merge.md)
+- [Triton_Proton Integration](Triton_Proton-Integration.md)
 
 🔧 Architecture and development:
 
 - [Architecture](Architecture.md)
 - [Developer Guide](Developer-Guide.md)
+- [Build, Test, and CI](Build-Test-and-CI.md)
+- [Code Formatting](Code-Formatting.md)
 
-🧪 Examples and help:
+❓ Help:
 
-- [Examples](Examples.md)
-- [Triton_Proton Integration](Triton_Proton-Integration.md)
 - [Troubleshooting](Troubleshooting.md)
 - [FAQ](FAQ.md)
-- [Build, Test, and CI](Build-Test-and-CI.md)
- - [Code Formatting](Code-Formatting.md)
 
-If you only have 5 minutes, read Quickstart and Post-processing: IPC Merge.
+If you only have 5 minutes, read Quickstart and Analyses.
 
 Welcome to the CUTracer wiki!

@@ -13,6 +13,7 @@
 
 ### 🔬 Analyses & Workflows
 - [Analyses](Analyses.md)
+- [Automated Diagnosis Service](Automated-Diagnosis-Service.md)
 - [Post-processing: IPC Merge](Post-processing-IPC-Merge.md)
 - [Triton/Proton Integration](Triton_Proton-Integration.md)
 
