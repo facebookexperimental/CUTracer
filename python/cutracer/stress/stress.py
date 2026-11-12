@@ -1710,6 +1710,11 @@ def _unattributed_reason(result: StressResult) -> str:
             f"the control arm reproduced {result.baseline_reproductions} of "
             f"{result.baseline_completed} run(s) with injection disabled"
         )
+    if result.unattributed_reproductions:
+        return (
+            f"{result.unattributed_reproductions} attempt(s) reported the bug "
+            "while injecting no delay"
+        )
     if result.attribution == ATTRIBUTION_NO_BASELINE:
         return "reproduced, but no control arm ran"
     return (
@@ -1749,8 +1754,9 @@ def _incomplete_reasons(result: StressResult) -> List[str]:
 def result_verdict(result: StressResult) -> Verdict:
     """Classify one search.
 
-    - finding: an attempt reproduced the bug and the control arm never did, so
-      the injected delay is what made the difference.
+    - finding: an attempt reproduced the bug, and neither the control arm nor
+      an attempt that injected nothing did, so the injected delay is what made
+      the difference.
     - suspect: the bug reproduced, but not attributably to an injected delay:
       it also reproduced with injection disabled, or in an attempt that
       injected nothing, or without a complete control arm.
@@ -1760,26 +1766,21 @@ def result_verdict(result: StressResult) -> Verdict:
     - incomplete: anything else.
     """
     triggering = result.triggering
-    if triggering is not None:
-        if result.attribution == ATTRIBUTION_ATTRIBUTED:
-            return Verdict(
-                VERDICT_FINDING,
-                [
-                    f"reproduced ({triggering.symptom}) at "
-                    f"delay_ns={triggering.delay_ns}"
-                ],
-            )
-        return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
-    if result.baseline_reproductions:
-        return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
-    if result.unattributed_reproductions:
+    if (
+        triggering is not None
+        and result.attribution == ATTRIBUTION_ATTRIBUTED
+        and not result.unattributed_reproductions
+    ):
         return Verdict(
-            VERDICT_SUSPECT,
-            [
-                f"{result.unattributed_reproductions} attempt(s) reported the bug "
-                "while injecting no delay"
-            ],
+            VERDICT_FINDING,
+            [f"reproduced ({triggering.symptom}) at delay_ns={triggering.delay_ns}"],
         )
+    if (
+        triggering is not None
+        or result.baseline_reproductions
+        or result.unattributed_reproductions
+    ):
+        return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
     reasons = _incomplete_reasons(result)
     if reasons:
         return Verdict(VERDICT_INCOMPLETE, reasons)

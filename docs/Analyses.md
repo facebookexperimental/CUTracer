@@ -164,8 +164,8 @@ Every report carries a `verdict`, with `reasons`:
 
 | `verdict.status` | Meaning |
 |------------------|---------|
-| `finding` | An attempt reproduced the bug and the control arm never did, so the injected delay made the difference |
-| `suspect` | The bug reproduced, but not attributably to a delay: it also reproduced with injection disabled, in an attempt that injected nothing, or without a complete control arm |
+| `finding` | An attempt reproduced the bug, and neither the control arm nor an attempt that injected nothing did, so the injected delay made the difference |
+| `suspect` | The bug reproduced, but not attributably to a delay: it also reproduced with injection disabled, in an attempt that injected nothing, or without a complete control arm. In a search over several modes, one suspect mode makes the whole search `suspect`, even when another mode has a finding |
 | `clean` | Every planned attempt ran and measured something (no infra error, timeout or unexplained hang), after a complete control arm, and nothing reproduced. It covers only the attempts made |
 | `incomplete` | Anything else, including a mode that did not run and a search the budget cut short |
 

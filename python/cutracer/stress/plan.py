@@ -229,20 +229,27 @@ def _not_searched(run: ModeRun, baseline: _BaselineResult) -> Optional[tuple[str
 
 
 def plan_verdict(runs: Sequence[ModeRun]) -> Verdict:
-    """The plan's verdict: a finding in any mode, else a suspect failure in any
-    mode, else clean only if every mode that applied ran clean."""
+    """The plan's verdict: suspect if any mode saw the failure without an
+    attributable delay, since a finding in another mode does not outweigh a
+    failure that also happens without one; else a finding in any mode; else
+    clean only if every mode that applied ran clean."""
     verdicts = [
         (run.mode, result_verdict(run.result)) for run in runs if run.result is not None
     ]
-    for status in (VERDICT_FINDING, VERDICT_SUSPECT):
-        found = [
+
+    def reasons_of(status: str) -> list[str]:
+        return [
             f"{mode}: {reason}"
             for mode, verdict in verdicts
             if verdict.status == status
             for reason in verdict.reasons
         ]
-        if found:
-            return Verdict(status, found)
+
+    suspect, finding = reasons_of(VERDICT_SUSPECT), reasons_of(VERDICT_FINDING)
+    if suspect:
+        return Verdict(VERDICT_SUSPECT, suspect + finding)
+    if finding:
+        return Verdict(VERDICT_FINDING, finding)
     reasons = [
         f"{mode}: {reason}"
         for mode, verdict in verdicts
