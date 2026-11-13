@@ -194,6 +194,7 @@ static void forget_runtime_module(CUcontext ctx, CUmodule module) {
       already_instrumented.erase(f);
       pthread_mutex_lock(&g_cluster_obs_mutex);
       g_func_to_observed_cluster.erase(f);
+      g_func_to_captured_launch_attributes.erase(f);
       pthread_mutex_unlock(&g_cluster_obs_mutex);
       if (state) {
         if (module) state->retired_function_handles.insert(f);

@@ -328,6 +328,31 @@
       "type": "boolean",
       "description": "Whether CUTRACER_TRACE_PC_OFFSETS parsed successfully"
     },
+    "launch_attributes": {
+      "description": "Attributes a direct launch passed to cuLaunchKernelEx, or implied (cooperative launches). Only attributes the launch set appear, so an empty object means none; a PDL launch has programmatic_stream_serialization true. Absent on graph node launches (see captured_launch_attributes) and in traces written before it was recorded.",
+      "allOf": [{"$ref": "#/definitions/launch_attributes"}]
+    },
+    "captured_launch_attributes": {
+      "description": "On a graph node launch: the attributes of the stream-captured launch that made this function's graph node, since NVBit reports no node attributes and capture turns PDL into a programmatic graph edge. Absent when the function was not captured, was captured with different attributes, or its node was built with the graph API.",
+      "allOf": [{"$ref": "#/definitions/launch_attributes"}]
+    },
+    "function_attributes": {
+      "type": "object",
+      "description": "Launch-relevant attributes of the function at this launch (cuFuncGetAttribute). Attributes the driver could not report are left out. On a graph node launch they are read when the graph launches, so they can differ from what the node was captured with.",
+      "properties": {
+        "max_dynamic_shared_size_bytes": {"type": "integer"},
+        "preferred_shared_memory_carveout": {"type": "integer", "description": "Percent of the unified cache for shared memory; -1 means no preference"},
+        "cluster_size_must_be_set": {"type": "boolean"},
+        "required_cluster_dim": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 3, "maxItems": 3},
+        "non_portable_cluster_size_allowed": {"type": "boolean"},
+        "cluster_scheduling_policy": {"type": "string", "enum": ["default", "spread", "load_balancing", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "nonblocking_launches": {
+      "type": "boolean",
+      "description": "Whether CUTracer ran with --nonblocking-launches. Without it CUTracer waits for the device before and after every direct launch, so a PDL launch cannot overlap its predecessor."
+    },
     "runtime_identity": {
       "type": "object",
       "description": "Launch record of the runtime identity manifest (cutracer_runtime_<pid>_<nonce>.ndjson), present when runtime identity is enabled or an instrumentation plan is active. process, context, module and function are the keys of earlier records in that manifest; launch is the SHA-256 of this object without launch.",
@@ -401,5 +426,50 @@
       "additionalProperties": false
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "definitions": {
+    "launch_attributes": {
+      "type": "object",
+      "properties": {
+        "access_policy_window": {
+          "type": "object",
+          "properties": {"num_bytes": {"type": "integer"}, "hit_ratio": {"type": "number"}},
+          "additionalProperties": false
+        },
+        "cooperative": {"type": "boolean"},
+        "cluster_dim": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 3, "maxItems": 3},
+        "cluster_scheduling_policy": {"type": "string", "enum": ["default", "spread", "load_balancing", "unknown"]},
+        "programmatic_stream_serialization": {"type": "boolean"},
+        "programmatic_event": {
+          "type": "object",
+          "properties": {
+            "event": {"type": "integer", "description": "CUevent handle a consumer on another stream waits on"},
+            "flags": {"type": "integer"},
+            "trigger_at_block_start": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "priority": {"type": "integer"},
+        "mem_sync_domain_map": {
+          "type": "object",
+          "properties": {"default": {"type": "integer"}, "remote": {"type": "integer"}},
+          "additionalProperties": false
+        },
+        "mem_sync_domain": {"type": "string", "enum": ["default", "remote", "unknown"]},
+        "launch_completion_event": {
+          "type": "object",
+          "properties": {"event": {"type": "integer"}, "flags": {"type": "integer"}},
+          "additionalProperties": false
+        },
+        "device_updatable_kernel_node": {"type": "boolean"},
+        "preferred_cluster_dim": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 3, "maxItems": 3},
+        "preferred_shared_memory_carveout": {"type": "integer"},
+        "nvlink_util_centric_scheduling": {"type": "boolean"},
+        "portable_cluster_size_mode": {"type": "string", "enum": ["default", "require_portable", "allow_non_portable", "unknown"]},
+        "shared_memory_mode": {"type": "string", "enum": ["default", "require_portable", "allow_non_portable", "unknown"]},
+        "unrecognized": {"type": "array", "items": {"type": "integer"}, "description": "Attribute ids this build does not decode"}
+      },
+      "additionalProperties": false
+    }
+  }
 }

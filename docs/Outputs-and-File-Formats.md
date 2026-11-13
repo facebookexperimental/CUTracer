@@ -83,6 +83,31 @@ share this contract.
 When the runtime identity manifest is enabled, the kernel metadata header also
 carries `runtime_identity`: the same launch record that the manifest writes.
 
+Kernel metadata and kernel launch events also describe how the kernel was
+launched:
+
+- `launch_attributes` (direct launches): the attributes passed to
+  `cuLaunchKernelEx`, or `cooperative` for `cuLaunchCooperativeKernel`. Only
+  attributes the launch set appear, so `{}` means none. A PDL launch has
+  `programmatic_stream_serialization: true`; `programmatic_event.event` is the
+  `CUevent` handle a consumer on another stream waits on. Ids this build does
+  not decode are listed under `unrecognized`.
+- `captured_launch_attributes` (CUDA graph node launches): the attributes of the
+  stream-captured launch that made the function's node. NVBit reports no node
+  attributes, and capture turns PDL into a programmatic graph edge. Absent when
+  the function was not captured, was captured with different attributes, or
+  its node came from the graph API.
+- `function_attributes`: `cuFuncGetAttribute` values that affect the launch
+  (dynamic shared memory, carveout with `-1` meaning no preference, required and
+  non-portable cluster sizes, scheduling policy). Attributes the driver cannot
+  report are left out.
+- `nonblocking_launches`: whether CUTracer ran with `--nonblocking-launches`.
+  Without it CUTracer waits for the device around every direct launch, so a PDL
+  launch cannot overlap its predecessor.
+
+A missing key means unknown, for example in traces written before these fields
+existed.
+
 ### NDJSON Example
 
 ```json
@@ -106,7 +131,7 @@ analysis, and dedup studies.
 
 | `type` value | When emitted | Key fields |
 |--------------|--------------|------------|
-| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name` (demangled), `mangled_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `cluster_dim` (`[x,y,z]`, `[1,1,1]` without clusters), `cluster_size`, `nregs`, `shmem`, `stream_id` |
+| `"kernel_launch"` | Every kernel launch | `kernel_launch_id`, `kernel_name` (demangled), `mangled_name`, `kernel_checksum`, `grid` (`[x,y,z]`), `block` (`[x,y,z]`), `cluster_dim` (`[x,y,z]`, `[1,1,1]` without clusters), `cluster_size`, `nregs`, `shmem`, `stream_id`, `launch_attributes` or `captured_launch_attributes`, `function_attributes`, `nonblocking_launches` (see kernel metadata above) |
 | `"callstack_def"` | First time a unique CPU callstack is seen (mode=`dedup`) | `callstack_id` (hex hash), `frames` (array of strings), `source` |
 
 `kernel_name` remains the human-readable demangled name. `mangled_name` is the
