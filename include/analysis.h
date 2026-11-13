@@ -24,6 +24,7 @@
 
 #include "capture_completion.h"
 #include "common.h"
+#include "hang_check_policy.h"
 #include "instr_category.h"
 #include "kernel_types.h"
 #include "nvbit.h"
@@ -223,7 +224,7 @@ struct CTXstate {
   /* State for Deadlock/Hang Detection */
   std::map<WarpKey, WarpLoopState> loop_states;
   std::set<WarpKey> active_warps;
-  time_t last_hang_check_time;
+  cutracer::HangCheckPolicy hang_check;
 
   // Pending mem traces per warp for out-of-order arrival (mem before reg)
   std::unordered_map<WarpKey, std::deque<mem_addr_access_t>, WarpKey::Hash> pending_mem_by_warp;
@@ -241,7 +242,6 @@ struct CTXstate {
   // (guarded by writers_mutex)
   std::string kernel_start_name;
   std::atomic<time_t> last_data_received_time{0};
-  int deadlock_consecutive_hits = 0;
   bool deadlock_termination_initiated = false;
 
   // Warp statistics tracking per kernel launch

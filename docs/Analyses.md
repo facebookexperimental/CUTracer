@@ -16,8 +16,8 @@ Caveats:
 - Enable with: `CUTRACER_ANALYSIS=deadlock_detection` (auto-enables `reg_trace`).
 - Host logic summary:
   - Maintains a ring of recent PCs per warp, derives a canonical loop signature and period.
-  - When all active warps are in stable loops for consecutive checks, the tool logs and signals termination (SIGTERM, then SIGKILL if needed).
-- Output: Messages in the main log (e.g., "Possible kernel hang", "Deadlock sustained...").
+  - At most one check per second (monotonic clock). When no active warp is progressing (each is at a blocking barrier or in a stable loop) for 3 consecutive checks, the tool logs and signals termination (SIGTERM, then SIGKILL if needed). The count starts over whenever the record stream switches to another launch and whenever no warp is active.
+- Output: Messages in the main log: "Possible kernel hang" on each check without progress, and "Deadlock sustained for N checks at least M ms apart" with the launch and warp counts when it terminates. `cutracer.watchdog` counts that line as a watchdog-ended hang.
 
 Caveats:
 - `reg_trace` increases overhead; narrow `KERNEL_FILTERS` and instruction intervals to reduce impact.

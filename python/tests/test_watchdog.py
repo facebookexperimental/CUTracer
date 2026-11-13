@@ -16,6 +16,14 @@ NO_DATA = (
     "No-data hang detected: kernel launched 15 seconds ago but never produced "
     "any trace data (limit: 15 seconds); sending SIGTERM."
 )
+DEADLOCK = (
+    "Deadlock sustained for 3 checks at least 1000 ms apart: launch_id=7, no active warp "
+    "progressing (looping=12, barrier=4); sending SIGTERM."
+)
+POSSIBLE_HANG = (
+    "Possible kernel hang: launch_id=7 — state(looping=12, barrier=4, "
+    "progressing=0) for 1 seconds."
+)
 
 
 def _write(directory: str, name: str, *lines: str) -> None:
@@ -52,3 +60,8 @@ class WatchdogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _write(directory, "cutracer_main_rank0.log", "started", "finished")
             self.assertEqual(watchdog_terminations(directory, before=set()), [])
+
+    def test_deadlock_check_termination_counts_but_a_warning_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _write(directory, "cutracer_main_rank0.log", POSSIBLE_HANG, DEADLOCK)
+            self.assertEqual(watchdog_terminations(directory, before=set()), [DEADLOCK])

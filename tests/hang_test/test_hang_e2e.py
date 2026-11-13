@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pkg_resources
 from cutracer.runner import _build_cutracer_env, resolve_cutracer_so
+from cutracer.watchdog import WATCHDOG_MARKERS
 
 
 class TestHangE2E(unittest.TestCase):
@@ -247,11 +248,12 @@ class TestHangE2E(unittest.TestCase):
             f"Expected hang detection to terminate subprocess, but it exited 0.\n"
             f"OUTPUT:\n{output[-4000:]}",
         )
-        self.assertIn(
-            "Deadlock sustained",
-            output,
-            f"Hang detection message not found in subprocess output.\n"
-            f"OUTPUT:\n{output[-4000:]}",
+        # The deadlock check's line must stay one cutracer.watchdog counts.
+        deadlock_markers = [m for m in WATCHDOG_MARKERS if m.startswith("Deadlock")]
+        self.assertTrue(
+            any(marker in output for marker in deadlock_markers),
+            f"Hang detection message {deadlock_markers} not found in subprocess "
+            f"output.\nOUTPUT:\n{output[-4000:]}",
         )
 
     # ------------------------------------------------------------------
