@@ -214,6 +214,28 @@ runaway-large. All accept `0` to disable.
 | `CUTRACER_NO_DATA_TIMEOUT_S` | uint32 | `15` | Abort if no records arrive on the channel for this many seconds. With `random_delay` alone no records ever arrive, so this is a per-kernel wall-clock limit counted from launch; CUTracer warns at startup when it is the only limit in that mode |
 | `CUTRACER_TRACE_SIZE_LIMIT_MB` | uint32 | `0` (disabled) | Stop tracing once the on-disk trace reaches this size (MB) |
 
+### Launch Handling
+
+By default CUTracer waits for the device to go idle before every launch that
+is not being captured into a CUDA graph, and waits for each launch to finish
+and its trace to drain before returning to the application. Separate launches
+therefore never overlap under CUTracer (nodes of one CUDA graph still can),
+which hides cross-kernel races (for example a PDL consumer that reads before its
+producer finishes) and can hang programs in which a running kernel waits for a
+later launch.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CUTRACER_NONBLOCKING_LAUNCHES` | `0`/`1` | `0` | Return to the application right after each launch: the launch's trace drains on a background thread without the launching thread waiting for it, and CUTracer waits for the device to go idle before a launch only when the launch changes code an earlier launch may still be running (a switch between instrumented and original code, or instrumenting a kernel or callee that already ran). Not compatible with `deadlock_detection`, `proton_instr_histogram` or `CUTRACER_INSTRUMENTATION_PLAN`, which assume one kernel at a time; CUTracer refuses the combination |
+
+With non-blocking launches:
+- Each instrumented launch is followed in its stream by the event its drain waits on. So is every identified launch when `CUTRACER_RUNTIME_IDENTITY` is on. Other uninstrumented launches (the bare launch logger, or kernels outside `-k`) add nothing. On GB200, a kernel launched right after an instrumented one with programmatic dependent launch (PDL) still overlapped it, and the instrumented kernel's trace was complete; other GPUs and drivers are untested.
+- PDL inside a CUDA graph still does not overlap. On GB200 a graph-replayed PDL pair that races natively was clean under CUTracer, with or without this setting and with the bare launch logger, so the cause is in how graph launches run under NVBit, not in CUTracer's waits.
+- The wait before a launch that changes code covers direct launches only: launches captured into a graph switch code without it, as in the default mode. If a running kernel waits for the very launch that needs the wait, the program hangs as in the default mode.
+- The timers start at a kernel's first trace record, not at its launch, so a kernel waiting in its stream is not timed out. They judge only while a kernel that has sent records is still open. The kernel timeout restarts whenever the trace switches between overlapping kernels and can fire late or not at all. A kernel that hangs before its first record, and a delay-only kernel (which sends none), are not timed out.
+- A launching thread that gets far ahead waits: for the oldest queued drain once 1024 are queued, and for all of them once 256 traces are open. If a queued kernel waits for a launch that thread has not issued yet, the program hangs there.
+- At context teardown CUTracer waits for every queued drain, that is, for every instrumented kernel still running.
+
 ### Deadlock Check Policy
 
 With `CUTRACER_ANALYSIS=deadlock_detection`, the online check ends the run after
@@ -274,6 +296,7 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_KERNEL_EVENTS` | Advanced — Kernel Events |
 | `CUTRACER_KERNEL_TIMEOUT_S` | Advanced — Runtime Limits |
 | `CUTRACER_NO_DATA_TIMEOUT_S` | Advanced — Runtime Limits |
+| `CUTRACER_NONBLOCKING_LAUNCHES` | Advanced — Launch Handling |
 | `CUTRACER_OUTPUT_DIR` | Output |
 | `CUTRACER_RUN_ID` | Advanced — Runtime Identity |
 | `CUTRACER_RUNTIME_IDENTITY` | Advanced — Runtime Identity |

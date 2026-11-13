@@ -69,6 +69,7 @@ class InstrumentationConfig:
     hang_check_interval_ms: int = 1000
     hang_check_hits: int = 3
     hang_min_stall_s: int = 0
+    nonblocking_launches: bool = False
     cwd: Optional[str] = None
     timeout: Optional[int] = None
     base_env: Optional[Mapping[str, str]] = None
@@ -335,12 +336,24 @@ def build_cutracer_env(
     hang_check_interval_ms: int = 1000,
     hang_check_hits: int = 3,
     hang_min_stall_s: int = 0,
+    nonblocking_launches: bool = False,
     base_env: Optional[Mapping[str, str]] = None,
     use_bundled_cuda_tools: bool = True,
     exact_kernel_name: Optional[str] = None,
     exact_kernel_checksum: Optional[str] = None,
 ) -> dict:
     """Build environment dict with CUTracer variables."""
+    if nonblocking_launches:
+        serial = [
+            name
+            for name in ("deadlock_detection", "proton_instr_histogram")
+            if name in (analysis or "")
+        ]
+        if serial:
+            raise ValueError(
+                "nonblocking launches let kernels overlap, which "
+                f"{' and '.join(serial)} does not support"
+            )
     if (exact_kernel_name is None) != (exact_kernel_checksum is None):
         raise ValueError("exact kernel name and checksum must be provided together")
     if exact_kernel_name is not None and (
@@ -426,6 +439,7 @@ def build_cutracer_env(
     env["CUTRACER_HANG_CHECK_INTERVAL_MS"] = str(hang_check_interval_ms)
     env["CUTRACER_HANG_CHECK_HITS"] = str(hang_check_hits)
     env["CUTRACER_HANG_MIN_STALL_S"] = str(hang_min_stall_s)
+    env["CUTRACER_NONBLOCKING_LAUNCHES"] = "1" if nonblocking_launches else "0"
 
     # NVBit launches nvdisasm after importlib's resource context has exited.
     # Zip/PEX resources therefore need a persistent path, not the temporary
@@ -502,6 +516,7 @@ def _resolve_and_build_env(
         hang_check_interval_ms=config.hang_check_interval_ms,
         hang_check_hits=config.hang_check_hits,
         hang_min_stall_s=config.hang_min_stall_s,
+        nonblocking_launches=config.nonblocking_launches,
         base_env=config.base_env,
         use_bundled_cuda_tools=config.use_bundled_cuda_tools,
     )
@@ -794,6 +809,7 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_HANG_CHECK_INTERVAL_MS",
         "CUTRACER_HANG_CHECK_HITS",
         "CUTRACER_HANG_MIN_STALL_S",
+        "CUTRACER_NONBLOCKING_LAUNCHES",
     ]
     click.echo("=" * 60)
     click.echo("CUTracer Configuration:")
@@ -1035,6 +1051,19 @@ _CUTRACER_OPTIONS = [
         "ending the process. Set it above the longest wait a correct kernel "
         "can spend spinning (for example on another rank). 0 = hits alone.",
     ),
+    click.option(
+        "--nonblocking-launches",
+        is_flag=True,
+        default=False,
+        help="Do not block the launching thread around kernel launches: "
+        "return to the application without waiting for a launch to finish "
+        "and drain, and wait for the device to go idle before a launch only "
+        "when it changes code an earlier launch may still be running. Kernels "
+        "can then overlap as they do natively (PDL launch-before-wait, "
+        "kernels that wait for a later launch), except PDL inside a CUDA "
+        "graph. Not compatible with -a deadlock_detection, "
+        "-a proton_instr_histogram or an instrumentation plan.",
+    ),
 ]
 
 
@@ -1081,6 +1110,7 @@ def trace_command(
     hang_check_interval_ms: int,
     hang_check_hits: int,
     hang_min_stall_s: int,
+    nonblocking_launches: bool,
     cmd: tuple,
 ) -> None:
     """Trace a CUDA application with CUTracer.
@@ -1193,12 +1223,16 @@ def trace_command(
         hang_check_interval_ms=hang_check_interval_ms,
         hang_check_hits=hang_check_hits,
         hang_min_stall_s=hang_min_stall_s,
+        nonblocking_launches=nonblocking_launches,
         capture_output=False,
         shell=True,
     )
     config = with_run_delay_seed(config)
 
-    so_path, run_env = _resolve_and_build_env(config)
+    try:
+        so_path, run_env = _resolve_and_build_env(config)
+    except ValueError as error:
+        raise click.UsageError(str(error)) from error
 
     _print_config_summary(run_env)
 

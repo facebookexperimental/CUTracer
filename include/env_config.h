@@ -280,6 +280,12 @@ extern uint32_t hang_check_interval_ms;
 extern uint32_t hang_check_hits;
 extern uint32_t hang_min_stall_s;
 
+// Non-blocking launches (CUTRACER_NONBLOCKING_LAUNCHES=1): the launching
+// thread no longer waits for a launch to finish and drain, and waits for the
+// device to go idle before a direct launch only when the launch changes which
+// code the function runs. Kernels can then overlap as they do natively.
+extern bool nonblocking_launches;
+
 // Trace file size limit in MB (0 = disabled)
 // When the trace file exceeds this limit, the process is automatically terminated.
 // Set via CUTRACER_TRACE_SIZE_LIMIT_MB environment variable

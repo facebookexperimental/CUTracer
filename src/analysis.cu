@@ -211,6 +211,7 @@ void process_instruction_histogram(const opcode_only_t* ri, CTXstate* ctx_state,
   }
 
   CUfunction current_func = launch_state.func;
+  std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
 
   // Get clock opcode IDs for this function, which mark region boundaries.
   const std::unordered_set<int>* clock_opcode_ids = nullptr;
@@ -735,6 +736,16 @@ static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launc
  * @param ctx_state Pointer to the state for the current CUDA context.
  * @param current_kernel_launch_id The current kernel launch ID.
  */
+// A non-blocking launch can wait in its stream behind other work, so the
+// timers judge only launches whose kernels have sent a record.
+static bool has_started_capture(CTXstate* ctx_state) {
+  std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+  for (const auto& [launch_id, next_index] : ctx_state->trace_index_by_kernel) {
+    if (next_index > 0) return true;
+  }
+  return false;
+}
+
 static void check_kernel_timeout(CTXstate* ctx_state, uint64_t current_kernel_launch_id) {
   if (kernel_timeout_s == 0) return;
   if (ctx_state->deadlock_termination_initiated) return;
@@ -743,6 +754,7 @@ static void check_kernel_timeout(CTXstate* ctx_state, uint64_t current_kernel_la
   time_t now = time(nullptr);
   time_t kernel_running_time = now - ctx_state->kernel_start_time;
   if (kernel_running_time >= static_cast<time_t>(kernel_timeout_s)) {
+    if (nonblocking_launches && !has_started_capture(ctx_state)) return;
     std::string kernel_name;
     {
       std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
@@ -798,6 +810,7 @@ static void check_no_data_timeout(CTXstate* ctx_state, uint64_t current_kernel_l
   time_t now = time(nullptr);
   time_t silence_duration = now - reference_time;
   if (silence_duration >= static_cast<time_t>(no_data_timeout_s)) {
+    if (nonblocking_launches && !has_started_capture(ctx_state)) return;
     if (ctx_state->last_data_received_time == 0) {
       loprintf(
           "No-data hang detected: kernel launched %ld seconds ago but never "
@@ -1070,6 +1083,7 @@ void* recv_thread_fun(void* args) {
           // One snapshot serves both the deadlock checks and the SASS lookup below.
           KernelLaunchStateSnapshot launch_state;
           const bool has_launch_state = copy_kernel_launch_state(ri->kernel_launch_id, launch_state);
+          std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
 
           if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
             WarpKey key = {ri->cta_id_x, ri->cta_id_y, ri->cta_id_z, ri->warp_id};
@@ -1118,6 +1132,9 @@ void* recv_thread_fun(void* args) {
               reg_indices_ptr = &ctx_state->id_to_reg_indices_map[launch_state.func][ri->opcode_id];
             }
           }
+          // reg_indices_ptr stays valid: a published table is only erased
+          // when its module unloads, after the receiver's chunk boundary.
+          tables.unlock();
 
           // Unified trace output through TraceWriter for all modes (per-launch files)
           {
@@ -1151,6 +1168,7 @@ void* recv_thread_fun(void* args) {
           std::string sass_str_cpp;
           KernelLaunchStateSnapshot launch_state;
           if (copy_kernel_launch_state(oi->kernel_launch_id, launch_state)) {
+            std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
             if (ctx_state->id_to_sass_map.count(launch_state.func) &&
                 ctx_state->id_to_sass_map[launch_state.func].count(oi->opcode_id)) {
               sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][oi->opcode_id];
@@ -1180,6 +1198,7 @@ void* recv_thread_fun(void* args) {
           std::string sass_str_cpp;
           KernelLaunchStateSnapshot launch_state;
           if (copy_kernel_launch_state(mem->kernel_launch_id, launch_state)) {
+            std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
             if (ctx_state->id_to_sass_map.count(launch_state.func) &&
                 ctx_state->id_to_sass_map[launch_state.func].count(mem->opcode_id)) {
               sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][mem->opcode_id];
@@ -1209,6 +1228,7 @@ void* recv_thread_fun(void* args) {
           std::string sass_str_cpp;
           KernelLaunchStateSnapshot launch_state;
           if (copy_kernel_launch_state(mem_value->kernel_launch_id, launch_state)) {
+            std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
             if (ctx_state->id_to_sass_map.count(launch_state.func) &&
                 ctx_state->id_to_sass_map[launch_state.func].count(mem_value->opcode_id)) {
               sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][mem_value->opcode_id];
@@ -1244,6 +1264,7 @@ void* recv_thread_fun(void* args) {
           std::string sass_str_cpp;
           KernelLaunchStateSnapshot launch_state;
           if (copy_kernel_launch_state(tma->kernel_launch_id, launch_state)) {
+            std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
             if (ctx_state->id_to_sass_map.count(launch_state.func) &&
                 ctx_state->id_to_sass_map[launch_state.func].count(tma->opcode_id)) {
               sass_str_cpp = ctx_state->id_to_sass_map[launch_state.func][tma->opcode_id];

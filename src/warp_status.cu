@@ -101,6 +101,8 @@ WarpStatusSummary collect_warp_status(CTXstate* ctx_state, uint64_t current_kern
       f_func = func_iter->second.second;
     }
   }
+  // Held for the whole summary: it reads sass_map throughout.
+  std::shared_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
   if (f_func != nullptr && ctx_state->id_to_sass_map.count(f_func)) {
     sass_map = &ctx_state->id_to_sass_map[f_func];
   }

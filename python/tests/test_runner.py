@@ -318,6 +318,7 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_HANG_CHECK_INTERVAL_MS"], "1000")
         self.assertEqual(env["CUTRACER_HANG_CHECK_HITS"], "3")
         self.assertEqual(env["CUTRACER_HANG_MIN_STALL_S"], "0")
+        self.assertEqual(env["CUTRACER_NONBLOCKING_LAUNCHES"], "0")
 
     @patch("cutracer.runner.resources")
     def test_sets_the_deadlock_check_policy(self, mock_resources: MagicMock) -> None:
@@ -340,6 +341,24 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_HANG_CHECK_INTERVAL_MS"], "500")
         self.assertEqual(env["CUTRACER_HANG_CHECK_HITS"], "4")
         self.assertEqual(env["CUTRACER_HANG_MIN_STALL_S"], "30")
+
+    @patch("cutracer.runner.resources")
+    def test_sets_nonblocking_launches(self, mock_resources: MagicMock) -> None:
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
+        env = _build_cutracer_env(
+            cutracer_so="/path/to/cutracer.so",
+            instrument="opcode_only",
+            analysis=None,
+            kernel_filters=None,
+            instr_categories=None,
+            trace_format=None,
+            output_dir=None,
+            verbose=None,
+            zstd_level=None,
+            delay_ns=None,
+            nonblocking_launches=True,
+        )
+        self.assertEqual(env["CUTRACER_NONBLOCKING_LAUNCHES"], "1")
 
     @patch("cutracer.runner._resolve_bundled_cuda_tools")
     def test_sets_persistent_cuda_tool_paths(self, resolve_tools) -> None:
