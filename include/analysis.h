@@ -27,6 +27,7 @@
 #include "hang_check_policy.h"
 #include "instr_category.h"
 #include "kernel_types.h"
+#include "launch_drain_worker.h"
 #include "nvbit.h"
 /* for channel */
 #include "utils/channel.hpp"
@@ -199,6 +200,11 @@ struct CTXstate {
   // parent thread should wait until the state becomes FINISHED to clean up.
   std::atomic<RecvThreadState> recv_thread_done{RecvThreadState::INIT};
   CaptureCompletionQueue capture_completions;
+  // Waits for launches to finish, flushes the channel and posts their capture
+  // completions off the launching thread. Its flush stream is private, so a
+  // flush never queues behind or ahead of application work.
+  std::unique_ptr<cutracer::LaunchDrainWorker> drain_worker;
+  cudaStream_t drain_stream = nullptr;
   std::atomic<bool> channel_failed{false};
   std::unordered_set<CUfunction> instrumented_launch_roots;
   // Handles of functions whose module this context unloaded.

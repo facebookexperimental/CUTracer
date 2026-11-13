@@ -33,11 +33,24 @@ class CaptureCompletionQueue {
   }
 
   void request_graph_completion(bool kernel_completed, bool channel_drained, const std::string& error) {
+    request_graph_completion(take_graph_launches(), kernel_completed, channel_drained, error);
+  }
+
+  // The kernel launches registered by one cuGraphLaunch, taken at its exit so
+  // that a later graph launch cannot add to them before they are completed.
+  std::vector<uint64_t> take_graph_launches() {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto launch_id : graph_launches_) {
+    std::vector<uint64_t> launches;
+    launches.swap(graph_launches_);
+    return launches;
+  }
+
+  void request_graph_completion(const std::vector<uint64_t>& launch_ids, bool kernel_completed, bool channel_drained,
+                                const std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto launch_id : launch_ids) {
       pending_.push_back({launch_id, kernel_completed, channel_drained, error});
     }
-    graph_launches_.clear();
   }
 
   // ChannelHost ACKs after copying, before the receiver parses the chunk.
