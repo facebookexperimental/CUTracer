@@ -33,8 +33,10 @@
 #include "warp_status.h"
 
 #define LOOP_REPEAT_THRESH 3
-// Throttle interval for hang checks (seconds)
-#define HANG_CHECK_THROTTLE_SECS 1
+// An exited warp leaves the hang check once it has been quiet for this many
+// time() seconds after its EXIT (1 to 2 s of wall time), so a warp whose other
+// lanes are still running is not dropped at its first EXIT record.
+#define EXIT_PRUNE_SECS 1
 // Throttle interval for periodic TraceWriter/log flush (seconds)
 #define PERIODIC_FLUSH_SECS 1
 // Throttle interval for trace size limit checks (recv loop iterations)
@@ -567,6 +569,8 @@ static void clear_deadlock_state(CTXstate* ctx_state, uint64_t kernel_launch_id 
   ctx_state->last_is_defer_blocking_by_warp.clear();
   ctx_state->kernel_start_time = 0;
   ctx_state->last_data_received_time = 0;
+  // A hit on an earlier launch says nothing about this one.
+  ctx_state->hang_check.restart(cutracer::HangCheckPolicy::Clock::now());
 
   // Clear kernel warp tracking for the specified kernel
   if (kernel_launch_id != 0) {
@@ -596,21 +600,17 @@ static void print_warp_status_summary(CTXstate* ctx_state, uint64_t current_kern
   }
 }
 
-// Checks for potential kernel hangs by determining if all active warps are stuck in loops.
-// The check is throttled to run at most once every HANG_CHECK_THROTTLE_SECS.
-// If all warps are looping and the condition persists for several checks, it terminates the process.
-// Before checking, it prunes warps that are candidates for exiting and have been inactive.
+// Checks whether any active warp is still making progress, that is, neither at
+// a blocking barrier nor in a stable loop. ctx_state->hang_check decides when a
+// check is due and when a run of checks without progress ends the process.
+// Exited warps that have been quiet since their EXIT are pruned first.
 static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launch_id) {
+  const auto check_time = cutracer::HangCheckPolicy::Clock::now();
+  if (!ctx_state->hang_check.due(check_time)) {
+    return;
+  }
+
   time_t now = time(nullptr);
-  if (now - ctx_state->last_hang_check_time < HANG_CHECK_THROTTLE_SECS) {  // Throttle to configured interval
-    return;
-  }
-  ctx_state->last_hang_check_time = now;
-
-  if (ctx_state->active_warps.empty()) {
-    return;
-  }
-
   // Cleanup exit-candidate warps before evaluating loop state
   std::vector<WarpKey> to_remove;
   to_remove.reserve(ctx_state->active_warps.size());
@@ -621,8 +621,8 @@ static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launc
     time_t last_seen = 0;
     auto itSeen = ctx_state->last_seen_time_by_warp.find(key);
     if (itSeen != ctx_state->last_seen_time_by_warp.end()) last_seen = itSeen->second;
-    // Remove only if no activity since EXIT and at least one throttle interval has passed
-    if (last_seen <= exit_since && (now - exit_since) >= HANG_CHECK_THROTTLE_SECS) {
+    // Remove only if no activity since EXIT and the prune delay has passed
+    if (last_seen <= exit_since && (now - exit_since) >= EXIT_PRUNE_SECS) {
       to_remove.push_back(key);
     }
   }
@@ -644,7 +644,6 @@ static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launc
   size_t looping_cnt = 0;
   size_t barrier_cnt = 0;
   size_t progressing_cnt = 0;
-  bool candidate_hang = false;
   for (const WarpKey& warp_key : ctx_state->active_warps) {
     bool is_looping = false;
     {
@@ -672,42 +671,43 @@ static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launc
   //  - barrier: the last observed instruction is BAR.SYNC.DEFER_BLOCKING
   //  - looping: not barrier and loop_flag == true (stable PC cycle detected)
   //  - progressing: not barrier and loop_flag == false (still making forward progress)
-  // If progressing_cnt == 0 (and there are active warps), the system is stalled.
+  // If progressing_cnt == 0 and warps remain after pruning, the system is stalled.
   // This single condition covers the three intended hang scenarios:
   //  (1) All barrier: barrier_cnt == active_warps.size(), looping_cnt == 0, progressing_cnt == 0
   //  (2) Barrier + the rest looping: barrier_cnt > 0, looping_cnt > 0, progressing_cnt == 0
   //  (3) All looping: looping_cnt == active_warps.size(), barrier_cnt == 0, progressing_cnt == 0
-  if (!ctx_state->active_warps.empty() && progressing_cnt == 0) {
-    candidate_hang = true;
+
+  const auto outcome = ctx_state->hang_check.record(check_time, ctx_state->active_warps.size(), progressing_cnt);
+  if (outcome == cutracer::HangCheckPolicy::Outcome::Idle || outcome == cutracer::HangCheckPolicy::Outcome::Progress) {
+    return;
   }
 
-  // Layer 1: Heuristic — fast kill for known patterns (all warps stuck)
-  if (candidate_hang) {
-    time_t hang_time = 0;
-    if (!ctx_state->loop_states.empty()) {
-      hang_time = now - ctx_state->loop_states.begin()->second.first_loop_time;
-    }
-    loprintf(
-        "Possible kernel hang: launch_id=%lu — state(looping=%zu, barrier=%zu, progressing=%zu) for %ld seconds.\n",
-        current_kernel_launch_id, looping_cnt, barrier_cnt, progressing_cnt, hang_time);
-    print_warp_status_summary(ctx_state, current_kernel_launch_id);
-    if (!ctx_state->deadlock_termination_initiated) {
-      ctx_state->deadlock_consecutive_hits++;
-      if (ctx_state->deadlock_consecutive_hits >= 3) {
-        loprintf("Deadlock sustained for %d checks; sending SIGTERM.\n", ctx_state->deadlock_consecutive_hits);
-        ctx_state->deadlock_termination_initiated = true;
-        flush_log_files();
-        fflush(stdout);
-        fflush(stderr);
-        raise(SIGTERM);
-        sleep(2);
-        loprintf("Process still alive after SIGTERM; sending SIGKILL.\n");
-        raise(SIGKILL);
-      }
-    }
-  } else {
-    ctx_state->deadlock_consecutive_hits = 0;
+  time_t hang_time = 0;
+  if (!ctx_state->loop_states.empty()) {
+    hang_time = now - ctx_state->loop_states.begin()->second.first_loop_time;
   }
+  loprintf("Possible kernel hang: launch_id=%lu — state(looping=%zu, barrier=%zu, progressing=%zu) for %ld seconds.\n",
+           current_kernel_launch_id, looping_cnt, barrier_cnt, progressing_cnt, hang_time);
+  print_warp_status_summary(ctx_state, current_kernel_launch_id);
+  if (outcome != cutracer::HangCheckPolicy::Outcome::Terminate || ctx_state->deadlock_termination_initiated) {
+    return;
+  }
+  // Keep the "Deadlock sustained for " prefix: cutracer.watchdog, .ci/run_tests.sh,
+  // tests/hang_test/test_hang_e2e.py and the barrier capture audit match it.
+  const auto& policy = ctx_state->hang_check.config();
+  loprintf(
+      "Deadlock sustained for %u checks at least %lld ms apart: launch_id=%lu, no active warp progressing "
+      "(looping=%zu, barrier=%zu); sending SIGTERM.\n",
+      ctx_state->hang_check.hits(), static_cast<long long>(policy.interval.count()), current_kernel_launch_id,
+      looping_cnt, barrier_cnt);
+  ctx_state->deadlock_termination_initiated = true;
+  flush_log_files();
+  fflush(stdout);
+  fflush(stderr);
+  raise(SIGTERM);
+  sleep(2);
+  loprintf("Process still alive after SIGTERM; sending SIGKILL.\n");
+  raise(SIGKILL);
 }
 
 /**
@@ -1057,7 +1057,7 @@ void* recv_thread_fun(void* args) {
           if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
             WarpKey key = {ri->cta_id_x, ri->cta_id_y, ri->cta_id_z, ri->warp_id};
             if (is_new_kernel) {
-              ctx_state->last_hang_check_time = time(nullptr);
+              ctx_state->hang_check.restart(cutracer::HangCheckPolicy::Clock::now());
             }
             ctx_state->active_warps.insert(key);
             // Update last seen time for this warp

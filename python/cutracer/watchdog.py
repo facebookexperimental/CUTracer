@@ -3,9 +3,10 @@
 """Recognize runs that CUTracer's own watchdog ended.
 
 CUTracer ends a hung instrumented kernel itself: the kernel timeout
-(`CUTRACER_KERNEL_TIMEOUT_S`) and the no-data watchdog
-(`CUTRACER_NO_DATA_TIMEOUT_S`) write a line to the process's main log and send
-the process SIGTERM. The target's exit code then says little (the process died
+(`CUTRACER_KERNEL_TIMEOUT_S`), the no-data watchdog
+(`CUTRACER_NO_DATA_TIMEOUT_S`) and the online deadlock check
+(`-a deadlock_detection`) write a line to the process's main log and send the
+process SIGTERM. The target's exit code then says little (the process died
 of a signal, or a parent reported a failed worker), so a caller that needs to
 know whether a run hung reads the main logs instead.
 """
@@ -17,6 +18,7 @@ import os
 WATCHDOG_MARKERS: tuple[str, ...] = (
     "Kernel timeout: running for",
     "No-data hang detected",
+    "Deadlock sustained for ",
 )
 _MAIN_LOG_PREFIX = "cutracer_main_"
 _MAIN_LOG_SUFFIX = ".log"
