@@ -144,6 +144,11 @@ uint32_t kernel_timeout_s;
 // No-data hang detection timeout in seconds (default: 15)
 uint32_t no_data_timeout_s;
 
+// Online deadlock check policy (see env_config.h)
+uint32_t hang_check_interval_ms;
+uint32_t hang_check_hits;
+uint32_t hang_min_stall_s;
+
 // Trace file size limit in MB (0 = disabled)
 uint32_t trace_size_limit_mb;
 
@@ -1322,6 +1327,36 @@ void init_config_from_env() {
             "         kernels, raise CUTRACER_NO_DATA_TIMEOUT_S or set CUTRACER_KERNEL_TIMEOUT_S\n"
             "         (in this mode it counts from launch and names the kernel it ends).\n",
             no_data_timeout_s);
+  }
+
+  get_var_uint32(hang_check_interval_ms, "CUTRACER_HANG_CHECK_INTERVAL_MS", 1000,
+                 "Deadlock check: minimum time between checks in milliseconds (default: 1000)");
+  get_var_uint32(hang_check_hits, "CUTRACER_HANG_CHECK_HITS", 3,
+                 "Deadlock check: consecutive checks without progress that end the process (default: 3)");
+  get_var_uint32(hang_min_stall_s, "CUTRACER_HANG_MIN_STALL_S", 0,
+                 "Deadlock check: minimum stall in seconds before ending the process (0 = hits alone)");
+  if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
+    if (hang_check_interval_ms == 0 || hang_check_hits == 0) {
+      fprintf(stderr,
+              "FATAL: CUTRACER_HANG_CHECK_INTERVAL_MS (%u) and CUTRACER_HANG_CHECK_HITS (%u) must be positive.\n",
+              hang_check_interval_ms, hang_check_hits);
+      exit(1);
+    }
+    // Warps that block without spinning send no records, so the no-data
+    // watchdog ends such a stall before a longer minimum stall can expire.
+    if (no_data_timeout_s > 0 && hang_min_stall_s >= no_data_timeout_s) {
+      fprintf(stderr,
+              "WARNING: CUTRACER_HANG_MIN_STALL_S=%u is not below CUTRACER_NO_DATA_TIMEOUT_S=%u: a stall in which\n"
+              "         every warp blocks without sending trace data is ended by the no-data watchdog first.\n"
+              "         Raise CUTRACER_NO_DATA_TIMEOUT_S (--no-data-timeout-s) too if warps can block that long.\n",
+              hang_min_stall_s, no_data_timeout_s);
+    }
+    if (kernel_timeout_s > 0 && hang_min_stall_s >= kernel_timeout_s) {
+      fprintf(stderr,
+              "WARNING: CUTRACER_HANG_MIN_STALL_S=%u is not below CUTRACER_KERNEL_TIMEOUT_S=%u: the kernel timeout\n"
+              "         ends any stall that long before the deadlock check can.\n",
+              hang_min_stall_s, kernel_timeout_s);
+    }
   }
 
   // Trace file size limit (MB, 0 = disabled)

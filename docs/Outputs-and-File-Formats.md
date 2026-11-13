@@ -167,6 +167,22 @@ trace is complete only when its own `capture_completion` footer says so.
 - Every launched function is inspected once per module lifetime, selected or
   not: its instructions are walked and its CUBIN is dumped.
 
+## Warp Status NDJSON 🧭
+
+With `-a deadlock_detection` and an NDJSON trace format, CUTracer appends a snapshot of the launch's warps to `<kernel log basename>_warp_status_summary.ndjson`, one JSON object per line. The file is appended to across runs.
+
+- The online hang check writes one at its first stalled check and one when it ends the kernel. The kernel and no-data timeouts write one when they end it.
+- Each snapshot has `kernel_launch_id`, `warp_statistics` (grid, block and finished, active and never-executed warps), `active_warps` (per-warp state, loop and last instruction) and `trigger`:
+
+| `trigger` field | Meaning |
+|---|---|
+| `source` | `hang_check`, `kernel_timeout` or `no_data_timeout` |
+| `terminating` | true for the snapshot written as CUTracer ends the kernel |
+| `stalled_checks` | consecutive hang checks without progress so far |
+| `stalled_ms` | how long that run of checks has lasted |
+
+A `hang_check` snapshot with `terminating: true` means the check saw no progress for `--hang-check-hits` checks over at least `--hang-min-stall-s`.
+
 ## Delay Config JSON 🔀
 
 When using the `random_delay` analysis with `CUTRACER_DELAY_DUMP_PATH`, CUTracer writes a delay configuration JSON file for deterministic replay. This file is consumed by `CUTRACER_DELAY_LOAD_PATH`.

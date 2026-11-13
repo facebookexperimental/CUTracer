@@ -35,8 +35,18 @@ struct WarpStatusEntry {
   std::vector<InstructionInfo> loop_body;
 };
 
+// Why a snapshot was written: the online hang check (at its first stalled check
+// and when it ends the kernel), or the kernel or no-data timeout.
+struct WarpStatusTrigger {
+  const char* source = "hang_check";
+  bool terminating = false;
+  uint32_t stalled_checks = 0;
+  uint64_t stalled_ms = 0;
+};
+
 struct WarpStatusSummary {
   uint64_t kernel_launch_id = 0;
+  WarpStatusTrigger trigger;
   KernelDimensions dims = {};
   size_t total_warps = 0;
   size_t finished_warps = 0;

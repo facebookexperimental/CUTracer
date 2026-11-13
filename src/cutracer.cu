@@ -1059,6 +1059,8 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 void init_context_state(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
   CTXstate* ctx_state = ctx_state_map[ctx];
+  ctx_state->hang_check = cutracer::HangCheckPolicy(
+      {std::chrono::milliseconds(hang_check_interval_ms), hang_check_hits, std::chrono::seconds(hang_min_stall_s)});
   ctx_state->recv_thread_done = RecvThreadState::WORKING;
   cudaMallocManaged(&ctx_state->channel_dev, sizeof(ChannelDev));
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, channel_buffer_size, ctx_state->channel_dev,

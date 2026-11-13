@@ -270,6 +270,16 @@ extern uint32_t kernel_timeout_s;
 // Set via CUTRACER_NO_DATA_TIMEOUT_S environment variable
 extern uint32_t no_data_timeout_s;
 
+// Online deadlock check (-a deadlock_detection): checks run at least
+// hang_check_interval_ms apart, and hang_check_hits consecutive checks without
+// a progressing warp end the process once the stall has lasted
+// hang_min_stall_s. Defaults: 1000 ms, 3 hits, no minimum.
+// Set via CUTRACER_HANG_CHECK_INTERVAL_MS, CUTRACER_HANG_CHECK_HITS and
+// CUTRACER_HANG_MIN_STALL_S.
+extern uint32_t hang_check_interval_ms;
+extern uint32_t hang_check_hits;
+extern uint32_t hang_min_stall_s;
+
 // Trace file size limit in MB (0 = disabled)
 // When the trace file exceeds this limit, the process is automatically terminated.
 // Set via CUTRACER_TRACE_SIZE_LIMIT_MB environment variable
