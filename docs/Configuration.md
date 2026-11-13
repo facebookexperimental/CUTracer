@@ -214,6 +214,18 @@ runaway-large. All accept `0` to disable.
 | `CUTRACER_NO_DATA_TIMEOUT_S` | uint32 | `15` | Abort if no records arrive on the channel for this many seconds. With `random_delay` alone no records ever arrive, so this is a per-kernel wall-clock limit counted from launch; CUTracer warns at startup when it is the only limit in that mode |
 | `CUTRACER_TRACE_SIZE_LIMIT_MB` | uint32 | `0` (disabled) | Stop tracing once the on-disk trace reaches this size (MB) |
 
+### Deadlock Check Policy
+
+With `CUTRACER_ANALYSIS=deadlock_detection`, the online check ends the run after
+a number of consecutive checks in which no active warp makes progress. See
+[Analyses](Analyses.md) for the rule.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `CUTRACER_HANG_CHECK_INTERVAL_MS` | uint32 | `1000` | Minimum time between two checks. Must be positive |
+| `CUTRACER_HANG_CHECK_HITS` | uint32 | `3` | Consecutive checks without a progressing warp that end the run. Must be positive |
+| `CUTRACER_HANG_MIN_STALL_S` | uint32 | `0` (hits alone) | The stall must also have lasted this long, counted from the first check without progress. Set it above the longest wait a correct kernel can spend spinning; keep it below `CUTRACER_NO_DATA_TIMEOUT_S` if warps may block without spinning |
+
 ---
 
 ## Implicitly Set Variables
@@ -251,6 +263,9 @@ CUDA/NVBit/driver versions must be compatible with your GPU.
 | `CUTRACER_DUMP_CUBIN` | Debug |
 | `CUTRACER_EXACT_KERNEL_CHECKSUM` | Targeted Capture |
 | `CUTRACER_EXACT_KERNEL_NAME` | Targeted Capture |
+| `CUTRACER_HANG_CHECK_HITS` | Advanced — Deadlock Check Policy |
+| `CUTRACER_HANG_CHECK_INTERVAL_MS` | Advanced — Deadlock Check Policy |
+| `CUTRACER_HANG_MIN_STALL_S` | Advanced — Deadlock Check Policy |
 | `CUTRACER_INSTR_CATEGORIES` | Instruction Category Filtering |
 | `CUTRACER_INSTRUMENTATION_PLAN` | Advanced — Instrumentation Plans |
 | `CUTRACER_INSTRUMENT` | Core |

@@ -340,6 +340,10 @@ void write_warp_status_json(const WarpStatusSummary& summary, const std::string&
 
   json root;
   root["kernel_launch_id"] = summary.kernel_launch_id;
+  root["trigger"] = {{"source", summary.trigger.source},
+                     {"terminating", summary.trigger.terminating},
+                     {"stalled_checks", summary.trigger.stalled_checks},
+                     {"stalled_ms", summary.trigger.stalled_ms}};
 
   if (summary.has_stats) {
     json warp_stats;

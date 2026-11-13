@@ -338,6 +338,18 @@ class TestHangE2E(unittest.TestCase):
             f"Expected all snapshots to share kernel_launch_id, got: {kernel_ids}",
         )
 
+        # The online hang check writes a snapshot at its first stalled check
+        # and one when it ends the kernel; each says why it was written.
+        triggers = [r.get("trigger", {}) for r in records]
+        self.assertEqual({t.get("source") for t in triggers}, {"hang_check"}, triggers)
+        self.assertEqual(
+            (triggers[0].get("terminating"), triggers[0].get("stalled_checks")),
+            (False, 1),
+            triggers,
+        )
+        self.assertTrue(triggers[-1].get("terminating"), triggers)
+        self.assertGreaterEqual(triggers[-1].get("stalled_checks", 0), 3, triggers)
+
         # Every warp entry must carry inactive_secs (consistency with text)
         # and at least one entry across all snapshots must be LOOPING.
         saw_looping = False

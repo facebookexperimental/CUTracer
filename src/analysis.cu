@@ -578,8 +578,16 @@ static void clear_deadlock_state(CTXstate* ctx_state, uint64_t kernel_launch_id 
   }
 }
 
-static void print_warp_status_summary(CTXstate* ctx_state, uint64_t current_kernel_launch_id) {
+static WarpStatusTrigger warp_status_trigger(const CTXstate* ctx_state, const char* source, bool terminating) {
+  const auto& policy = ctx_state->hang_check;
+  const auto stalled = policy.stalled_for(cutracer::HangCheckPolicy::Clock::now());
+  return {source, terminating, policy.hits(), static_cast<uint64_t>(stalled.count())};
+}
+
+static void print_warp_status_summary(CTXstate* ctx_state, uint64_t current_kernel_launch_id,
+                                      const WarpStatusTrigger& trigger) {
   auto summary = collect_warp_status(ctx_state, current_kernel_launch_id);
+  summary.trigger = trigger;
   if (trace_format == 0) {
     print_warp_status_text(summary);
   } else {
@@ -688,18 +696,25 @@ static void check_kernel_hang(CTXstate* ctx_state, uint64_t current_kernel_launc
   }
   loprintf("Possible kernel hang: launch_id=%lu — state(looping=%zu, barrier=%zu, progressing=%zu) for %ld seconds.\n",
            current_kernel_launch_id, looping_cnt, barrier_cnt, progressing_cnt, hang_time);
-  print_warp_status_summary(ctx_state, current_kernel_launch_id);
-  if (outcome != cutracer::HangCheckPolicy::Outcome::Terminate || ctx_state->deadlock_termination_initiated) {
+  // The per-warp report can run to megabytes on a large grid. A long minimum
+  // stall means many stalled checks, so report at the first and the last.
+  const bool terminate = outcome == cutracer::HangCheckPolicy::Outcome::Terminate;
+  if (terminate || ctx_state->hang_check.hits() == 1) {
+    print_warp_status_summary(ctx_state, current_kernel_launch_id,
+                              warp_status_trigger(ctx_state, "hang_check", terminate));
+  }
+  if (!terminate || ctx_state->deadlock_termination_initiated) {
     return;
   }
   // Keep the "Deadlock sustained for " prefix: cutracer.watchdog, .ci/run_tests.sh,
   // tests/hang_test/test_hang_e2e.py and the barrier capture audit match it.
   const auto& policy = ctx_state->hang_check.config();
   loprintf(
-      "Deadlock sustained for %u checks at least %lld ms apart: launch_id=%lu, no active warp progressing "
-      "(looping=%zu, barrier=%zu); sending SIGTERM.\n",
-      ctx_state->hang_check.hits(), static_cast<long long>(policy.interval.count()), current_kernel_launch_id,
-      looping_cnt, barrier_cnt);
+      "Deadlock sustained for %u checks at least %lld ms apart over %lld ms (minimum stall %lld ms): launch_id=%lu, "
+      "no active warp progressing (looping=%zu, barrier=%zu); sending SIGTERM.\n",
+      ctx_state->hang_check.hits(), static_cast<long long>(policy.interval.count()),
+      static_cast<long long>(ctx_state->hang_check.stalled_for(check_time).count()),
+      static_cast<long long>(policy.min_stall.count()), current_kernel_launch_id, looping_cnt, barrier_cnt);
   ctx_state->deadlock_termination_initiated = true;
   flush_log_files();
   fflush(stdout);
@@ -736,7 +751,8 @@ static void check_kernel_timeout(CTXstate* ctx_state, uint64_t current_kernel_la
     loprintf("Kernel timeout: running for %ld seconds (limit: %u seconds); sending SIGTERM. kernel=%s\n",
              kernel_running_time, kernel_timeout_s, kernel_name.c_str());
     if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
-      print_warp_status_summary(ctx_state, current_kernel_launch_id);
+      print_warp_status_summary(ctx_state, current_kernel_launch_id,
+                                warp_status_trigger(ctx_state, "kernel_timeout", true));
     }
     ctx_state->deadlock_termination_initiated = true;
     flush_log_files();
@@ -794,7 +810,8 @@ static void check_no_data_timeout(CTXstate* ctx_state, uint64_t current_kernel_l
           silence_duration, no_data_timeout_s);
     }
     if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
-      print_warp_status_summary(ctx_state, current_kernel_launch_id);
+      print_warp_status_summary(ctx_state, current_kernel_launch_id,
+                                warp_status_trigger(ctx_state, "no_data_timeout", true));
     }
     ctx_state->deadlock_termination_initiated = true;
     flush_log_files();

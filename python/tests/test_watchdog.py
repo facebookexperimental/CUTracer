@@ -17,8 +17,9 @@ NO_DATA = (
     "any trace data (limit: 15 seconds); sending SIGTERM."
 )
 DEADLOCK = (
-    "Deadlock sustained for 3 checks at least 1000 ms apart: launch_id=7, no active warp "
-    "progressing (looping=12, barrier=4); sending SIGTERM."
+    "Deadlock sustained for 3 checks at least 1000 ms apart over 2000 ms (minimum "
+    "stall 0 ms): launch_id=7, no active warp progressing (looping=12, barrier=4); "
+    "sending SIGTERM."
 )
 POSSIBLE_HANG = (
     "Possible kernel hang: launch_id=7 — state(looping=12, barrier=4, "

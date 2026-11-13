@@ -66,6 +66,9 @@ class InstrumentationConfig:
     trace_size_limit_mb: int = 0
     kernel_timeout_s: int = 0
     no_data_timeout_s: int = 15
+    hang_check_interval_ms: int = 1000
+    hang_check_hits: int = 3
+    hang_min_stall_s: int = 0
     cwd: Optional[str] = None
     timeout: Optional[int] = None
     base_env: Optional[Mapping[str, str]] = None
@@ -329,6 +332,9 @@ def build_cutracer_env(
     trace_size_limit_mb: int = 0,
     kernel_timeout_s: int = 0,
     no_data_timeout_s: int = 15,
+    hang_check_interval_ms: int = 1000,
+    hang_check_hits: int = 3,
+    hang_min_stall_s: int = 0,
     base_env: Optional[Mapping[str, str]] = None,
     use_bundled_cuda_tools: bool = True,
     exact_kernel_name: Optional[str] = None,
@@ -417,6 +423,9 @@ def build_cutracer_env(
     env["CUTRACER_TRACE_SIZE_LIMIT_MB"] = str(trace_size_limit_mb)
     env["CUTRACER_KERNEL_TIMEOUT_S"] = str(kernel_timeout_s)
     env["CUTRACER_NO_DATA_TIMEOUT_S"] = str(no_data_timeout_s)
+    env["CUTRACER_HANG_CHECK_INTERVAL_MS"] = str(hang_check_interval_ms)
+    env["CUTRACER_HANG_CHECK_HITS"] = str(hang_check_hits)
+    env["CUTRACER_HANG_MIN_STALL_S"] = str(hang_min_stall_s)
 
     # NVBit launches nvdisasm after importlib's resource context has exited.
     # Zip/PEX resources therefore need a persistent path, not the temporary
@@ -490,6 +499,9 @@ def _resolve_and_build_env(
         trace_size_limit_mb=config.trace_size_limit_mb,
         kernel_timeout_s=config.kernel_timeout_s,
         no_data_timeout_s=config.no_data_timeout_s,
+        hang_check_interval_ms=config.hang_check_interval_ms,
+        hang_check_hits=config.hang_check_hits,
+        hang_min_stall_s=config.hang_min_stall_s,
         base_env=config.base_env,
         use_bundled_cuda_tools=config.use_bundled_cuda_tools,
     )
@@ -779,6 +791,9 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_TRACE_SIZE_LIMIT_MB",
         "CUTRACER_KERNEL_TIMEOUT_S",
         "CUTRACER_NO_DATA_TIMEOUT_S",
+        "CUTRACER_HANG_CHECK_INTERVAL_MS",
+        "CUTRACER_HANG_CHECK_HITS",
+        "CUTRACER_HANG_MIN_STALL_S",
     ]
     click.echo("=" * 60)
     click.echo("CUTracer Configuration:")
@@ -994,6 +1009,32 @@ _CUTRACER_OPTIONS = [
         "Independent of deadlock detection (does not require -a deadlock_detection). "
         "Set to 0 to disable.",
     ),
+    click.option(
+        "--hang-check-interval-ms",
+        type=click.IntRange(min=1),
+        default=1000,
+        show_default=True,
+        help="With -a deadlock_detection: minimum time between two checks of "
+        "whether any active warp is still making progress.",
+    ),
+    click.option(
+        "--hang-check-hits",
+        type=click.IntRange(min=1),
+        default=3,
+        show_default=True,
+        help="With -a deadlock_detection: consecutive checks without a "
+        "progressing warp that end the process.",
+    ),
+    click.option(
+        "--hang-min-stall-s",
+        type=click.IntRange(min=0),
+        default=0,
+        show_default=True,
+        help="With -a deadlock_detection: also require the stall to last this "
+        "many seconds, counted from the first check without progress, before "
+        "ending the process. Set it above the longest wait a correct kernel "
+        "can spend spinning (for example on another rank). 0 = hits alone.",
+    ),
 ]
 
 
@@ -1037,6 +1078,9 @@ def trace_command(
     trace_size_limit_mb: int,
     kernel_timeout_s: int,
     no_data_timeout_s: int,
+    hang_check_interval_ms: int,
+    hang_check_hits: int,
+    hang_min_stall_s: int,
     cmd: tuple,
 ) -> None:
     """Trace a CUDA application with CUTracer.
@@ -1146,6 +1190,9 @@ def trace_command(
         trace_size_limit_mb=trace_size_limit_mb,
         kernel_timeout_s=kernel_timeout_s,
         no_data_timeout_s=no_data_timeout_s,
+        hang_check_interval_ms=hang_check_interval_ms,
+        hang_check_hits=hang_check_hits,
+        hang_min_stall_s=hang_min_stall_s,
         capture_output=False,
         shell=True,
     )

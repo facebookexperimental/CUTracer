@@ -15,16 +15,21 @@ namespace cutracer {
 struct HangCheckConfig {
   std::chrono::milliseconds interval{1000};
   uint32_t required_hits{3};
+  // The stall must also have lasted this long, measured from the first check
+  // that saw no progress. Set it above the longest wait a correct kernel can
+  // spend spinning, for example on another rank. Zero leaves it to the hits.
+  std::chrono::milliseconds min_stall{0};
 };
 
 // When the online deadlock check (-a deadlock_detection) ends a kernel.
 //
 // The receiver asks `due()` as records arrive. A due check classifies every
 // active warp and reports how many there are and how many are still making
-// progress; a run of `required_hits` consecutive checks with active warps but
-// none progressing terminates the kernel. A check with no active warp starts
-// the count over. Checks are at least `interval` apart on a monotonic clock,
-// so a run of N hits spans at least (N - 1) intervals.
+// progress. A run of `required_hits` consecutive checks with active warps but
+// none progressing terminates the kernel once the run has lasted `min_stall`;
+// a check with no active warp starts the count over. Checks are at least
+// `interval` apart on a monotonic clock, so a terminating run spans at least
+// (required_hits - 1) intervals and at least `min_stall`.
 class HangCheckPolicy {
  public:
   using Clock = std::chrono::steady_clock;
@@ -32,8 +37,8 @@ class HangCheckPolicy {
   enum class Outcome {
     Idle,       // no active warp to judge; the count starts over
     Progress,   // some active warp is still making progress
-    Stall,      // no warp made progress; not yet enough consecutive hits
-    Terminate,  // `required_hits` consecutive checks without progress
+    Stall,      // no warp made progress; too few hits, or shorter than `min_stall`
+    Terminate,  // `required_hits` checks without progress over `min_stall`
   };
 
   explicit HangCheckPolicy(HangCheckConfig config = {}) : config_{config} {
@@ -60,12 +65,24 @@ class HangCheckPolicy {
       hits_ = 0;
       return Outcome::Progress;
     }
+    if (hits_ == 0) {
+      stall_start_ = now;
+    }
     ++hits_;
-    return hits_ >= config_.required_hits ? Outcome::Terminate : Outcome::Stall;
+    const bool long_enough = now - stall_start_ >= config_.min_stall;
+    return (hits_ >= config_.required_hits && long_enough) ? Outcome::Terminate : Outcome::Stall;
   }
 
   uint32_t hits() const {
     return hits_;
+  }
+
+  // How long the current run of checks without progress has lasted.
+  std::chrono::milliseconds stalled_for(Clock::time_point now) const {
+    if (hits_ == 0) {
+      return std::chrono::milliseconds{0};
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - stall_start_);
   }
 
   const HangCheckConfig& config() const {
@@ -75,6 +92,7 @@ class HangCheckPolicy {
  private:
   HangCheckConfig config_;
   std::optional<Clock::time_point> last_check_;
+  Clock::time_point stall_start_{};
   uint32_t hits_ = 0;
 };
 

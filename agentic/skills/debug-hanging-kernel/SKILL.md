@@ -63,6 +63,12 @@ cutracer trace -i reg_trace -a deadlock_detection --channel-records 1 \
   `LOOPING` or `BARRIER`, or at `--kernel-timeout-s`, whichever comes first.
   `--trace-size-limit-mb` caps the trace. The run exits nonzero (241 after
   SIGTERM, 247 after SIGKILL); that is expected.
+- The deadlock check ends a run after three checks about a second apart, so a
+  correct kernel whose warps legitimately spin for more than 2 to 3 seconds
+  (for example waiting on another rank) is also ended. If the kernel can wait
+  that long, pass `--hang-min-stall-s` above the longest legitimate wait (and
+  `--no-data-timeout-s` above it if warps block without spinning); the log
+  line says how long the stall lasted.
 - The report lists every active warp, so with a large grid `run.log` runs to
   megabytes. Read the `WARP STATISTICS` block first
   (`grep -A14 'WARP STATISTICS' <dir>/run.log`), then single warps.

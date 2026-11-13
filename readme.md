@@ -105,6 +105,8 @@ cutracer analyze warp-summary hang/<trace>.ndjson
 
 `-a deadlock_detection` turns on `reg_trace`, classifies each warp as `BARRIER`, `LOOPING` or `PROGRESSING`, prints a warp report and ends a hung run with SIGTERM, then SIGKILL (exit status 241 or 247). `--channel-records 1` flushes every record, so the trace reaches the moment of the hang. Without this analysis, `--no-data-timeout-s` (default 15 s) still ends a run whose kernels stop sending records, and `--kernel-timeout-s` ends a kernel that runs too long; `0` turns either off.
 
+With the defaults the check ends a run after 3 checks about 1 s apart in which no warp made progress, so a correct kernel whose warps spin longer, for example while waiting on another rank, is ended too. Raise `--hang-min-stall-s` above the longest such wait, and `--no-data-timeout-s` with it if warps can block without spinning.
+
 ### Find and shrink a data race
 
 A data race depends on timing, so a buggy kernel can pass by luck. `random_delay` injects random per-thread delays before synchronization instructions, which makes such races fail visibly. `cutracer stress` automates the search: it runs an oracle command (exit 0 when the bug reproduced, non-zero otherwise) under several delay strategies, after control runs with every delay turned off, and saves the first delay config that reproduces the bug.
@@ -172,6 +174,7 @@ Most `cutracer trace` flags set an environment variable that `cutracer.so` reads
 | `CUTRACER_OUTPUT_DIR` | `-o` | Output directory, created if missing |
 | `CUTRACER_TRACE_FORMAT` | `--trace-format` | `ndjson` (default), `zstd`, `text` or `clp` |
 | `CUTRACER_NO_DATA_TIMEOUT_S`, `CUTRACER_KERNEL_TIMEOUT_S` | `--no-data-timeout-s`, `--kernel-timeout-s` | Hang watchdogs |
+| `CUTRACER_HANG_CHECK_INTERVAL_MS`, `CUTRACER_HANG_CHECK_HITS`, `CUTRACER_HANG_MIN_STALL_S` | `--hang-check-interval-ms`, `--hang-check-hits`, `--hang-min-stall-s` | When `-a deadlock_detection` ends a run as hung |
 | `CUTRACER_DELAY_*`, `CUTRACER_CLUSTER_CTA_ID` | `--delay-*` | Delay injection, dump and replay |
 | `INSTR_BEGIN`, `INSTR_END` | | Instrument only a range of static instruction indices |
 | `CUTRACER_EXACT_KERNEL_NAME`, `CUTRACER_EXACT_KERNEL_CHECKSUM` | | Instrument exactly one kernel, by full name and checksum |
