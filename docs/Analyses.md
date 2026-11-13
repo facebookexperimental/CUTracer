@@ -190,6 +190,22 @@ cutracer stress -k my_kernel --not-interesting-exit-codes 1 --confirm -o /tmp/s 
 - The node runs in a child of `--python`, the project's interpreter, which inherits CUTracer's injection; the oracle itself never loads CUDA. `-o` keeps each run's report, log, delay config and `outcome.json` in an `attempt-*` directory; every run also prints its exit code and the reason on one stderr line. `--pytest-arg=ARG` (repeatable) adds pytest arguments after the defaults `-p no:timeout -o addopts=`.
 - The oracle is one standalone script (standard library only, plus pytest in the child). A search runs its oracle for every attempt and control run, and starting CUTracer each time costs seconds, so CI should write the script out once with `cutracer oracle export /tmp/s/oracle.py` and use `.venv/bin/python /tmp/s/oracle.py --rootdir . --nodeid ...` as the oracle (`--python` then defaults to that interpreter).
 
+#### Any command as the oracle (`cutracer oracle cmd`)
+
+For a workload that is not a pytest node — a TritonBench or tutorial script, a shell command, a Buck `python_unittest` target — `cutracer oracle cmd` maps its exit codes to the same contract without a wrapper script:
+
+```bash
+cutracer stress -k my_kernel --not-interesting-exit-codes 1 --confirm -o /tmp/s -- \
+    cutracer oracle cmd --fail-codes 1 --pass-codes 0 --fail-pattern 'AssertionError|mismatch' \
+    -k my_kernel --signature-file /tmp/s/signature -o /tmp/s/oracle -- \
+    python /path/to/workload.py --args
+```
+
+- Exit 0 when the command exits with a `--fail-codes` code (1 by default), 1 when it exits with a `--pass-codes` code (0 by default); any other code, a signal, a `--timeout` or an interrupt exits 2, so a crash never reads as a pass or a reproduction.
+- `--fail-pattern REGEX` requires the regex in the command's output (stdout and stderr) for a fail-code run to count, and pins the signature on the matched text; without it the signature is the exit code alone, so two different failures that share a fail code count as the same failure. Prefer a pattern whenever the command can fail in more than one way, especially with `--confirm`, whose replays should reproduce the same failure and not just any fail-code exit.
+- Like the pytest oracle, an injected run must have launched a kernel matching `-k` with delay points in its delay config, `--signature-file` pins the first reproduction for the replays of `--confirm` (an empty file pins nothing yet), `-o` keeps each run's log, delay config and `outcome.json` in an `attempt-*` directory, every run prints its exit code and the reason on one stderr line, and `--plain` runs without CUTracer, for a preflight.
+- The same standalone script serves both modes: `cutracer oracle export /tmp/s/oracle.py` once, then `/usr/bin/python3 /tmp/s/oracle.py cmd --fail-codes ... -- <command>` as the oracle.
+
 Random delays slow a producer down along with its consumers, so they rarely let the producer lap a consumer that is missing from the release protocol. `--strategy isolate` tries one target per attempt (per instrumented kernel in first-launch order, cluster ranks high to low and then warps within each kernel, taken from every instrumented launch shape of the control arm, or from `--isolate-ranks` and `--isolate-warps`) and stops at the first that fails. A consumer that reaches its wait two phases late waits on the parity of a phase that may never complete, so isolate counts a hang ended by CUTracer's kernel timeout as a reproduction (`--hang-is-bug`, with `--kernel-timeout-s 60`) and reports it as `"symptom": "hang"`. By default each target gets one 1 ms delay: a clean kernel with W warps per CTA and clusters of C CTAs costs W × C attempts.
 
 ```bash
