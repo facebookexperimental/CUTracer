@@ -21,12 +21,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -1054,6 +1057,51 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
   return should_instrument;
 }
 
+// NVBit identifies tool threads by the hash of their std::thread::id, as
+// ChannelHost::get_thread_id() does for the receiver.
+static uint64_t nvbit_thread_key(std::thread::id id) {
+  return std::hash<std::thread::id>{}(id);
+}
+
+// The drain worker issues the context's post-launch CUDA calls. It registers
+// as an NVBit tool thread, so those calls trigger no callbacks; makes the
+// context current; and switches to relaxed capture mode, so its event waits
+// and private-stream syncs do not invalidate another thread's global-mode
+// capture. Returns false if the worker cannot drain for this context.
+static bool start_drain_thread(CUcontext ctx, CTXstate* ctx_state) {
+  nvbit_set_tool_thread(nvbit_thread_key(std::this_thread::get_id()));
+  cutracer::ScopedCudaCallbackSuppression suppress_callbacks;
+  if (cuCtxSetCurrent(ctx) != CUDA_SUCCESS) return false;
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess) return false;
+  return cudaStreamCreateWithFlags(&ctx_state->drain_stream, cudaStreamNonBlocking) == cudaSuccess;
+}
+
+static void stop_drain_thread(CTXstate* ctx_state) {
+  cutracer::ScopedCudaCallbackSuppression suppress_callbacks;
+  if (ctx_state->drain_stream) {
+    cudaStreamDestroy(ctx_state->drain_stream);
+    ctx_state->drain_stream = nullptr;
+  }
+  nvbit_unset_tool_thread(nvbit_thread_key(std::this_thread::get_id()));
+}
+
+// Starts the context's drain worker and waits for it to come up. If it cannot,
+// launches drain on the launching thread as before.
+static void init_drain_worker(CUcontext ctx, CTXstate* ctx_state) {
+  auto started = std::make_shared<std::promise<bool>>();
+  auto started_result = started->get_future();
+  auto worker = std::make_unique<cutracer::LaunchDrainWorker>(
+      [ctx, ctx_state, started] { started->set_value(start_drain_thread(ctx, ctx_state)); },
+      [ctx_state] { stop_drain_thread(ctx_state); });
+  if (started_result.get()) {
+    ctx_state->drain_worker = std::move(worker);
+    return;
+  }
+  worker->stop();
+  loprintf("WARNING: launch drain worker could not start for context %p; draining on the launching thread\n", ctx);
+}
+
 // Reference code from NVIDIA nvbit mem_trace tool
 // Reference code from NVIDIA nvbit mem_trace tool
 void init_context_state(CUcontext ctx) {
@@ -1066,6 +1114,7 @@ void init_context_state(CUcontext ctx) {
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, channel_buffer_size, ctx_state->channel_dev,
                                recv_thread_fun, ctx);
   nvbit_set_tool_thread(ctx_state->channel_host.get_thread_id());
+  init_drain_worker(ctx, ctx_state);
   if (runtime_plan_requested.load()) apply_runtime_plan([&](auto& plan) { plan.initialize_context(ctx); });
 }
 
@@ -1465,40 +1514,111 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   return should_instrument;
 }
 
-enum class CaptureSyncScope { Device, Stream };
-
 struct CaptureDrainResult {
   bool kernel_completed;
   bool channel_drained;
 };
 
-static CaptureDrainResult synchronize_and_drain_capture(CUcontext ctx, CTXstate* ctx_state, CaptureSyncScope scope,
-                                                        CUstream stream, bool launch_succeeded) {
-  // A default-stream wait is not a device-wide wait. Keep the scope explicit
-  // for both synchronization points, even when the graph stream is nullptr.
-  const auto synchronize = [scope, stream] {
-    return scope == CaptureSyncScope::Device ? cudaDeviceSynchronize() : cudaStreamSynchronize(stream);
-  };
-  const auto kernel_status = synchronize();
-  bool channel_drained = false;
-  if (kernel_status == cudaSuccess) {
-    void* flush_args[] = {&ctx_state->channel_dev};
-    const auto flush_stream = scope == CaptureSyncScope::Device ? nullptr : stream;
-    const int flush_status =
-        nvbit_launch_kernel(ctx, ctx_state->flush_channel_func, 1, 1, 1, 1, 1, 1, 0, flush_stream, flush_args, nullptr);
-    channel_drained = flush_status == 0 && synchronize() == cudaSuccess;
-  }
+static bool flush_channel(CUcontext ctx, CTXstate* ctx_state, CUstream stream) {
+  void* flush_args[] = {&ctx_state->channel_dev};
+  return nvbit_launch_kernel(ctx, ctx_state->flush_channel_func, 1, 1, 1, 1, 1, 1, 0, stream, flush_args, nullptr) == 0;
+}
+
+// Direct launches: the whole device must be idle before the flush, as before
+// the drain moved off the launching thread.
+static CaptureDrainResult drain_after_device_sync(CUcontext ctx, CTXstate* ctx_state, bool launch_succeeded) {
+  const auto kernel_status = cudaDeviceSynchronize();
+  const bool channel_drained =
+      kernel_status == cudaSuccess && flush_channel(ctx, ctx_state, nullptr) && cudaDeviceSynchronize() == cudaSuccess;
   if (!channel_drained) {
     ctx_state->channel_failed = true;
   }
   return {launch_succeeded && kernel_status == cudaSuccess, channel_drained};
 }
 
-// the function is only called for non cuda graph launch cases.
-static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
-                                bool launch_succeeded) {
-  const auto completion =
-      synchronize_and_drain_capture(ctx, ctx_state, CaptureSyncScope::Device, nullptr, launch_succeeded);
+// Graph launches: wait for the event the launching thread recorded behind the
+// graph on its stream, then flush on the worker's private stream. The kernels
+// have finished, so the flush needs no ordering against application work.
+static CaptureDrainResult drain_after_event(CUcontext ctx, CTXstate* ctx_state, cudaEvent_t launch_end,
+                                            bool launch_succeeded) {
+  const auto kernel_status = launch_end ? cudaEventSynchronize(launch_end) : cudaDeviceSynchronize();
+  if (launch_end) cudaEventDestroy(launch_end);
+  const auto flush_stream = ctx_state->drain_stream;
+  const auto flushed = [&] { return flush_stream ? cudaStreamSynchronize(flush_stream) : cudaDeviceSynchronize(); };
+  const bool channel_drained =
+      kernel_status == cudaSuccess && flush_channel(ctx, ctx_state, flush_stream) && flushed() == cudaSuccess;
+  if (!channel_drained) {
+    ctx_state->channel_failed = true;
+  }
+  return {launch_succeeded && kernel_status == cudaSuccess, channel_drained};
+}
+
+// Records, on the launching thread, where a launch ends on its stream. A
+// per-thread default stream names a different stream on any other thread, so
+// the drain worker waits for this event instead of for the stream. Returns
+// nullptr if the event cannot be recorded; the worker then waits for the device.
+static cudaEvent_t record_launch_end(CUstream stream, int api) {
+  cudaStream_t record_stream = stream;
+  if (record_stream == nullptr && api == API_CUDA_cuGraphLaunch_ptsz) record_stream = cudaStreamPerThread;
+  cudaEvent_t event = nullptr;
+  if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+  if (cudaEventRecord(event, record_stream) != cudaSuccess) {
+    cudaEventDestroy(event);
+    return nullptr;
+  }
+  return event;
+}
+
+// Queues a launch's drain on the context's worker (or runs it here if there is
+// none) and returns its ticket. A drain that throws marks the channel failed and
+// runs `on_failure`, which posts the launch's capture completion as failed:
+// otherwise its trace would stay open and the no-data watchdog would later end
+// the run as a hang.
+template <typename Drain, typename OnFailure>
+static uint64_t queue_drain(CTXstate* ctx_state, Drain drain, OnFailure on_failure) {
+  auto job = [ctx_state, drain, on_failure]() mutable {
+    cutracer::ScopedCudaCallbackSuppression suppress_callbacks;
+    std::string failure;
+    try {
+      drain();
+      return;
+    } catch (const std::exception& error) {
+      failure = error.what();
+    } catch (...) {
+      failure = "unknown exception";
+    }
+    ctx_state->channel_failed = true;
+    loprintf("ERROR: launch drain failed: %s\n", failure.c_str());
+    on_failure();
+  };
+  if (!ctx_state->drain_worker) {
+    job();
+    return 0;
+  }
+  return ctx_state->drain_worker->submit(std::move(job));
+}
+
+// Runs a launch's drain on the context's worker and waits for it, so the
+// launching thread returns only after the capture completion is posted.
+// Returns whether the drain saw the launch complete.
+template <typename Drain, typename OnFailure>
+static bool run_drain(CTXstate* ctx_state, Drain drain, OnFailure on_failure) {
+  bool completed = false;
+  const uint64_t ticket = queue_drain(ctx_state, [&completed, drain]() mutable { completed = drain(); }, on_failure);
+  if (ctx_state->drain_worker) ctx_state->drain_worker->wait(ticket);
+  return completed;
+}
+
+// When the drain ran on the launching thread, a fault it saw also became that
+// thread's last CUDA error, which a launch check such as PyTorch's reads right
+// after the launch. Keep that: the device is idle by now, so this is cheap.
+static void surface_launch_failure() {
+  cudaDeviceSynchronize();
+}
+
+static bool finish_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
+                                 bool launch_succeeded) {
+  const auto completion = drain_after_device_sync(ctx, ctx_state, launch_succeeded);
   const bool kernel_completed = completion.kernel_completed;
   const bool channel_drained = completion.channel_drained;
   if (launch_id) {
@@ -1517,21 +1637,55 @@ static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optiona
                kernel_completed, channel_drained);
     }
   }
+  return kernel_completed;
 }
 
-static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool launch_succeeded) {
-  const auto completion =
-      synchronize_and_drain_capture(ctx, ctx_state, CaptureSyncScope::Stream, stream, launch_succeeded);
+// the function is only called for non cuda graph launch cases.
+static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
+                                bool launch_succeeded) {
+  const bool completed = run_drain(
+      ctx_state, [=] { return finish_kernel_launch(ctx, ctx_state, launch_id, launch_succeeded); },
+      [=] {
+        if (launch_id) ctx_state->capture_completions.request({*launch_id, false, false, "launch_drain_failed"});
+      });
+  if (!completed) surface_launch_failure();
+}
+
+// The kernels a cuGraphLaunch registered and its runtime identity frame are
+// taken at its exit, on the launching thread, and handed to its drain.
+struct GraphLaunchExit {
+  std::vector<uint64_t> launch_ids;
+  std::optional<cutracer::RuntimeGraphTracker::Exit> runtime;
+};
+
+static bool finish_graph_launch(CUcontext ctx, CTXstate* ctx_state, const GraphLaunchExit& exit, cudaEvent_t launch_end,
+                                bool launch_succeeded) {
+  const auto completion = drain_after_event(ctx, ctx_state, launch_end, launch_succeeded);
   const bool kernel_completed = completion.kernel_completed;
   const bool channel_drained = completion.channel_drained;
   const std::string error = kernel_completed && channel_drained ? "" : "cuda_graph_launch_or_flush_failed";
-  finish_runtime_graph(ctx, ctx_state, stream, api, true, kernel_completed, channel_drained);
+  complete_runtime_graph(ctx, ctx_state, exit.runtime, kernel_completed, channel_drained);
   if (!runtime_plan_requested.load())
-    ctx_state->capture_completions.request_graph_completion(kernel_completed, channel_drained, error);
+    ctx_state->capture_completions.request_graph_completion(exit.launch_ids, kernel_completed, channel_drained, error);
   if (!error.empty()) {
     loprintf("ERROR: incomplete graph capture: kernel_completed=%d channel_drained=%d\n", kernel_completed,
              channel_drained);
   }
+  return kernel_completed;
+}
+
+static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool launch_succeeded) {
+  const GraphLaunchExit exit{ctx_state->capture_completions.take_graph_launches(),
+                             take_runtime_graph(ctx, stream, api, true)};
+  const cudaEvent_t launch_end = record_launch_end(stream, api);
+  const bool completed = run_drain(
+      ctx_state, [=] { return finish_graph_launch(ctx, ctx_state, exit, launch_end, launch_succeeded); },
+      [=] {
+        complete_runtime_graph(ctx, ctx_state, exit.runtime, false, false);
+        if (!runtime_plan_requested.load())
+          ctx_state->capture_completions.request_graph_completion(exit.launch_ids, false, false, "launch_drain_failed");
+      });
+  if (!completed) surface_launch_failure();
 }
 
 // CUDA 12+ launch APIs also accept a CUkernel, which the CUDA runtime passes
@@ -1766,6 +1920,12 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   /* get context state from map */
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
   CTXstate* ctx_state = ctx_state_map[ctx];
+
+  // Its last action destroys its stream and unregisters it from NVBit.
+  if (ctx_state->drain_worker) {
+    ctx_state->drain_worker->stop();
+    ctx_state->drain_worker.reset();
+  }
 
   /* Final flush: ensure last kernel's data is not lost */
   if (ctx_state->need_sync && !ctx_state->channel_failed) {

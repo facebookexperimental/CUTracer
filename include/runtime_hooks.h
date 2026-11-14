@@ -215,11 +215,19 @@ static uint64_t runtime_stream_key(CUstream stream) {
   return stream == CU_STREAM_LEGACY || stream == CU_STREAM_PER_THREAD ? 0 : reinterpret_cast<uint64_t>(stream);
 }
 
-static void finish_runtime_graph(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool entry_matched,
-                                 bool kernel_completed, bool channel_drained) {
-  if (!runtime_identity.active()) return;
-  const auto exit =
-      runtime_graph_tracker.take(reinterpret_cast<uint64_t>(ctx), runtime_stream_key(stream), api, entry_matched);
+// The tracker's frame for a cuGraphLaunch, taken at its exit on the launching
+// thread; nullopt when runtime identity is off.
+static std::optional<cutracer::RuntimeGraphTracker::Exit> take_runtime_graph(CUcontext ctx, CUstream stream, int api,
+                                                                             bool entry_matched) {
+  if (!runtime_identity.active()) return std::nullopt;
+  return runtime_graph_tracker.take(reinterpret_cast<uint64_t>(ctx), runtime_stream_key(stream), api, entry_matched);
+}
+
+static void complete_runtime_graph(CUcontext ctx, CTXstate* ctx_state,
+                                   const std::optional<cutracer::RuntimeGraphTracker::Exit>& taken,
+                                   bool kernel_completed, bool channel_drained) {
+  if (!taken) return;
+  const auto& exit = *taken;
   if (!exit.matched) {
     ctx_state->channel_failed = true;
     runtime_identity_error("graph_completion_without_matching_invocation");
@@ -237,6 +245,12 @@ static void finish_runtime_graph(CUcontext ctx, CTXstate* ctx_state, CUstream st
       ctx_state->capture_completions.request({id, done, drained, done && drained ? "" : "graph_completion_unverified"});
     }
   }
+}
+
+static void finish_runtime_graph(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool entry_matched,
+                                 bool kernel_completed, bool channel_drained) {
+  complete_runtime_graph(ctx, ctx_state, take_runtime_graph(ctx, stream, api, entry_matched), kernel_completed,
+                         channel_drained);
 }
 
 static void observe_runtime_module(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, const char* name, void* params,

@@ -337,6 +337,25 @@ TEST_F(CaptureCompletionTest, GraphRequestPreservesLaunchFailureAfterSuccessfulD
   EXPECT_EQ(ready[0].error, "cuda_graph_launch_or_flush_failed");
 }
 
+TEST(CaptureCompletionQueueTest, AGraphLaunchCompletesOnlyTheLaunchesItTook) {
+  CaptureCompletionQueue queue;
+  queue.register_graph_launch(3);
+  queue.register_graph_launch(9);
+  const auto first_graph = queue.take_graph_launches();
+  // A second cuGraphLaunch registers its kernels before the first one's drain.
+  queue.register_graph_launch(17);
+  queue.request_graph_completion(first_graph, true, true, "");
+  const auto ready = queue.take_at_chunk_boundary();
+  ASSERT_EQ(ready.size(), 2);
+  EXPECT_EQ(ready[0].launch_id, 3);
+  EXPECT_EQ(ready[1].launch_id, 9);
+
+  queue.request_graph_completion(queue.take_graph_launches(), true, true, "");
+  const auto next = queue.take_at_chunk_boundary();
+  ASSERT_EQ(next.size(), 1);
+  EXPECT_EQ(next[0].launch_id, 17);
+}
+
 TEST(CaptureCompletionQueueTest, ReceiverWaitNeedsABoundaryAfterTheWaitBegins) {
   CaptureCompletionQueue queue;
   queue.request({7, true, true, ""});
