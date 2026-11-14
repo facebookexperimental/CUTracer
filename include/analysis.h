@@ -27,6 +27,7 @@
 #include "hang_check_policy.h"
 #include "instr_category.h"
 #include "kernel_types.h"
+#include "launch_code_state.h"
 #include "launch_drain_worker.h"
 #include "nvbit.h"
 /* for channel */
@@ -210,13 +211,27 @@ struct CTXstate {
   // Handles of functions whose module this context unloaded.
   std::unordered_set<CUfunction> retired_function_handles;
   // Direct launches with a runtime identity launch record awaiting completion.
+  // The drain worker erases entries while launching threads insert them.
   std::unordered_set<uint64_t> identified_launches;
+  std::mutex identified_launches_mutex;
+  // Which code each launched function runs, for non-blocking launches, and
+  // the functions each launch root brings with it (itself and its callees).
+  // Used only from CUDA callbacks, which hold cuda_event_mutex, and at context
+  // teardown, when nothing can launch on the context. Neither member has its
+  // own lock.
+  cutracer::LaunchCodeState launch_code;
+  std::unordered_map<CUfunction, std::vector<const void*>> launch_code_functions;
 
   // Whether the context and the channel need a synchronization at termination.
   // Set to true when a kernel is actually launched (not during stream capture
   // or graph build). Used by nvbit_at_ctx_term to decide whether to flush.
   bool need_sync = false;
 
+  // Guards the per-function instruction tables below: launching threads
+  // publish a function's tables when they instrument it while the receiver
+  // looks records up in them, and with overlapping launches the receiver is
+  // usually busy when that happens.
+  mutable std::shared_mutex instr_tables_mutex;
   // Per-function SASS mappings for instruction histogram feature
   std::unordered_map<CUfunction, std::map<int, std::string>> id_to_sass_map;
   // Per-function SASS binary encoding (from Instr::getSassBinary(), nvbit 1.8+)

@@ -23,6 +23,7 @@ Caveats:
 Caveats:
 - `reg_trace` increases overhead; narrow `KERNEL_FILTERS` and instruction intervals to reduce impact.
 - EXIT opcode detection helps prune exiting warps to avoid false positives.
+- The check needs CUTracer's default blocking launches (it is rejected with `--nonblocking-launches`). A program in which a running kernel waits for a later launch, such as a cross-rank cohort in eager mode, hangs under blocking launches, so the online check cannot be used on it; trace it with `--nonblocking-launches` and analyze offline instead.
 
 ## Data Race Detection (random_delay) 🔀
 

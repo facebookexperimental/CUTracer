@@ -149,6 +149,9 @@ uint32_t hang_check_interval_ms;
 uint32_t hang_check_hits;
 uint32_t hang_min_stall_s;
 
+// Non-blocking launches (see env_config.h)
+bool nonblocking_launches;
+
 // Trace file size limit in MB (0 = disabled)
 uint32_t trace_size_limit_mb;
 
@@ -1091,6 +1094,31 @@ void init_output_dir() {
 }
 
 // Initialize all configuration variables
+// The receiver attributes records to one kernel at a time: the deadlock check
+// and the instruction histogram restart their state whenever the record stream
+// switches launches, and an instrumentation plan prepares each launch
+// synchronously. None of them works while kernels overlap.
+static void init_nonblocking_launches() {
+  int enabled = 0;
+  get_var_int(enabled, "CUTRACER_NONBLOCKING_LAUNCHES", 0,
+              "Return to the application right after each launch instead of waiting for it (1 = enabled)");
+  nonblocking_launches = enabled != 0;
+  if (!nonblocking_launches) return;
+  const char* conflict = nullptr;
+  if (is_analysis_type_enabled(AnalysisType::DEADLOCK_DETECTION)) {
+    conflict = "-a deadlock_detection";
+  } else if (is_analysis_type_enabled(AnalysisType::PROTON_INSTR_HISTOGRAM)) {
+    conflict = "-a proton_instr_histogram";
+  } else if (getenv("CUTRACER_INSTRUMENTATION_PLAN")) {
+    conflict = "CUTRACER_INSTRUMENTATION_PLAN";
+  }
+  if (conflict) {
+    fprintf(stderr, "FATAL: CUTRACER_NONBLOCKING_LAUNCHES lets kernels overlap, which %s does not support.\n",
+            conflict);
+    exit(1);
+  }
+}
+
 void init_config_from_env() {
   // Enable device memory allocation
   setenv("CUDA_MANAGED_FORCE_DEVICE_ALLOC", "1", 1);
@@ -1358,6 +1386,8 @@ void init_config_from_env() {
               hang_min_stall_s, kernel_timeout_s);
     }
   }
+
+  init_nonblocking_launches();
 
   // Trace file size limit (MB, 0 = disabled)
   get_var_uint32(trace_size_limit_mb, "CUTRACER_TRACE_SIZE_LIMIT_MB", 0,

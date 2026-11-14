@@ -175,6 +175,7 @@ Most `cutracer trace` flags set an environment variable that `cutracer.so` reads
 | `CUTRACER_TRACE_FORMAT` | `--trace-format` | `ndjson` (default), `zstd`, `text` or `clp` |
 | `CUTRACER_NO_DATA_TIMEOUT_S`, `CUTRACER_KERNEL_TIMEOUT_S` | `--no-data-timeout-s`, `--kernel-timeout-s` | Hang watchdogs |
 | `CUTRACER_HANG_CHECK_INTERVAL_MS`, `CUTRACER_HANG_CHECK_HITS`, `CUTRACER_HANG_MIN_STALL_S` | `--hang-check-interval-ms`, `--hang-check-hits`, `--hang-min-stall-s` | When `-a deadlock_detection` ends a run as hung |
+| `CUTRACER_NONBLOCKING_LAUNCHES` | `--nonblocking-launches` | Let kernels overlap as they do natively (PDL, kernels that wait for a later launch); not with `-a deadlock_detection`, `-a proton_instr_histogram` or a plan |
 | `CUTRACER_DELAY_*`, `CUTRACER_CLUSTER_CTA_ID` | `--delay-*` | Delay injection, dump and replay |
 | `INSTR_BEGIN`, `INSTR_END` | | Instrument only a range of static instruction indices |
 | `CUTRACER_EXACT_KERNEL_NAME`, `CUTRACER_EXACT_KERNEL_CHECKSUM` | | Instrument exactly one kernel, by full name and checksum |

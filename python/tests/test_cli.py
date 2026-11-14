@@ -4,6 +4,7 @@
 
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -206,6 +207,26 @@ class TraceCommandTest(unittest.TestCase):
         """Test trace without a command shows usage error."""
         result = self.runner.invoke(main, ["trace"])
         self.assertNotEqual(result.exit_code, 0)
+
+    def test_trace_rejects_nonblocking_launches_with_a_serial_analysis(self):
+        with tempfile.NamedTemporaryFile(suffix=".so") as library:
+            result = self.runner.invoke(
+                main,
+                [
+                    "trace",
+                    "--cutracer-so",
+                    library.name,
+                    "--nonblocking-launches",
+                    "-a",
+                    "deadlock_detection",
+                    "--",
+                    "true",
+                ],
+            )
+        # A clean CLI error, not a traceback.
+        self.assertIsInstance(result.exception, SystemExit, result.output)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("deadlock_detection", result.output)
 
 
 class ModuleEntryPointTest(unittest.TestCase):

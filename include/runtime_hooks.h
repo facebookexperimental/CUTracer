@@ -197,12 +197,18 @@ static void forget_runtime_module(CUcontext ctx, CUmodule module) {
       pthread_mutex_unlock(&g_cluster_obs_mutex);
       if (state) {
         if (module) state->retired_function_handles.insert(f);
-        state->id_to_sass_map.erase(f);
-        state->id_to_sass_binary_map.erase(f);
-        state->id_to_reg_indices_map.erase(f);
-        state->clock_opcode_ids.erase(f);
-        state->exit_opcode_ids.erase(f);
+        {
+          std::unique_lock<std::shared_mutex> tables(state->instr_tables_mutex);
+          state->id_to_sass_map.erase(f);
+          state->id_to_sass_binary_map.erase(f);
+          state->id_to_reg_indices_map.erase(f);
+          state->clock_opcode_ids.erase(f);
+          state->exit_opcode_ids.erase(f);
+        }
         state->instrumented_launch_roots.erase(f);
+        state->launch_code.forget(f);
+        // A cached callee list may name the retired function.
+        state->launch_code_functions.clear();
       }
       it = kernel_metadata_by_func.erase(it);
     } else

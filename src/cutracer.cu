@@ -780,6 +780,10 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       replay_points = get_replay_instrumentation_points(mangled_name, meta.kernel_checksum);
     }
 
+    // Built here and published under instr_tables_mutex once complete.
+    std::map<int, std::string> sass_by_opcode;
+    std::map<int, std::vector<uint8_t>> binary_by_opcode;
+    std::map<int, RegIndices> reg_indices_by_opcode;
     uint32_t cnt = 0;
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
@@ -797,7 +801,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       int opcode_id = instr->getIdx();
       const bool trace_instruction_selected =
           should_instrument_instr_by_trace_category(instr) && should_instrument_trace_pc(instr->getOffset());
-      ctx_state->id_to_sass_map[f][opcode_id] = std::string(instr->getSass());
+      sass_by_opcode[opcode_id] = std::string(instr->getSass());
 
       // Collect SASS binary encoding (nvbit 1.8+)
       {
@@ -805,7 +809,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
         instr->getSassBinary([](uint8_t b, void* ud) { static_cast<std::vector<uint8_t>*>(ud)->push_back(b); },
                              &binary);
         if (!binary.empty()) {
-          ctx_state->id_to_sass_binary_map[f][opcode_id] = std::move(binary);
+          binary_by_opcode[opcode_id] = std::move(binary);
         }
       }
 
@@ -918,7 +922,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
         for (int num : operands.ureg_nums) {
           reg_idx.ureg_indices.push_back(static_cast<uint8_t>(num));
         }
-        ctx_state->id_to_reg_indices_map[f][opcode_id] = std::move(reg_idx);
+        reg_indices_by_opcode[opcode_id] = std::move(reg_idx);
       }
 
       // Choose instrumentation based on enabled types (only if this instruction passes category filter)
@@ -1029,15 +1033,17 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     // - "clock" (CS2R SR_CLOCKLO) used for histogram region boundaries
     // - "EXIT" used as a candidate signal for warp completion on host side
     // - Categorized instructions (MMA, TMA, SYNC, etc.) for tracing
-    for (std::map<int, std::string>::const_iterator it_sass = ctx_state->id_to_sass_map[f].begin();
-         it_sass != ctx_state->id_to_sass_map[f].end(); ++it_sass) {
+    std::unordered_set<int> clock_ids;
+    std::unordered_set<int> exit_ids;
+    for (std::map<int, std::string>::const_iterator it_sass = sass_by_opcode.begin(); it_sass != sass_by_opcode.end();
+         ++it_sass) {
       const char* sass_cstr = it_sass->second.c_str();
       if (strstr(sass_cstr, "CS2R") && strstr(sass_cstr, "SR_CLOCKLO")) {
-        ctx_state->clock_opcode_ids[f].insert(it_sass->first);
+        clock_ids.insert(it_sass->first);
       }
       // Simple substring detection for EXIT mnemonic (predication handled by extract on host side)
       if (strstr(sass_cstr, "EXIT")) {
-        ctx_state->exit_opcode_ids[f].insert(it_sass->first);
+        exit_ids.insert(it_sass->first);
       }
       // Detect instruction category and log if matched
       InstrCategory category = detect_instr_category(sass_cstr);
@@ -1046,6 +1052,14 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
         loprintf("%s detected: kernel=%s opcode_id=%d sass='%s' (%s)\n", get_instr_category_name(category),
                  unmangled_name, it_sass->first, sass_cstr, desc ? desc : "");
       }
+    }
+    {
+      std::unique_lock<std::shared_mutex> tables(ctx_state->instr_tables_mutex);
+      ctx_state->id_to_sass_map[f] = std::move(sass_by_opcode);
+      ctx_state->id_to_sass_binary_map[f] = std::move(binary_by_opcode);
+      ctx_state->id_to_reg_indices_map[f] = std::move(reg_indices_by_opcode);
+      ctx_state->clock_opcode_ids[f] = std::move(clock_ids);
+      ctx_state->exit_opcode_ids[f] = std::move(exit_ids);
     }
 
     /* ============================================ */
@@ -1099,7 +1113,8 @@ static void init_drain_worker(CUcontext ctx, CTXstate* ctx_state) {
     return;
   }
   worker->stop();
-  loprintf("WARNING: launch drain worker could not start for context %p; draining on the launching thread\n", ctx);
+  loprintf("WARNING: launch drain worker could not start for context %p; draining on the launching thread%s\n", ctx,
+           nonblocking_launches ? ", so --nonblocking-launches has no effect in this context" : "");
 }
 
 // Reference code from NVIDIA nvbit mem_trace tool
@@ -1286,6 +1301,17 @@ static TraceWriter& create_trace_writer_locked(CTXstate* ctx_state, uint64_t lau
 }
 
 // Reference code from NVIDIA nvbit mem_trace tool
+// The functions whose code a launch of `func` selects: the root and the device
+// functions it calls, which NVBit switches with it. Callers hold
+// cuda_event_mutex (see CTXstate::launch_code_functions).
+static const std::vector<const void*>& launch_code_functions(CUcontext ctx, CTXstate* ctx_state, CUfunction func) {
+  auto cached = ctx_state->launch_code_functions.find(func);
+  if (cached != ctx_state->launch_code_functions.end()) return cached->second;
+  std::vector<const void*> functions{func};
+  for (CUfunction callee : nvbit_get_related_functions(ctx, func)) functions.push_back(callee);
+  return ctx_state->launch_code_functions.emplace(func, std::move(functions)).first->second;
+}
+
 /**
  * @brief Prepares for a kernel launch, conditionally instrumenting and logging.
  *
@@ -1343,8 +1369,10 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       resolve_cluster_launch_info(func, has_dynamic_cluster, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
 
   // no need to sync during stream capture or manual graph build, since no
-  // kernel is actually launched.
-  if (!stream_capture && !build_graph && !ctx_state->channel_failed) {
+  // kernel is actually launched. Non-blocking launches sync below, and only if
+  // this launch changes code an earlier launch may still be running.
+  const bool launching = !stream_capture && !build_graph;
+  if (launching && !nonblocking_launches && !ctx_state->channel_failed) {
     /* Make sure GPU is idle */
     cudaDeviceSynchronize();
     CUDA_CHECK_LAST_ERROR();
@@ -1357,12 +1385,15 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   // A reused handle runs its original code: NVBit's state for it is stale.
   const bool reused_handle = reused_function_handle(ctx, func);
   if (reused_handle) nvbit_enable_instrumented(ctx, func, false);
+  const size_t instrumented_functions = already_instrumented.size();
   bool should_instrument =
       !ctx_state->channel_failed && !reused_handle &&
       (runtime_plan_requested.load() ? apply_runtime_plan([&](auto& plan) {
         return plan.prepare(ctx, func, meta.runtime_identity, reinterpret_cast<uint64_t>(ctx_state->channel_dev));
       })
                                      : instrument_function_if_needed(ctx, func));
+  // This launch inserted instrumentation, into its root or a callee.
+  const bool first_instrumentation = already_instrumented.size() != instrumented_functions;
   if (should_instrument)
     ctx_state->instrumented_launch_roots.insert(func);
   else
@@ -1454,7 +1485,10 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     } else {
       runtime_launch = identify_runtime_launch(ctx, func, kernel_launch_id, dims, cluster, runtime_stream, "direct",
                                                should_instrument);
-      if (!runtime_launch.is_null()) ctx_state->identified_launches.insert(kernel_launch_id);
+      if (!runtime_launch.is_null()) {
+        std::lock_guard<std::mutex> lock(ctx_state->identified_launches_mutex);
+        ctx_state->identified_launches.insert(kernel_launch_id);
+      }
     }
     if (runtime_plan_requested.load() && should_instrument) {
       plan_applied = apply_runtime_plan([&](auto& plan) { return plan.launch(ctx, func, runtime_launch); });
@@ -1493,9 +1527,13 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
 
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
-      ctx_state->kernel_start_time = time(nullptr);
+      // A non-blocking launch can wait in its stream behind other work, so its
+      // timers start at its first trace record instead.
+      if (!nonblocking_launches) {
+        ctx_state->kernel_start_time = time(nullptr);
+        ctx_state->last_data_received_time = 0;
+      }
       ctx_state->kernel_start_name = meta.unmangled_name;
-      ctx_state->last_data_received_time = 0;
       auto& writer = create_trace_writer_locked(ctx_state, current_launch_id, base_filename, metadata);
       if (!plan_applied.is_null()) writer.write_metadata(plan_applied);
     }
@@ -1504,6 +1542,15 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
                base_filename.c_str());
   }
 
+  // With nothing instrumented, no launch ever changes code.
+  if (nonblocking_launches && has_any_instrumentation_enabled() &&
+      ctx_state->launch_code.update(launch_code_functions(ctx, ctx_state, func), should_instrument,
+                                    first_instrumentation) &&
+      launching) {
+    // Kernels still running must not see the code they run change.
+    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+  }
   nvbit_enable_instrumented(ctx, func, should_instrument);
   if (runtime_plan_requested.load() && should_instrument && !stream_capture && !build_graph) {
     // Let NVBit finish preparing the instrumented launch: a launch on a
@@ -1536,9 +1583,10 @@ static CaptureDrainResult drain_after_device_sync(CUcontext ctx, CTXstate* ctx_s
   return {launch_succeeded && kernel_status == cudaSuccess, channel_drained};
 }
 
-// Graph launches: wait for the event the launching thread recorded behind the
-// graph on its stream, then flush on the worker's private stream. The kernels
-// have finished, so the flush needs no ordering against application work.
+// Graph launches and non-blocking direct launches: wait for the event the
+// launching thread recorded behind the launch on its stream, then flush on the
+// worker's private stream. The kernels have finished, so the flush needs no
+// ordering against application work.
 static CaptureDrainResult drain_after_event(CUcontext ctx, CTXstate* ctx_state, cudaEvent_t launch_end,
                                             bool launch_succeeded) {
   const auto kernel_status = launch_end ? cudaEventSynchronize(launch_end) : cudaDeviceSynchronize();
@@ -1558,8 +1606,10 @@ static CaptureDrainResult drain_after_event(CUcontext ctx, CTXstate* ctx_state, 
 // the drain worker waits for this event instead of for the stream. Returns
 // nullptr if the event cannot be recorded; the worker then waits for the device.
 static cudaEvent_t record_launch_end(CUstream stream, int api) {
+  const bool per_thread_api = api == API_CUDA_cuGraphLaunch_ptsz || api == API_CUDA_cuLaunchKernel_ptsz ||
+                              api == API_CUDA_cuLaunchKernelEx_ptsz || api == API_CUDA_cuLaunchCooperativeKernel_ptsz;
   cudaStream_t record_stream = stream;
-  if (record_stream == nullptr && api == API_CUDA_cuGraphLaunch_ptsz) record_stream = cudaStreamPerThread;
+  if (record_stream == nullptr && per_thread_api) record_stream = cudaStreamPerThread;
   cudaEvent_t event = nullptr;
   if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) return nullptr;
   if (cudaEventRecord(event, record_stream) != cudaSuccess) {
@@ -1609,6 +1659,27 @@ static bool run_drain(CTXstate* ctx_state, Drain drain, OnFailure on_failure) {
   return completed;
 }
 
+// Queues a non-blocking launch's drain. Each queued drain holds an event, and
+// keeps its traces open (a file and a buffer each; a graph launch has one per
+// instrumented node) until its launch finishes. A launching thread that gets
+// too far ahead waits: for the oldest queued drain past kMaxQueuedDrains, and
+// for every queued drain past kMaxOpenTraces open traces.
+constexpr uint64_t kMaxQueuedDrains = 1024;
+constexpr size_t kMaxOpenTraces = 256;
+
+static size_t open_trace_count(CTXstate* ctx_state) {
+  std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+  return ctx_state->trace_writers.size();
+}
+
+template <typename Drain, typename OnFailure>
+static void queue_nonblocking_drain(CTXstate* ctx_state, Drain drain, OnFailure on_failure) {
+  const uint64_t ticket = queue_drain(ctx_state, std::move(drain), std::move(on_failure));
+  if (!ctx_state->drain_worker) return;
+  if (ticket > kMaxQueuedDrains) ctx_state->drain_worker->wait(ticket - kMaxQueuedDrains);
+  if (open_trace_count(ctx_state) > kMaxOpenTraces) ctx_state->drain_worker->wait_idle();
+}
+
 // When the drain ran on the launching thread, a fault it saw also became that
 // thread's last CUDA error, which a launch check such as PyTorch's reads right
 // after the launch. Keep that: the device is idle by now, so this is cheap.
@@ -1616,13 +1687,21 @@ static void surface_launch_failure() {
   cudaDeviceSynchronize();
 }
 
+// `launch_end` is the event a non-blocking launch recorded behind itself; a
+// blocking launch passes nullopt and the drain waits for the whole device.
 static bool finish_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
-                                 bool launch_succeeded) {
-  const auto completion = drain_after_device_sync(ctx, ctx_state, launch_succeeded);
+                                 bool launch_succeeded, std::optional<cudaEvent_t> launch_end) {
+  const auto completion = launch_end ? drain_after_event(ctx, ctx_state, *launch_end, launch_succeeded)
+                                     : drain_after_device_sync(ctx, ctx_state, launch_succeeded);
   const bool kernel_completed = completion.kernel_completed;
   const bool channel_drained = completion.channel_drained;
   if (launch_id) {
-    if (ctx_state->identified_launches.erase(*launch_id)) {
+    bool identified = false;
+    {
+      std::lock_guard<std::mutex> lock(ctx_state->identified_launches_mutex);
+      identified = ctx_state->identified_launches.erase(*launch_id) > 0;
+    }
+    if (identified) {
       runtime_event([&](auto& ledger) {
         ledger.complete(reinterpret_cast<uint64_t>(ctx), *launch_id, kernel_completed, channel_drained);
       });
@@ -1640,19 +1719,38 @@ static bool finish_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::option
   return kernel_completed;
 }
 
+// Whether a launch has anything to drain: records in the channel (it has a
+// trace writer) or a runtime identity record awaiting its completion.
+static bool launch_needs_drain(CTXstate* ctx_state, uint64_t launch_id) {
+  {
+    std::shared_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
+    if (ctx_state->trace_writers.count(launch_id)) return true;
+  }
+  std::lock_guard<std::mutex> lock(ctx_state->identified_launches_mutex);
+  return ctx_state->identified_launches.count(launch_id) > 0;
+}
+
 // the function is only called for non cuda graph launch cases.
 static void leave_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::optional<uint64_t> launch_id,
-                                bool launch_succeeded) {
-  const bool completed = run_drain(
-      ctx_state, [=] { return finish_kernel_launch(ctx, ctx_state, launch_id, launch_succeeded); },
-      [=] {
-        if (launch_id) ctx_state->capture_completions.request({*launch_id, false, false, "launch_drain_failed"});
-      });
-  if (!completed) surface_launch_failure();
+                                bool launch_succeeded, CUstream stream, int api) {
+  const auto fail = [=] {
+    if (launch_id) ctx_state->capture_completions.request({*launch_id, false, false, "launch_drain_failed"});
+  };
+  if (!nonblocking_launches) {
+    const auto drain = [=] { return finish_kernel_launch(ctx, ctx_state, launch_id, launch_succeeded, std::nullopt); };
+    if (!run_drain(ctx_state, drain, fail)) surface_launch_failure();
+    return;
+  }
+  // Nothing was instrumented or identified: there is nothing to wait for.
+  if (!launch_id || !launch_needs_drain(ctx_state, *launch_id)) return;
+  const cudaEvent_t launch_end = record_launch_end(stream, api);
+  queue_nonblocking_drain(
+      ctx_state, [=] { finish_kernel_launch(ctx, ctx_state, launch_id, launch_succeeded, launch_end); }, fail);
 }
 
 // The kernels a cuGraphLaunch registered and its runtime identity frame are
-// taken at its exit, on the launching thread, and handed to its drain.
+// taken at its exit, on the launching thread, and handed to its drain: with
+// non-blocking launches a later cuGraphLaunch can run before this drain does.
 struct GraphLaunchExit {
   std::vector<uint64_t> launch_ids;
   std::optional<cutracer::RuntimeGraphTracker::Exit> runtime;
@@ -1677,15 +1775,20 @@ static bool finish_graph_launch(CUcontext ctx, CTXstate* ctx_state, const GraphL
 static void leave_graph_launch(CUcontext ctx, CTXstate* ctx_state, CUstream stream, int api, bool launch_succeeded) {
   const GraphLaunchExit exit{ctx_state->capture_completions.take_graph_launches(),
                              take_runtime_graph(ctx, stream, api, true)};
+  // No instrumented node and no runtime identity frame: nothing to drain.
+  if (nonblocking_launches && exit.launch_ids.empty() && !exit.runtime) return;
   const cudaEvent_t launch_end = record_launch_end(stream, api);
-  const bool completed = run_drain(
-      ctx_state, [=] { return finish_graph_launch(ctx, ctx_state, exit, launch_end, launch_succeeded); },
-      [=] {
-        complete_runtime_graph(ctx, ctx_state, exit.runtime, false, false);
-        if (!runtime_plan_requested.load())
-          ctx_state->capture_completions.request_graph_completion(exit.launch_ids, false, false, "launch_drain_failed");
-      });
-  if (!completed) surface_launch_failure();
+  const auto drain = [=] { return finish_graph_launch(ctx, ctx_state, exit, launch_end, launch_succeeded); };
+  const auto fail = [=] {
+    complete_runtime_graph(ctx, ctx_state, exit.runtime, false, false);
+    if (!runtime_plan_requested.load())
+      ctx_state->capture_completions.request_graph_completion(exit.launch_ids, false, false, "launch_drain_failed");
+  };
+  if (nonblocking_launches) {
+    queue_nonblocking_drain(ctx_state, drain, fail);
+    return;
+  }
+  if (!run_drain(ctx_state, drain, fail)) surface_launch_failure();
 }
 
 // CUDA 12+ launch APIs also accept a CUkernel, which the CUDA runtime passes
@@ -1745,7 +1848,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
         enter_kernel_launch(ctx, func, launch_id, cbid, params);
         launch_callback.enter({ctx, cbid, launch_id, true});
       } else if (const auto launch = take_pending_launch()) {
-        leave_kernel_launch(ctx, ctx_state, launch->launch_id, pStatus && *pStatus == CUDA_SUCCESS);
+        leave_kernel_launch(ctx, ctx_state, launch->launch_id, pStatus && *pStatus == CUDA_SUCCESS, nullptr, cbid);
       }
     } break;
     // To support kernel launched by cuda graph (in addition to existing kernel
@@ -1820,7 +1923,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
       } else if (const auto launch = take_pending_launch()) {
         if (launch->retained_lock) {
           loprintf_vl(1, "kernel %s not captured by cuda graph\n", nvbit_get_func_name(ctx, func));
-          leave_kernel_launch(ctx, ctx_state, launch->launch_id, pStatus && *pStatus == CUDA_SUCCESS);
+          leave_kernel_launch(ctx, ctx_state, launch->launch_id, pStatus && *pStatus == CUDA_SUCCESS, hStream, cbid);
         } else {
           loprintf_vl(1, "kernel %s captured by cuda graph\n", nvbit_get_func_name(ctx, func));
         }
@@ -2138,11 +2241,13 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
       // graph completes, so graph timing is scoped to the graph execution:
       // only the first node records the start and the name (marked as a
       // graph), and later nodes do not move the timer or rename it.
-      if (ctx_state->kernel_start_time == 0) {
-        ctx_state->kernel_start_time = time(nullptr);
-        ctx_state->kernel_start_name = meta.unmangled_name + " (graph)";
+      if (!nonblocking_launches) {
+        if (ctx_state->kernel_start_time == 0) {
+          ctx_state->kernel_start_time = time(nullptr);
+          ctx_state->kernel_start_name = meta.unmangled_name + " (graph)";
+        }
+        ctx_state->last_data_received_time = 0;
       }
-      ctx_state->last_data_received_time = 0;
       auto& writer = create_trace_writer_locked(ctx_state, kernel_launch_id, base_filename, metadata);
       if (runtime_plan_requested.load()) {
         writer.write_metadata(plan_applied);
