@@ -45,6 +45,7 @@
 #include "common.h"
 #include "cubin_identity.h"
 #include "cuda_callback_guard.h"
+#include "launch_attributes.h"
 
 /* analysis functionality */
 #include "analysis.h"
@@ -124,6 +125,37 @@ static bool extract_cluster_dim_from_launch_ex(nvbit_api_cuda_t cbid, void* para
     }
   }
   return false;
+}
+
+// The attribute fields of a kernel launch event and of trace metadata. A null
+// `launch_attributes` (direct launches) or `captured_launch_attributes` (graph
+// node launches) is unknown and left out.
+static nlohmann::json launch_attribute_fields(const nlohmann::json& launch_attributes,
+                                              const nlohmann::json& captured_launch_attributes,
+                                              const nlohmann::json& function_attributes) {
+  nlohmann::json fields = {{"function_attributes", function_attributes},
+                           {"nonblocking_launches", nonblocking_launches}};
+  if (!launch_attributes.is_null()) fields["launch_attributes"] = launch_attributes;
+  if (!captured_launch_attributes.is_null()) fields["captured_launch_attributes"] = captured_launch_attributes;
+  return fields;
+}
+
+static nlohmann::json describe_function_attributes(CUfunction func) {
+  return cutracer::describe_function_attributes([func](CUfunction_attribute attribute, int& value) {
+    return cuFuncGetAttribute(&value, attribute, func) == CUDA_SUCCESS;
+  });
+}
+
+// The attributes a direct launch passed (cuLaunchKernelEx), or implied
+// (cuLaunchCooperativeKernel). Other launch APIs take none.
+static nlohmann::json describe_direct_launch_attributes(nvbit_api_cuda_t cbid, void* params) {
+  if (cbid == API_CUDA_cuLaunchKernelEx_ptsz || cbid == API_CUDA_cuLaunchKernelEx) {
+    const auto* config = static_cast<cuLaunchKernelEx_params*>(params)->config;
+    return cutracer::describe_launch_attributes(config->attrs, config->numAttrs, false);
+  }
+  const bool cooperative =
+      cbid == API_CUDA_cuLaunchCooperativeKernel || cbid == API_CUDA_cuLaunchCooperativeKernel_ptsz;
+  return cutracer::describe_launch_attributes(nullptr, 0, cooperative);
 }
 
 enum class ClusterDimSource {
@@ -367,11 +399,12 @@ static uint64_t hash_callstack(const std::vector<std::string>& frames) {
  * references it by callstack_id in subsequent launch events.
  * In FULL mode, inlines the complete callstack in every launch event.
  * In NOSTACK mode, omits callstack information entirely.
+ * `attribute_fields` comes from launch_attribute_fields.
  */
 static void write_kernel_launch_event(const KernelFuncMetadata& meta, const KernelDimensions& dims,
                                       const ClusterLaunchInfo& cluster, unsigned int dynamic_shmem, uint64_t stream_id,
                                       uint64_t launch_id, const std::vector<std::string>& callstack,
-                                      const std::string& callstack_source) {
+                                      const std::string& callstack_source, const nlohmann::json& attribute_fields) {
   if (!g_kernel_events_writer || kernel_events_mode == KernelEventsMode::DISABLED) {
     return;
   }
@@ -389,6 +422,7 @@ static void write_kernel_launch_event(const KernelFuncMetadata& meta, const Kern
   event["nregs"] = meta.nregs;
   event["shmem"] = meta.shmem_static_nbytes + dynamic_shmem;
   event["stream_id"] = stream_id;
+  if (attribute_fields.is_object()) event.update(attribute_fields);
 
   if (kernel_events_mode == KernelEventsMode::DEDUP) {
     if (callstack.empty()) {
@@ -441,6 +475,11 @@ std::map<uint64_t, KernelDimensions> kernel_launch_to_dimensions_map;
 // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION, which cuFuncGetAttribute can't see
 // because Triton doesn't use the static __cluster_dims__ kernel attribute.
 std::unordered_map<CUfunction, ClusterLaunchInfo> g_func_to_observed_cluster;
+// Launch attributes of the stream-captured launch that made a function's graph
+// node. NVBit reports no node attributes, and capture turns PDL into a
+// programmatic graph edge, so the captured call is the only record of them. A
+// function captured with different attributes maps to null (unknown).
+std::unordered_map<CUfunction, nlohmann::json> g_func_to_captured_launch_attributes;
 pthread_mutex_t g_cluster_obs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Legacy trace names are kernel_<checksum>_iter<n>_pid<pid>_<name>. Number
@@ -1365,6 +1404,13 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     }
     pthread_mutex_unlock(&g_cluster_obs_mutex);
   }
+  if (stream_capture) {
+    const nlohmann::json captured = describe_direct_launch_attributes(cbid, params);
+    pthread_mutex_lock(&g_cluster_obs_mutex);
+    const auto [known, inserted] = g_func_to_captured_launch_attributes.emplace(func, captured);
+    if (!inserted && known->second != captured) known->second = nullptr;
+    pthread_mutex_unlock(&g_cluster_obs_mutex);
+  }
   ClusterLaunchInfo cluster =
       resolve_cluster_launch_info(func, has_dynamic_cluster, dynamic_cluster_x, dynamic_cluster_y, dynamic_cluster_z);
 
@@ -1409,6 +1455,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   uint32_t current_iter = 0;
   nlohmann::json runtime_launch;
   nlohmann::json plan_applied;
+  nlohmann::json attribute_fields;
 
   // during stream capture or manual graph build, no kernel is launched, so
   // do not set launch argument, do not print kernel info, do not increase
@@ -1499,6 +1546,11 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       }
     }
 
+    if (kernel_events_mode != KernelEventsMode::DISABLED || should_instrument) {
+      attribute_fields = launch_attribute_fields(describe_direct_launch_attributes(cbid, params), nullptr,
+                                                 describe_function_attributes(func));
+    }
+
     // Write structured kernel launch event (applies to ALL kernels, not just instrumented)
     if (kernel_events_mode != KernelEventsMode::DISABLED) {
       uint64_t stream_id = 0;
@@ -1508,7 +1560,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
         stream_id = (uint64_t)((cuLaunchKernel_params*)params)->hStream;
       }
       write_kernel_launch_event(meta, dims, cluster, dynamic_shmem, stream_id, kernel_launch_id, cpu_callstack,
-                                callstack_source);
+                                callstack_source, attribute_fields);
     }
   }
 
@@ -1524,6 +1576,7 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
     auto metadata = build_kernel_metadata_json(meta, dims, dynamic_shmem, cluster, cpu_callstack, callstack_source,
                                                func, ctx_state, current_launch_id, "direct");
     if (!runtime_launch.is_null()) metadata["runtime_identity"] = runtime_launch;
+    if (attribute_fields.is_object()) metadata.update(attribute_fields);
 
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
@@ -2204,11 +2257,21 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
   // Capture the CPU call stack for graph node launches as well
   auto [cpu_callstack, callstack_source] = capture_cpu_callstack();
 
+  nlohmann::json attribute_fields;
+  if (kernel_events_mode != KernelEventsMode::DISABLED || capture_selected) {
+    nlohmann::json captured;
+    pthread_mutex_lock(&g_cluster_obs_mutex);
+    const auto captured_it = g_func_to_captured_launch_attributes.find(func);
+    if (captured_it != g_func_to_captured_launch_attributes.end()) captured = captured_it->second;
+    pthread_mutex_unlock(&g_cluster_obs_mutex);
+    attribute_fields = launch_attribute_fields(nullptr, captured, describe_function_attributes(func));
+  }
+
   // Write structured kernel launch event for graph node launches
   if (kernel_events_mode != KernelEventsMode::DISABLED) {
     const auto& meta_ev = get_or_create_kernel_func_metadata(func, ctx);
     write_kernel_launch_event(meta_ev, dims, cluster, config.shmem_dynamic_nbytes, (uint64_t)stream, kernel_launch_id,
-                              cpu_callstack, callstack_source);
+                              cpu_callstack, callstack_source, attribute_fields);
   }
 
   nlohmann::json plan_applied;
@@ -2229,6 +2292,7 @@ void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
     auto metadata = build_kernel_metadata_json(meta, dims, config.shmem_dynamic_nbytes, cluster, cpu_callstack,
                                                callstack_source, func, ctx_state, kernel_launch_id, "graph");
     if (!runtime_launch.is_null()) metadata["runtime_identity"] = runtime_launch;
+    if (attribute_fields.is_object()) metadata.update(attribute_fields);
     {
       std::unique_lock<std::shared_mutex> lock(ctx_state->writers_mutex);
       // A graph node launch is an actual kernel execution (unlike the direct

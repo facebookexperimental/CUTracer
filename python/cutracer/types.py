@@ -120,6 +120,11 @@ class TraceRecord(TypedDict, total=False):
     trace_warp_mask: int | None
     trace_pc_offsets: list[int] | None
     trace_pc_filter_valid: bool | None
+    # Also in kernel_launch events; see docs/Outputs-and-File-Formats.md.
+    launch_attributes: dict[str, Any]
+    captured_launch_attributes: dict[str, Any]
+    function_attributes: dict[str, Any]
+    nonblocking_launches: bool
     instructions: dict[
         str, dict[str, Any]
     ]  # opcode_id (str) -> {sass, binary, regs, uregs, ...}

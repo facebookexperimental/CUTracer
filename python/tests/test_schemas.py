@@ -263,6 +263,59 @@ class KernelMetadataSchemaTest(unittest.TestCase):
             ):
                 jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
 
+    def test_launch_attribute_fields(self):
+        """Test the launch and function attributes the runtime records."""
+        base_record = {
+            "type": "kernel_metadata",
+            "mangled_name": "_Z6kernelPfS_i",
+            "unmangled_name": "kernel(float*, float*, int)",
+            "kernel_checksum": "a1b2c3d4e5f67890",
+            "func_addr": "0x7f1234567890",
+            "nregs": 32,
+            "shmem_static": 0,
+            "grid": [128, 1, 1],
+            "block": [256, 1, 1],
+            "shmem_dynamic": 0,
+            "nonblocking_launches": True,
+            "function_attributes": {
+                "max_dynamic_shared_size_bytes": 49152,
+                "preferred_shared_memory_carveout": -1,
+                "required_cluster_dim": [2, 1, 1],
+                "cluster_scheduling_policy": "default",
+            },
+        }
+        pdl = {
+            "programmatic_stream_serialization": True,
+            "programmatic_event": {
+                "event": 0x1234,
+                "flags": 0,
+                "trigger_at_block_start": False,
+            },
+            "cluster_dim": [2, 1, 1],
+            "mem_sync_domain": "remote",
+            "unrecognized": [15],
+        }
+        for fields in (
+            {},
+            {"launch_attributes": {}},
+            {"launch_attributes": pdl},
+            {"captured_launch_attributes": pdl},
+        ):
+            with self.subTest(fields=fields):
+                jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
+        for fields in (
+            {"launch_attributes": {"programmatic_serialization": True}},
+            {"launch_attributes": {"programmatic_stream_serialization": 1}},
+            {"captured_launch_attributes": {"mem_sync_domain": "local"}},
+            {"function_attributes": {"max_threads": 1024}},
+            {"nonblocking_launches": "yes"},
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaises(jsonschema.ValidationError),
+            ):
+                jsonschema.validate({**base_record, **fields}, KERNEL_METADATA_SCHEMA)
+
     def test_runtime_identity_launch_record(self):
         """Test the launch record attached when runtime identity is enabled."""
         identity = {
