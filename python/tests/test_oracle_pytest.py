@@ -391,14 +391,17 @@ class RealPytestWorkerTest(_OracleTestCase):
         *,
         prelude: str = "",
         child_last: str | None = None,
+        installed: dict[str, str] | None = None,
     ) -> tuple[int, str]:
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        # A fresh directory per case: pytest caches modules by path.
         root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
         packages = root / "venv/lib/python3/site-packages"
         packages.mkdir(parents=True)
         (packages / "checks.py").write_text("def check():\n    assert 1 == 2\n")
+        for name, text in (installed or {}).items():
+            (packages / name).parent.mkdir(parents=True, exist_ok=True)
+            (packages / name).write_text(text)
         # A worker's formatted traceback: the test file's helper, then a
         # frame in an installed package, chained after an unrelated error.
         child_stack = (
@@ -429,7 +432,12 @@ class RealPytestWorkerTest(_OracleTestCase):
             + [f"--assertion-site={site}" for site in sites]
             + [f"--pytest-arg={arg}" for arg in self.oracle.DEFAULT_PYTEST_ARGS]
         )
-        with mock.patch.dict(os.environ, {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}):
+        # Every case writes its own `test_x.py`, and pytest reuses a module that
+        # is already in `sys.modules` under the same name.
+        with (
+            mock.patch.dict(os.environ, {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}),
+            mock.patch.dict(sys.modules),
+        ):
             code = self.oracle.run_worker(args)
         data = json.loads(report.read_text())
         self.assertEqual(code, data["pytest_exit"])
@@ -501,6 +509,34 @@ class RealPytestWorkerTest(_OracleTestCase):
         for body, sites, expected in cases:
             with self.subTest(body=body, sites=sites):
                 self.assertEqual(self._classify(body, sites)[0], expected)
+
+    def test_modules_the_test_imports_do_not_stop_the_report(self) -> None:
+        installed = {
+            # Like `torch.classes`: every attribute exists, `__path__` included.
+            "import classes": {
+                "classes.py": (
+                    "import sys, types\n"
+                    "class Classes(types.ModuleType):\n"
+                    "    __file__ = 'classes.py'\n"
+                    "    def __getattr__(self, name):\n"
+                    "        return types.ModuleType(name)\n"
+                    "sys.modules[__name__] = Classes(__name__)\n"
+                )
+            },
+            # `pkg.ns` is a namespace package: its `__path__` comes from `pkg`.
+            "import pkg.ns.mod": {"pkg/__init__.py": "", "pkg/ns/mod.py": ""},
+        }
+        test = ("test_x.py::test_x",)
+        for statement, files in installed.items():
+            for body, expected in (
+                ("assert 1 == 1", PASSED),
+                ("assert 1 == 2", REPRODUCED),
+            ):
+                with self.subTest(statement, body=body):
+                    code, _ = self._classify(
+                        body, test, prelude=f"{statement}\n", installed=files
+                    )
+                    self.assertEqual(code, expected)
 
 
 class OracleCliTest(unittest.TestCase):
