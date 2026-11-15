@@ -201,7 +201,7 @@ extern "C" __device__ __noinline__ void instrument_opcode(int pred, int opcode_i
 }
 
 /**
- * @brief Helper function to read a 32-bit value from shared memory using byte-level access.
+ * @brief Helper function to read up to 32 bits from shared memory using byte-level access.
  *
  * Uses __cvta_shared_to_generic to convert shared memory segment address
  * to a generic pointer, then reads bytes individually to handle arbitrary alignment.
@@ -209,16 +209,16 @@ extern "C" __device__ __noinline__ void instrument_opcode(int pred, int opcode_i
  * non-4-byte-aligned addresses.
  *
  * @param smemAddr The shared memory segment address (not a generic pointer)
- * @return The 32-bit value at the given shared memory address (little-endian)
+ * @param nbytes Number of bytes to read (1 to 4). Must not exceed the bytes the instruction accessed, which can
+ *               end at the last byte of the CTA's shared memory.
+ * @return The value at the given shared memory address (little-endian), zero-extended
  */
-__device__ __forceinline__ uint32_t loadSmemValue32(uint64_t smemAddr) {
+__device__ __forceinline__ uint32_t loadSmemValue32(uint64_t smemAddr, int nbytes) {
   const auto ptr = static_cast<unsigned char*>(__cvta_shared_to_generic(static_cast<unsigned>(smemAddr)));
-  // Read bytes individually and assemble into uint32_t (little-endian)
   uint32_t value = 0;
-  value |= static_cast<uint32_t>(ptr[0]);
-  value |= static_cast<uint32_t>(ptr[1]) << 8;
-  value |= static_cast<uint32_t>(ptr[2]) << 16;
-  value |= static_cast<uint32_t>(ptr[3]) << 24;
+  for (int b = 0; b < nbytes; b++) {
+    value |= static_cast<uint32_t>(ptr[b]) << (8 * b);
+  }
   return value;
 }
 
@@ -306,7 +306,7 @@ extern "C" __device__ __noinline__ void instrument_mem_value(int pred, int opcod
     uint32_t my_values[4] = {0, 0, 0, 0};
     if (addr != 0) {
       for (int w = 0; w < words_to_read; w++) {
-        my_values[w] = loadSmemValue32(addr + w * 4);
+        my_values[w] = loadSmemValue32(addr + w * 4, min(access_size - w * 4, 4));
       }
     }
 

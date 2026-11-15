@@ -230,6 +230,26 @@ build_vectoradd_smem() {
   return 0
 }
 
+# Function to build smem_tail test (2-byte shared-memory accesses that end at the last byte of the allocation)
+build_smem_tail() {
+  echo "🔨 Building smem_tail test..."
+
+  cd "$PROJECT_ROOT/tests/smem_tail"
+
+  # Clean and build
+  make clean
+  make -j"$(nproc)"
+
+  # Verify the test executable was built
+  if [ ! -f "$PROJECT_ROOT/tests/smem_tail/smem_tail" ]; then
+    echo "❌ smem_tail test not found!"
+    return 1
+  fi
+
+  echo "✅ smem_tail test built successfully"
+  return 0
+}
+
 # Function to run vectoradd_smem with a specific instrument mode
 run_vectoradd_smem() {
   local instrument_mode=$1
@@ -345,6 +365,54 @@ verify_mem_values() {
   echo "  ✅ Found $addrs_count lines with addrs (addresses also captured)"
 
   echo "  ✅ Memory value verification passed!"
+  return 0
+}
+
+# Function to check mem_value_trace on 2-byte shared-memory accesses that end at the last byte of the CTA's
+# shared memory: the instrumented run must not fault, and each lane must record exactly the value it stored
+# (lane + 1), with no bytes from the next lane or from past the allocation.
+test_smem_tail_values() {
+  echo "  -> Running smem_tail with CUTRACER_INSTRUMENT=mem_value_trace..."
+
+  cd "$PROJECT_ROOT/tests/smem_tail"
+
+  # Clean up old trace files
+  rm -f ./*.ndjson ./*.ndjson.zst ./*.log
+
+  if ! CUDA_INJECTION64_PATH="$PROJECT_ROOT/lib/cutracer.so" \
+       CUTRACER_INSTRUMENT=mem_value_trace \
+       ./smem_tail >cutracer_output.log 2>&1; then
+    echo "❌ smem_tail with mem_value_trace failed"
+    echo "     === CUTracer Output ==="
+    cat cutracer_output.log
+    return 1
+  fi
+
+  local trace_file
+  trace_file=$(get_smem_trace_file "$PROJECT_ROOT/tests/smem_tail")
+  if [ -z "$trace_file" ]; then
+    echo "❌ No trace file found in smem_tail directory"
+    ls -la "$PROJECT_ROOT/tests/smem_tail"
+    return 1
+  fi
+
+  local cat_cmd="cat"
+  if [[ "$trace_file" == *.zst ]]; then
+    cat_cmd="zstd -dc"
+  fi
+
+  # mem_space 4 is InstrType::MemorySpace::SHARED
+  local smem_records='select(.type == "mem_value_trace" and .mem_space == 4 and .access_size == 2)'
+  local total exact
+  total=$($cat_cmd "$trace_file" | jq -c "$smem_records" | wc -l)
+  exact=$($cat_cmd "$trace_file" | jq -c "$smem_records | select([.values | to_entries[] | .value[0] == .key + 1] | all)" | wc -l)
+
+  if [ "$total" -lt 2 ] || [ "$exact" -ne "$total" ]; then
+    echo "❌ FAILED: expected the 2-byte STS and LDS to record each lane's own value; $exact of $total records do"
+    $cat_cmd "$trace_file" | jq -c "$smem_records | {pc, is_load, lane0: .values[0], lane31: .values[31]}" | head -4
+    return 1
+  fi
+  echo "  ✅ All $total 2-byte shared-memory records carry exactly each lane's value"
   return 0
 }
 
@@ -1247,6 +1315,11 @@ test_mem_value_trace() {
     return 1
   fi
 
+  if ! build_smem_tail || ! test_smem_tail_values; then
+    echo "❌ smem_tail value check failed"
+    return 1
+  fi
+
   echo "✅ mem_value_trace test passed!"
   cd "$PROJECT_ROOT"
   return 0
@@ -1421,7 +1494,7 @@ maybe_build_vectoradd_smem() {
 
 case "$TEST_TYPE" in
 "build-only")
-  build_cutracer && build_vectoradd && build_vectoradd_smem
+  build_cutracer && build_vectoradd && build_vectoradd_smem && build_smem_tail
   ;;
 "vectoradd")
   maybe_build_vectoradd && test_vectoradd && test_py_add_with_kernel_filters

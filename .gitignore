@@ -104,6 +104,7 @@ third_party/rapidjson
 
 tests/vectoradd/vectoradd
 tests/vectoradd_smem/vectoradd_smem
+tests/smem_tail/smem_tail
 .cache/
 compile_commands.json
 
