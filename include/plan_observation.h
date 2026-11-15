@@ -27,3 +27,6 @@ struct plan_observation_t {
   uint32_t word_mask;
   uint32_t values[PLAN_CAPTURE_WORDS][32];
 };
+
+// See the channel record size checks in common.h.
+static_assert(sizeof(plan_observation_t) % 8 == 0, "channel records must be a multiple of 8 bytes");

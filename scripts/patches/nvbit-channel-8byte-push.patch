@@ -1,0 +1,51 @@
+diff --git a/core/utils/channel.hpp b/core/utils/channel.hpp
+--- a/core/utils/channel.hpp
++++ b/core/utils/channel.hpp
+@@ -101,6 +101,30 @@
+             return;
+         }
+ 
++        // Every record must be a multiple of 8 bytes, and the copy below
++        // stores it into the buffer as 8-byte words. Do not replace that copy
++        // with std::memcpy, and do not add a byte-wise fallback for other
++        // sizes.
++        //
++        // Without USE_ASYNC_STREAM the buffer is mapped pinned host memory,
++        // so every store in the copy becomes a PCIe write to host memory.
++        // Device code gives std::memcpy no store width: for records like
++        // CUTracer's it compiles to a loop of one-byte loads and stores
++        // (LD.E.U8 + ST.E.U8), one PCIe write per record byte. On B200 hosts
++        // that write stream took GPUs off the bus (Xid 79) within seconds to
++        // minutes whenever the buffer sat on the NUMA node remote to the GPU:
++        // about once a second the GPU's traffic to host memory stalled for 10
++        // to 110 ms, and the PCIe link went down at the start of one of those
++        // stalls. The same records stored as 8-byte words ran without stalls.
++        // A size that is not a multiple of 8 is a caller bug, so it traps here
++        // rather than fall back to the byte copy.
++        //
++        // Buffer offsets stay 8-byte aligned: every reservation is a multiple
++        // of 8, and the buffer comes from cudaHostAlloc or cudaMalloc.
++        if (nbytes % 8 != 0) {
++            __trap();
++        }
++
+         dev_atomic_u64 head(head_bytes);
+         dev_atomic_u64 tail(tail_bytes);
+ 
+@@ -128,7 +152,15 @@
+             }
+         }
+ 
+-        std::memcpy(buff + curr, packet, nbytes);
++        // 8-byte stores; see the comment at the top of push(). The 8-byte
++        // std::memcpy only reads the packet, which may have any alignment.
++        const auto* src = static_cast<const unsigned char*>(packet);
++        auto* dst = reinterpret_cast<std::uint64_t*>(buff + curr);
++        for (std::uint32_t i = 0; i < nbytes / 8; ++i) {
++            std::uint64_t word;
++            std::memcpy(&word, src + 8 * i, sizeof(word));
++            dst[i] = word;
++        }
+ 
+         // Publish payload completion to the flusher.
+         tail.fetch_add(

@@ -4,7 +4,7 @@
 - For a faster, targeted build, you can specify an architecture, e.g., `make ARCH=sm_90`.
 - `inject_funcs.cu` is compiled with special flags; `ptxas` version gates may alter `-maxrregcount`.
 
-Standalone builds require NVBit 1.8.1 or newer, which includes the upstream channel synchronization fix. Run `./install_third_party.sh` when upgrading an existing checkout. `make` tracks NVBit headers and the library, and rebuilds objects and embedded fatbins after changes or dependency reinstallation, including archives that preserve older timestamps.
+Standalone builds require NVBit 1.8.1 or newer and the `patch` utility. `install_third_party.sh` applies the patches in `scripts/patches/` to the downloaded NVBit, and `make` applies them to existing downloads before compiling. `nvbit-channel-8byte-push.patch` makes `ChannelDev::push` store records into the host-mapped channel buffer as 8-byte words and trap on a record whose size is not a multiple of 8. The upstream `std::memcpy` compiles to one-byte stores, one PCIe write per record byte, which took B200 GPUs off the bus when the buffer sat on the NUMA node remote to the GPU; the patch's comment has the details. Already patched dependencies are accepted; an incompatible upstream channel stops the build for review. Run `./install_third_party.sh` when upgrading an existing checkout. `make` tracks NVBit headers and the library, and rebuilds objects and embedded fatbins after changes or dependency reinstallation, including archives that preserve older timestamps.
 
 ### Build knobs (Makefile)
 

@@ -195,4 +195,14 @@ struct tma_access_t {
 
 #include "plan_observation.h"
 
+#ifdef __cplusplus
+/* ChannelDev::push stores each record into the host-mapped channel buffer as 8-byte words and traps on a record whose
+ * size is not a multiple of 8. The comment in ChannelDev::push describes the B200 PCIe failure a byte copy caused. */
+static_assert(sizeof(reg_info_t) % 8 == 0, "channel records must be a multiple of 8 bytes");
+static_assert(sizeof(mem_addr_access_t) % 8 == 0, "channel records must be a multiple of 8 bytes");
+static_assert(sizeof(mem_value_access_t) % 8 == 0, "channel records must be a multiple of 8 bytes");
+static_assert(sizeof(opcode_only_t) % 8 == 0, "channel records must be a multiple of 8 bytes");
+static_assert(sizeof(tma_access_t) % 8 == 0, "channel records must be a multiple of 8 bytes");
+#endif /* __cplusplus */
+
 #endif /* COMMON_H */
