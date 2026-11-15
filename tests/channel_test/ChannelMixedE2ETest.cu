@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -39,8 +40,14 @@ struct alignas(8) SmallRecord {
   uint64_t canary;
 };
 
+// 324 bytes, which breaks the 8-byte record size that ChannelDev::push requires.
+struct OddRecord {
+  uint32_t words[81];
+};
+
 static_assert(sizeof(LargeRecord) == 2168, "must match reg_info_t size");
 static_assert(sizeof(SmallRecord) == 328, "must match tma_access_t size");
+static_assert(sizeof(OddRecord) % 8 != 0, "must not be a multiple of 8 bytes");
 
 __host__ __device__ uint32_t payloadValue(uint64_t sequence, uint32_t index, uint32_t type) {
   uint64_t value = sequence * 0x9e3779b97f4a7c15ULL;
@@ -116,6 +123,11 @@ __global__ void pushMixedRecords(ChannelDev* channel, int recordsPerWarp) {
 
 __global__ void flushChannel(ChannelDev* channel) {
   channel->flush();
+}
+
+__global__ void pushOddRecord(ChannelDev* channel) {
+  OddRecord record{};
+  channel->push(&record, sizeof(record));
 }
 
 struct Stats {
@@ -239,6 +251,26 @@ TEST(ChannelE2E, PublishesMixedRecordsBeforeTail) {
   EXPECT_EQ(stats.corrupt, 0);
   EXPECT_EQ(stats.unknown, 0);
   EXPECT_EQ(stats.truncated, 0);
+}
+
+// Exits 1 when the kernel fails, 0 when the odd-sized record was accepted.
+[[noreturn]] void pushOddRecordAndExit() {
+  ChannelDev* channelDev = nullptr;
+  if (cudaMallocManaged(&channelDev, sizeof(ChannelDev)) != cudaSuccess) {
+    std::_Exit(2);
+  }
+  ChannelHost channelHost;
+  channelHost.init(0, kChannelBytes, channelDev, nullptr);
+  pushOddRecord<<<1, 1>>>(channelDev);
+  std::_Exit(cudaDeviceSynchronize() == cudaSuccess ? 0 : 1);
+}
+
+// ChannelDev::push must stop the kernel on a record whose size is not a
+// multiple of 8 rather than copy it into host-mapped memory byte by byte. The
+// trap ends the CUDA context, so the push runs in a child process.
+TEST(ChannelE2EDeathTest, TrapsOnRecordSizeNotMultipleOfEight) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(pushOddRecordAndExit(), testing::ExitedWithCode(1), "");
 }
 
 }  // namespace

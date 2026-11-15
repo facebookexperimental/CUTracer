@@ -46,6 +46,8 @@ INCLUDE_DIR := include
 NVBIT_PATH=./third_party/nvbit/core
 NVBIT_CHANNEL=$(NVBIT_PATH)/utils/channel.hpp
 NVBIT_HEADERS=$(wildcard $(NVBIT_PATH)/*.h $(NVBIT_PATH)/utils/*.h $(NVBIT_PATH)/utils/*.hpp)
+NVBIT_PATCHES=$(wildcard scripts/patches/*.patch)
+NVBIT_PATCH_STAMP=$(NVBIT_PATH)/.cutracer-nvbit-patches
 NVBIT_DEPENDENCY_STAMP=$(NVBIT_PATH)/.cutracer-build-deps
 PICOSHA2_PATH=./third_party/picosha2
 INCLUDES=-I$(NVBIT_PATH) -I./$(INCLUDE_DIR) -I./third_party -I$(PICOSHA2_PATH)
@@ -138,9 +140,17 @@ $(OBJ_DIR):
 $(LIB_DIR):
 	mkdir -p $@
 
+# Apply scripts/patches/ to existing downloads as well as dependencies installed
+# by the script. Keep the stamp inside NVBit so reinstalling it reapplies them.
+nvbit-patch: $(NVBIT_PATCH_STAMP)
+
+$(NVBIT_PATCH_STAMP): $(NVBIT_CHANNEL) scripts/apply_nvbit_patches.sh $(NVBIT_PATCHES)
+	bash scripts/apply_nvbit_patches.sh "$(NVBIT_PATH)/.."
+	touch "$@"
+
 # Keep the stamp inside NVBit so reinstalling it invalidates old objects even
 # when the release archive preserves header and library timestamps.
-$(NVBIT_DEPENDENCY_STAMP): $(NVBIT_CHANNEL) $(NVBIT_HEADERS) $(NVBIT_PATH)/libnvbit.a
+$(NVBIT_DEPENDENCY_STAMP): $(NVBIT_PATCH_STAMP) $(NVBIT_CHANNEL) $(NVBIT_HEADERS) $(NVBIT_PATH)/libnvbit.a
 	touch "$@"
 
 # Linking rule
@@ -182,4 +192,4 @@ $(OBJS): | $(OBJ_DIR)
 clean:
 	rm -rf $(OBJ_DIR) $(LIB_DIR) $(TOOL_FUNC_DIR)/*.fatbin $(TOOL_FUNC_DIR)/*.c
 
-.PHONY: all clean dirs
+.PHONY: all clean dirs nvbit-patch
