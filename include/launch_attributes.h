@@ -64,10 +64,14 @@ inline const char* portability_mode_name(int mode) {
 inline nlohmann::json describe_launch_attributes(const CUlaunchAttribute* attrs, unsigned int count,
                                                  bool cooperative_api) {
   nlohmann::json described = nlohmann::json::object();
-  if (cooperative_api) described["cooperative"] = true;
+  if (cooperative_api) {
+    described["cooperative"] = true;
+  }
   nlohmann::json unrecognized = nlohmann::json::array();
   const auto set = [&described](const char* key, nlohmann::json value) {
-    if (!described.contains(key)) described[key] = std::move(value);
+    if (!described.contains(key)) {
+      described[key] = std::move(value);
+    }
   };
   const auto handle = [](CUevent event) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(event)); };
   for (unsigned int i = 0; attrs && i < count; ++i) {
@@ -142,7 +146,9 @@ inline nlohmann::json describe_launch_attributes(const CUlaunchAttribute* attrs,
         break;
     }
   }
-  if (!unrecognized.empty()) described["unrecognized"] = unrecognized;
+  if (!unrecognized.empty()) {
+    described["unrecognized"] = unrecognized;
+  }
   return described;
 }
 
@@ -154,21 +160,29 @@ template <typename Query>
 nlohmann::json describe_function_attributes(Query query) {
   nlohmann::json described = nlohmann::json::object();
   int value = 0;
-  if (query(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, value)) described["max_dynamic_shared_size_bytes"] = value;
+  if (query(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, value)) {
+    described["max_dynamic_shared_size_bytes"] = value;
+  }
   // -1 means no preference.
-  if (query(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, value))
+  if (query(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, value)) {
     described["preferred_shared_memory_carveout"] = value;
-  if (query(CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET, value)) described["cluster_size_must_be_set"] = value != 0;
+  }
+  if (query(CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET, value)) {
+    described["cluster_size_must_be_set"] = value != 0;
+  }
   int width = 0, height = 0, depth = 0;
   if (query(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, width) &&
       query(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, height) &&
-      query(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, depth))
+      query(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, depth)) {
     described["required_cluster_dim"] = {width, height, depth};
-  if (query(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, value))
+  }
+  if (query(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, value)) {
     described["non_portable_cluster_size_allowed"] = value != 0;
-  if (query(CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, value))
+  }
+  if (query(CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, value)) {
     described["cluster_scheduling_policy"] =
         cluster_scheduling_policy_name(static_cast<CUclusterSchedulingPolicy>(value));
+  }
   return described;
 }
 

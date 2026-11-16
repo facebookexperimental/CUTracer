@@ -135,7 +135,9 @@ TEST(LaunchAttributes, IgnoredEntriesAreSkipped) {
 auto driver_reporting(const std::map<CUfunction_attribute, int>& values) {
   return [values](CUfunction_attribute attribute, int& value) {
     const auto it = values.find(attribute);
-    if (it == values.end()) return false;
+    if (it == values.end()) {
+      return false;
+    }
     value = it->second;
     return true;
   };
