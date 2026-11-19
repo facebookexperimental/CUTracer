@@ -152,6 +152,46 @@ Every report needs:
 6. an evidence summary from observation to conclusion;
 7. resolution and matched validation.
 
+### Channel titles: the report title and the Workplace title
+
+The title in item 1 is the report title. Use it for the durable copy of the
+report: an artifact, a document, or a repository file. A group feed shows
+only the title, so a report published as a post in the CUTracer Workplace
+group needs a separate, shorter post title in this form:
+
+`[Bot🤖][Case Report] <exact symptom> in <kernel/operator/component>
+[(<platform>)]: <confirmed cause or narrowest proven boundary>`
+
+Derive the post title under these rules:
+
+- Prefix order is fixed: provenance first, then post type. Use exactly one
+  type prefix. The post title may drop `CUTracer investigates` and shorten
+  component names, but it keeps the exact symptom and the same conclusion
+  and scope as the report title. Never strengthen a bounded or unresolved
+  conclusion to fit the shorter line.
+- `[Bot🤖]` marks agent-generated text. Use it when an agent drafted the
+  report, even when a human publishes the post. Omit it only for a
+  human-written report, which uses `[Case Report]` alone. A human fixing
+  typos in an agent draft does not remove the marker.
+- Classify by the reader's main takeaway, not by whether a fix shipped. A
+  report whose main value is a root cause and a reusable lesson is a Case
+  Report even when its resolution adds a CUTracer feature.
+- Keep `#casereport` as the first tag in the report's Tags line. The prefix
+  serves scanning in the feed; the hashtag serves search. One does not
+  replace the other.
+- Strip both prefixes from a public, non-Workplace copy. The provenance
+  and channel markers have no meaning outside the group feed.
+
+All CUTracer group posts use one taxonomy. These prefixes mirror the
+CUTracer Workplace group description; when that description changes,
+update this list in the same change:
+
+| Post title prefix | First tag | Use for |
+|---|---|---|
+| `[Bot🤖][Case Report]` or `[Case Report]` | `#casereport` | A completed investigation report; the only type this skill produces |
+| `[Bot🤖][Feature]` or `[Feature]` | `#feature` | A new capability, detector, CLI surface, or release |
+| `[Bot🤖][Feedback]` or `[Feedback]` | `#feedback` | A question, request, or proposal |
+
 When a human-authored report exists, add a comparison section after the blind
 or historical validation. Compare the investigation boundaries and evidence,
 not writing quality. State:
@@ -249,6 +289,10 @@ Verify all of the following:
   sanitizers, compilers, and source inspection.
 - The title contains the exact symptom, affected component, platform when
   useful, and the narrowest proven conclusion.
+- A Workplace post title starts with exactly one type prefix from the
+  channel-title table. Its `[Bot🤖]` marker matches how the text was
+  authored, its first tag is the matching hashtag, and its conclusion and
+  scope match the report title. A public copy carries no prefix.
 - The status links the relevant `examples/` or `tests/` code when it exists.
 - The TL;DR uses symptom, conclusion, outcome, and CUTracer contribution order.
 - Commands include portable setup and are runnable or explicitly illustrative.

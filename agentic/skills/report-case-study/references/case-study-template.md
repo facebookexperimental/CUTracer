@@ -6,8 +6,15 @@ they help prove the conclusion. Remove all bracketed guidance before delivery.
 ```markdown
 # CUTracer investigates <exact symptom> in <kernel/operator/component> [on <platform>]: <confirmed cause or narrowest proven boundary>
 
-**Status:** <confirmed / bounded / unresolved> · **Tags:** <tool, subsystem,
-failure class, platform, and kernel/operator terms>
+**Workplace title:** <for a post in the CUTracer Workplace group, replace
+the H1 above with `[Bot🤖][Case Report] <exact symptom> in
+<kernel/operator/component> [(<platform>)]: <confirmed cause or narrowest
+proven boundary>`; use `[Case Report]` without `[Bot🤖]` only for a
+human-written report; remove this line for every other channel>
+
+**Status:** <confirmed / bounded / unresolved> · **Tags:** <#casereport
+first for a Workplace post, then tool, subsystem, failure class, platform,
+and kernel/operator terms>
 
 ## TL;DR
 
@@ -183,6 +190,9 @@ impact, workaround, and concrete improvement.
 ## Editing rules
 
 - Use only facts from inspected inputs and produced artifacts.
+- For a Workplace post, the H1 carries exactly one type prefix, the
+  `[Bot🤖]` marker matches how the text was authored, and the first tag is
+  the matching hashtag. Strip the prefix from a public copy.
 - Link the relevant `examples/` or `tests/` code beside the status when it
   exists. Omit the field when no such code exists.
 - Prefer one evidence table over repeated prose.
