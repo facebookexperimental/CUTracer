@@ -4,21 +4,21 @@
 # Script to download and install third-party dependencies for CUTracer
 #
 # Environment Variables:
-#   NVBIT_VERSION       - NVBit version >= 1.8.1 (or "latest" for latest release)
+#   NVBIT_VERSION       - NVBit version >= 1.8.2 (or "latest" for latest release)
 #   JSON_VERSION        - nlohmann/json version
 #   RAPIDJSON_VERSION   - rapidjson release tag (header-only)
 #
 # Usage:
 #   ./install_third_party.sh                        # Use defaults
 #   NVBIT_VERSION=latest ./install_third_party.sh   # Use latest NVBit
-#   NVBIT_VERSION=1.8.1 JSON_VERSION=3.12.0 ./install_third_party.sh
+#   NVBIT_VERSION=1.8.2 JSON_VERSION=3.12.0 ./install_third_party.sh
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 1
 
 # ============================================================
 # Configuration: Set default values if not provided
 # ============================================================
-NVBIT_MIN_VERSION="1.8.1"
+NVBIT_MIN_VERSION="1.8.2"
 NVBIT_VERSION="${NVBIT_VERSION:-$NVBIT_MIN_VERSION}"
 JSON_VERSION="${JSON_VERSION:-3.12.0}"
 RAPIDJSON_VERSION="${RAPIDJSON_VERSION:-1.1.0}"

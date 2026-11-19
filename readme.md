@@ -24,7 +24,7 @@ CUTracer supports Hopper (SM90), Blackwell (SM100) and later GPUs. Analyzing sav
 - Linux on x86_64 or aarch64, with a Hopper or newer NVIDIA GPU for capture
 - A CUDA toolkit with `nvcc` to build `cutracer.so`; [`scripts/install_cuda.sh`](scripts/install_cuda.sh) installs one without root (see [Quickstart](docs/Quickstart.md))
 - libzstd, preferably with its static library so that `cutracer.so` is self-contained
-- NVBit 1.8.1 or newer, which `./install_third_party.sh` downloads
+- NVBit 1.8.2 or newer, which `./install_third_party.sh` downloads
 - Python 3.10 or newer for the `cutracer` command
 - NVIDIA Compute Sanitizer, part of the CUDA toolkit, for `cutracer compute-sanitizer` and `cutracer diagnose`
 
