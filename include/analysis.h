@@ -181,6 +181,8 @@ struct KernelFuncMetadata {
  * @brief Stores the completed instruction histogram for a specific region of a
  * warp.
  */
+struct ExitQuarantineState;
+
 struct CTXstate {
   /* context id */
   int id;
@@ -188,6 +190,11 @@ struct CTXstate {
   /* Channel used to communicate from GPU to CPU receiving thread */
   ChannelDev* channel_dev = nullptr;
   ChannelHost channel_host;
+
+  /* Exit quarantine device state and host copy; null when off. */
+  ExitQuarantineState* exit_quarantine = nullptr;
+  ExitQuarantineState* exit_quarantine_host = nullptr;
+  std::unordered_set<CUfunction> exit_quarantine_functions;
 
   /* Preloaded tool module for flush_channel (avoids <<<>>> module load deadlock) */
   CUmodule tool_module = nullptr;

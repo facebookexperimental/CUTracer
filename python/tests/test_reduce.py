@@ -524,18 +524,21 @@ class ReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kernel timeout"):
             ReplayConfig(oracle_argv=["./oracle"], kernel_timeout_s=-1)
 
-    def _hang_runner(self, *, returncode=-15, raise_timeout=False):
-        """A runner whose replay hangs: CUTracer logs its kernel timeout, then SIGTERM."""
+    def _hang_runner(
+        self, *, returncode=-15, raise_timeout=False, line=None, stderr=""
+    ):
+        """A runner that records native evidence before exiting or timing out."""
 
         def runner(argv, **kwargs):
             log = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"]) / "cutracer_main_1.log"
             log.write_text(
-                "Kernel timeout: running for 61 seconds (limit: 60 seconds); "
+                line
+                or "Kernel timeout: running for 61 seconds (limit: 60 seconds); "
                 "sending SIGTERM. kernel=k\n"
             )
             if raise_timeout:
-                raise subprocess.TimeoutExpired(argv, 1)
-            return subprocess.CompletedProcess(argv, returncode, "", "")
+                raise subprocess.TimeoutExpired(argv, 1, stderr=stderr)
+            return subprocess.CompletedProcess(argv, returncode, "", stderr)
 
         return runner
 
@@ -548,6 +551,112 @@ class ReplayTest(unittest.TestCase):
         fields.update(overrides)
         os.makedirs(fields["output_dir"], exist_ok=True)
         return ReplayConfig(**fields)
+
+    def test_replay_late_write_is_interesting_with_the_exit_quarantine(self):
+        def runner(argv, **kwargs):
+            log = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"]) / "cutracer_main_1.log"
+            log.write_text(
+                "Exit quarantine: shared memory of CTA (0,0,0) changed after its last "
+                "thread exited: offset 0x480 poison 0xc5c5c5c500000480 observed 0x1 "
+                "(launch_id 0)\n"
+            )
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        late = run_replay(
+            str(self.config_path),
+            self._replay_config(exit_quarantine_ns=50000),
+            runner=runner,
+        )
+        unwatched = run_replay(
+            str(self.config_path),
+            self._replay_config(output_dir=str(self.temp_dir / "plain")),
+            runner=runner,
+        )
+
+        self.assertEqual(late.outcome, ReplayOutcome.INTERESTING)
+        self.assertIn("late write: Exit quarantine", late.error)
+        self.assertEqual(unwatched.outcome, ReplayOutcome.NOT_INTERESTING)
+
+    def test_replay_fatal_precedes_late_write_and_success_or_timeout(self):
+        fatal = "FATAL: exit quarantine: unsupported graph"
+        late = "Exit quarantine: shared memory of CTA (0,0,0) changed after its last thread exited\n"
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out):
+                result = run_replay(
+                    str(self.config_path),
+                    self._replay_config(
+                        exit_quarantine_ns=50000,
+                        output_dir=str(self.temp_dir / f"fatal-{timed_out}"),
+                    ),
+                    runner=self._hang_runner(
+                        returncode=0,
+                        raise_timeout=timed_out,
+                        line=late,
+                        stderr=fatal,
+                    ),
+                )
+                self.assertEqual(result.outcome, ReplayOutcome.INFRA_ERROR)
+                self.assertEqual(result.error, fatal)
+
+    def test_replay_timeout_after_a_late_write_is_interesting(self):
+        line = (
+            "Exit quarantine: shared memory of CTA (0,0,0) changed after its last "
+            "thread exited: offset 0x480 poison 0xc5c5c5c500000480 observed 0x1 "
+            "(launch_id 0)\n"
+        )
+        for enabled, expected in (
+            (50000, ReplayOutcome.INTERESTING),
+            (0, ReplayOutcome.TIMED_OUT),
+        ):
+            with self.subTest(exit_quarantine_ns=enabled):
+                result = run_replay(
+                    str(self.config_path),
+                    self._replay_config(
+                        exit_quarantine_ns=enabled,
+                        output_dir=str(self.temp_dir / f"timeout-{enabled}"),
+                    ),
+                    runner=self._hang_runner(raise_timeout=True, line=line),
+                )
+                self.assertEqual(result.outcome, expected)
+                self.assertIsNone(result.returncode)
+
+    def test_replay_late_write_timeout_keeps_identity_validation(self):
+        expected_checksum = "a1b2c3d4e5f60001"
+        for checksum, expected in (
+            (expected_checksum, ReplayOutcome.INTERESTING),
+            ("other", ReplayOutcome.STALE_INPUT),
+            (None, ReplayOutcome.INFRA_ERROR),
+        ):
+            with self.subTest(checksum=checksum):
+
+                def runner(argv, checksum=checksum, **kwargs):
+                    out = Path(kwargs["env"]["CUTRACER_OUTPUT_DIR"])
+                    (out / "cutracer_main_1.log").write_text(
+                        "Exit quarantine: shared memory of CTA (0,0,0) changed after its last thread exited\n"
+                    )
+                    if checksum is not None:
+                        (out / "cutracer_kernel_events_test.ndjson").write_text(
+                            json.dumps(
+                                {
+                                    "type": "kernel_launch",
+                                    "kernel_name": "matmul_kernel",
+                                    "kernel_checksum": checksum,
+                                }
+                            )
+                            + "\n"
+                        )
+                    raise subprocess.TimeoutExpired(argv, 1)
+
+                result = run_replay(
+                    str(self.config_path),
+                    self._replay_config(
+                        exit_quarantine_ns=50000,
+                        expected_kernel_name="matmul_kernel",
+                        expected_kernel_checksum=expected_checksum,
+                    ),
+                    runner=runner,
+                )
+                self.assertEqual(result.outcome, expected)
 
     def test_replay_hang_is_interesting_with_hang_is_bug(self):
         hang = run_replay(

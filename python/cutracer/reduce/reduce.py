@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping, Optional, Sequence
 
-from click import ClickException
+from click import ClickException, echo
 from cutracer.cutracer_logger import get_logger
 from cutracer.reduce.config_mutator import DelayConfigMutator, DelayPoint
 from cutracer.runner import (
@@ -26,7 +26,12 @@ from cutracer.runner import (
     run_process_group,
     RunTarget,
 )
-from cutracer.watchdog import main_logs, watchdog_terminations
+from cutracer.watchdog import (
+    exit_quarantine_changes,
+    exit_quarantine_failures,
+    main_logs,
+    watchdog_terminations,
+)
 
 logger = get_logger("reduce")
 
@@ -62,6 +67,10 @@ class ReplayConfig:
     # A replay whose kernel CUTracer's watchdog ended (a hang) is interesting,
     # whatever the oracle's exit code.
     hang_is_bug: bool = False
+    # CUTracer's exit quarantine in each replay (ns, 0 = off); a replay in which
+    # a CTA's shared memory changed after its last thread exited is interesting,
+    # whatever the oracle's exit code.
+    exit_quarantine_ns: int = 0
     output_dir: Optional[str] = None
     timeout: int = 300
     cwd: Optional[str] = None
@@ -80,6 +89,10 @@ class ReplayConfig:
             raise ValueError("replay timeout must be positive")
         if self.kernel_timeout_s < 0:
             raise ValueError("replay kernel timeout must be >= 0")
+        if not 0 <= self.exit_quarantine_ns <= 0xFFFFFFFF:
+            raise ValueError(
+                "replay exit quarantine must be an unsigned 32-bit ns value"
+            )
         if (self.expected_kernel_name is None) != (
             self.expected_kernel_checksum is None
         ):
@@ -377,13 +390,25 @@ def _run_replay_once(  # noqa: C901
             )
         else:
             log_dir = config.cwd or os.getcwd()
-    logs_before = main_logs(log_dir) if config.hang_is_bug else set()
+    logs_before = (
+        main_logs(log_dir)
+        if config.hang_is_bug or config.exit_quarantine_ns > 0
+        else set()
+    )
 
     def hang_lines() -> list[str]:
         if not config.hang_is_bug:
             return []
         return watchdog_terminations(log_dir, before=logs_before)
 
+    def late_write_lines() -> list[str]:
+        if config.exit_quarantine_ns <= 0:
+            return []
+        return exit_quarantine_changes(log_dir, before=logs_before)
+
+    proc: Optional[subprocess.CompletedProcess[str]] = None
+    timeout_error = ""
+    timeout_output: tuple[str | bytes | None, ...] = ()
     try:
         proc = run_instrumented_target(
             config.oracle_argv,
@@ -411,41 +436,17 @@ def _run_replay_once(  # noqa: C901
                     if config.kernel_timeout_s > 0
                     else InstrumentationConfig.no_data_timeout_s
                 ),
+                exit_quarantine_ns=config.exit_quarantine_ns,
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
-                capture_output=config.capture_output,
+                capture_output=config.capture_output or config.exit_quarantine_ns > 0,
             ),
             runner=runner or run_process_group,
         )
     except subprocess.TimeoutExpired as exc:
-        watchdog = hang_lines()
-        if watchdog:
-            if config.expected_kernel_name is not None:
-                assert config.expected_kernel_checksum is not None
-                assert output_dir is not None
-                identity_failure = _validate_replay_kernel_identity(
-                    output_dir,
-                    expected_name=config.expected_kernel_name,
-                    expected_checksum=config.expected_kernel_checksum,
-                )
-                if identity_failure is not None:
-                    outcome, reason = identity_failure
-                    return ReplayResult(
-                        outcome=outcome,
-                        returncode=None,
-                        error=reason,
-                    )
-            return ReplayResult(
-                outcome=ReplayOutcome.INTERESTING,
-                returncode=None,
-                error="hang: " + watchdog[0],
-            )
-        return ReplayResult(
-            outcome=ReplayOutcome.TIMED_OUT,
-            returncode=None,
-            error=str(exc),
-        )
+        timeout_error = str(exc)
+        timeout_output = (exc.stdout, exc.stderr)
     except (ClickException, OSError, TypeError, ValueError) as exc:
         return ReplayResult(
             outcome=ReplayOutcome.INFRA_ERROR,
@@ -453,16 +454,44 @@ def _run_replay_once(  # noqa: C901
             error=str(exc),
         )
 
+    output = timeout_output if proc is None else (proc.stdout, proc.stderr)
+    if not config.capture_output and config.exit_quarantine_ns > 0:
+        for text, err in zip(output, (False, True)):
+            if text:
+                echo(
+                    text.decode(errors="replace") if isinstance(text, bytes) else text,
+                    err=err,
+                    nl=False,
+                )
+    fatal = exit_quarantine_failures(log_dir, before=logs_before, output=output)
+    if fatal:
+        return ReplayResult(
+            outcome=ReplayOutcome.INFRA_ERROR,
+            returncode=None if proc is None else proc.returncode,
+            stdout="" if proc is None else proc.stdout or "",
+            stderr="" if proc is None else proc.stderr or "",
+            error=fatal[0],
+        )
     watchdog = hang_lines()
-    if watchdog:
+    late_writes = late_write_lines()
+    if watchdog or late_writes:
         replay_result = ReplayResult(
             outcome=ReplayOutcome.INTERESTING,
-            returncode=proc.returncode,
-            stdout=proc.stdout or "",
-            stderr=proc.stderr or "",
-            error="hang: " + watchdog[0],
+            returncode=None if proc is None else proc.returncode,
+            stdout="" if proc is None else proc.stdout or "",
+            stderr="" if proc is None else proc.stderr or "",
+            error=("hang: " + watchdog[0])
+            if watchdog
+            else "late write: " + late_writes[0],
+        )
+    elif timeout_error:
+        return ReplayResult(
+            outcome=ReplayOutcome.TIMED_OUT,
+            returncode=None,
+            error=timeout_error,
         )
     else:
+        assert proc is not None
         replay_result = _classify_replay_process(proc, config)
     if replay_result.outcome == ReplayOutcome.INFRA_ERROR:
         return replay_result
@@ -479,7 +508,7 @@ def _run_replay_once(  # noqa: C901
             outcome, reason = identity_failure
             return ReplayResult(
                 outcome=outcome,
-                returncode=proc.returncode,
+                returncode=replay_result.returncode,
                 stdout=replay_result.stdout,
                 stderr=replay_result.stderr,
                 error=reason,

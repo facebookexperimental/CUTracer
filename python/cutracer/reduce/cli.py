@@ -148,6 +148,16 @@ def _run_reduction(
     "interesting, whatever the oracle's exit code.",
 )
 @click.option(
+    "--exit-quarantine-ns",
+    type=click.IntRange(min=0, max=0xFFFFFFFF),
+    default=0,
+    show_default=True,
+    help="CUTracer's exit quarantine in each replay (0 = off, see `cutracer "
+    "trace --exit-quarantine-ns`). A replay in which a CTA's shared memory "
+    "changed after its last thread exited is interesting, whatever the "
+    "oracle's exit code.",
+)
+@click.option(
     "--timeout",
     type=click.IntRange(min=1),
     default=300,
@@ -207,6 +217,7 @@ def reduce_command(
     delay_patterns: str | None,
     kernel_timeout_s: int,
     hang_is_bug: bool,
+    exit_quarantine_ns: int,
     timeout: int,
     output: str,
     minimal_config: str,
@@ -287,6 +298,7 @@ def reduce_command(
             delay_patterns=delay_patterns,
             kernel_timeout_s=kernel_timeout_s,
             hang_is_bug=hang_is_bug,
+            exit_quarantine_ns=exit_quarantine_ns,
             output_dir=os.path.dirname(os.path.abspath(minimal_config)),
             timeout=timeout,
             capture_output=not verbose,

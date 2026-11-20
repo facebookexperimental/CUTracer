@@ -1,15 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""Recognize runs that CUTracer's own watchdog ended.
-
-CUTracer ends a hung instrumented kernel itself: the kernel timeout
-(`CUTRACER_KERNEL_TIMEOUT_S`), the no-data watchdog
-(`CUTRACER_NO_DATA_TIMEOUT_S`) and the online deadlock check
-(`-a deadlock_detection`) write a line to the process's main log and send the
-process SIGTERM. The target's exit code then says little (the process died
-of a signal, or a parent reported a failed worker), so a caller that needs to
-know whether a run hung reads the main logs instead.
-"""
+"""Recognize CUTracer watchdog and exit-quarantine evidence in fresh main logs."""
 
 from __future__ import annotations
 
@@ -22,6 +13,8 @@ WATCHDOG_MARKERS: tuple[str, ...] = (
 )
 _MAIN_LOG_PREFIX = "cutracer_main_"
 _MAIN_LOG_SUFFIX = ".log"
+EXIT_QUARANTINE_MARKER = "Exit quarantine: shared memory of CTA"
+EXIT_QUARANTINE_FATAL = "FATAL: exit quarantine:"
 
 
 def main_logs(directory: str) -> set[str]:
@@ -37,12 +30,9 @@ def main_logs(directory: str) -> set[str]:
     }
 
 
-def watchdog_terminations(directory: str, *, before: set[str]) -> list[str]:
-    """Watchdog lines in the main logs of `directory` that are not in `before`.
-
-    Take `before` with `main_logs` just before starting the target, so only the
-    processes of that run count.
-    """
+def _main_log_lines(
+    directory: str, *, before: set[str], markers: tuple[str, ...]
+) -> list[str]:
     lines: list[str] = []
     for name in sorted(main_logs(directory) - before):
         try:
@@ -50,8 +40,36 @@ def watchdog_terminations(directory: str, *, before: set[str]) -> list[str]:
                 lines.extend(
                     line.rstrip("\n")
                     for line in log
-                    if any(marker in line for marker in WATCHDOG_MARKERS)
+                    if any(marker in line for marker in markers)
                 )
         except OSError:
             continue
     return lines
+
+
+def watchdog_terminations(directory: str, *, before: set[str]) -> list[str]:
+    """Watchdog lines from processes created after the `main_logs` snapshot."""
+    return _main_log_lines(directory, before=before, markers=WATCHDOG_MARKERS)
+
+
+def exit_quarantine_failures(
+    directory: str,
+    *,
+    before: set[str],
+    output: tuple[str | bytes | None, ...] = (),
+) -> list[str]:
+    """Fatal tool diagnostics, including output emitted before log initialization."""
+    lines = _main_log_lines(directory, before=before, markers=(EXIT_QUARANTINE_FATAL,))
+    for chunk in output:
+        text = (
+            chunk.decode(errors="replace") if isinstance(chunk, bytes) else chunk or ""
+        )
+        lines.extend(
+            line for line in text.splitlines() if EXIT_QUARANTINE_FATAL in line
+        )
+    return list(dict.fromkeys(lines))
+
+
+def exit_quarantine_changes(directory: str, *, before: set[str]) -> list[str]:
+    """Changed-word reports from processes created after the main-log snapshot."""
+    return _main_log_lines(directory, before=before, markers=(EXIT_QUARANTINE_MARKER,))

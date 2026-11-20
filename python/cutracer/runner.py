@@ -69,6 +69,7 @@ class InstrumentationConfig:
     hang_check_interval_ms: int = 1000
     hang_check_hits: int = 3
     hang_min_stall_s: int = 0
+    exit_quarantine_ns: int = 0
     nonblocking_launches: bool = False
     cwd: Optional[str] = None
     timeout: Optional[int] = None
@@ -336,6 +337,7 @@ def build_cutracer_env(
     hang_check_interval_ms: int = 1000,
     hang_check_hits: int = 3,
     hang_min_stall_s: int = 0,
+    exit_quarantine_ns: int = 0,
     nonblocking_launches: bool = False,
     base_env: Optional[Mapping[str, str]] = None,
     use_bundled_cuda_tools: bool = True,
@@ -354,6 +356,13 @@ def build_cutracer_env(
                 "nonblocking launches let kernels overlap, which "
                 f"{' and '.join(serial)} does not support"
             )
+    if not 0 <= exit_quarantine_ns <= 0xFFFFFFFF:
+        raise ValueError("the exit quarantine must be an unsigned 32-bit ns value")
+    if exit_quarantine_ns and nonblocking_launches:
+        raise ValueError(
+            "the exit quarantine needs blocking launches: overlapping kernels "
+            "would share its per-CTA exit counters"
+        )
     if (exact_kernel_name is None) != (exact_kernel_checksum is None):
         raise ValueError("exact kernel name and checksum must be provided together")
     if exact_kernel_name is not None and (
@@ -439,6 +448,7 @@ def build_cutracer_env(
     env["CUTRACER_HANG_CHECK_INTERVAL_MS"] = str(hang_check_interval_ms)
     env["CUTRACER_HANG_CHECK_HITS"] = str(hang_check_hits)
     env["CUTRACER_HANG_MIN_STALL_S"] = str(hang_min_stall_s)
+    env["CUTRACER_EXIT_QUARANTINE_NS"] = str(exit_quarantine_ns)
     env["CUTRACER_NONBLOCKING_LAUNCHES"] = "1" if nonblocking_launches else "0"
 
     # NVBit launches nvdisasm after importlib's resource context has exited.
@@ -516,6 +526,7 @@ def _resolve_and_build_env(
         hang_check_interval_ms=config.hang_check_interval_ms,
         hang_check_hits=config.hang_check_hits,
         hang_min_stall_s=config.hang_min_stall_s,
+        exit_quarantine_ns=config.exit_quarantine_ns,
         nonblocking_launches=config.nonblocking_launches,
         base_env=config.base_env,
         use_bundled_cuda_tools=config.use_bundled_cuda_tools,
@@ -809,6 +820,7 @@ def _print_config_summary(env: dict) -> None:
         "CUTRACER_HANG_CHECK_INTERVAL_MS",
         "CUTRACER_HANG_CHECK_HITS",
         "CUTRACER_HANG_MIN_STALL_S",
+        "CUTRACER_EXIT_QUARANTINE_NS",
         "CUTRACER_NONBLOCKING_LAUNCHES",
     ]
     click.echo("=" * 60)
@@ -1064,6 +1076,22 @@ _CUTRACER_OPTIONS = [
         "graph. Not compatible with -a deadlock_detection, "
         "-a proton_instr_histogram or an instrumentation plan.",
     ),
+    click.option(
+        "--exit-quarantine-ns",
+        type=click.IntRange(min=0, max=0xFFFFFFFF),
+        default=0,
+        show_default=True,
+        help="When the last thread of an instrumented CTA (sm_90+) exits, fill "
+        "the CTA's shared memory with a poison pattern, wait this many ns, and "
+        "log every word that changed ('Exit quarantine: shared memory of CTA "
+        "...' in the main log): an st.async or bulk copy that landed after the "
+        "CTA finished. A copy that still reads the shared memory then reads the "
+        "poison, so its consumer sees wrong values. A late mbarrier arrive is "
+        "not seen (an arrive on a poisoned barrier word changes nothing). "
+        "0 = off. Needs an instrumentation mode (-i) and direct blocking launches. "
+        "Mixed static/dynamic shared-memory layouts, graph capture/build/launch, "
+        "instrumentation plans and legacy launch APIs are rejected.",
+    ),
 ]
 
 
@@ -1111,6 +1139,7 @@ def trace_command(
     hang_check_hits: int,
     hang_min_stall_s: int,
     nonblocking_launches: bool,
+    exit_quarantine_ns: int,
     cmd: tuple,
 ) -> None:
     """Trace a CUDA application with CUTracer.
@@ -1224,6 +1253,7 @@ def trace_command(
         hang_check_hits=hang_check_hits,
         hang_min_stall_s=hang_min_stall_s,
         nonblocking_launches=nonblocking_launches,
+        exit_quarantine_ns=exit_quarantine_ns,
         capture_output=False,
         shell=True,
     )

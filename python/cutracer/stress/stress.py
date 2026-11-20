@@ -44,7 +44,12 @@ from cutracer.stress.retention import (
     MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
     retain_oldest_and_newest,
 )
-from cutracer.watchdog import main_logs, watchdog_terminations
+from cutracer.watchdog import (
+    exit_quarantine_changes,
+    exit_quarantine_failures,
+    main_logs,
+    watchdog_terminations,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -58,6 +63,9 @@ MIN_RUN_BUDGET_S = 30
 SYMPTOM_FAILURE = "failure"
 # CUTracer's watchdog ended a hung kernel (requires `hang_is_bug`).
 SYMPTOM_HANG = "hang"
+# CUTracer's exit quarantine saw a CTA's shared memory change after its last
+# thread exited (requires `exit_quarantine_ns`), while the oracle passed.
+SYMPTOM_LATE_WRITE = "late_write"
 
 STRATEGY_RANDOM: str = RANDOM.name
 STRATEGY_ISOLATE: str = ISOLATE.name
@@ -128,6 +136,11 @@ class StressConfig:
     # reproduction, whatever the oracle's exit code. Off by default: a large
     # delay can also slow a correct kernel past the timeout.
     hang_is_bug: bool = False
+    # CUTracer's exit quarantine in every run (ns, 0 = off): the last thread of
+    # each instrumented CTA poisons its shared memory and watches it this long.
+    # A run in which a word changed is a reproduction, whatever the oracle's
+    # exit code: a write landed in a CTA that had finished.
+    exit_quarantine_ns: int = 0
     # A mode of `cutracer.stress.modes`. STRATEGY_RANDOM: random per-thread
     # delays at every candidate point, all warps at once or one warpgroup at a
     # time (`warpgroup_ids`). STRATEGY_ISOLATE: one target (cluster rank,
@@ -186,6 +199,8 @@ class StressConfig:
             raise ValueError(
                 f"kernel_timeout_s must be >= 0, got {self.kernel_timeout_s}"
             )
+        if not 0 <= self.exit_quarantine_ns <= 0xFFFFFFFF:
+            raise ValueError("exit_quarantine_ns must be an unsigned 32-bit ns value")
         if self.strategy not in get_modes():
             raise ValueError(f"unknown stress strategy {self.strategy!r}")
         if get_mode(self.strategy).isolates_targets:
@@ -517,6 +532,7 @@ def _attempt_log(
     error: str = "",
     watchdog: Sequence[str] = (),
     target: Optional[DelayTarget] = None,
+    late_writes: Sequence[str] = (),
 ) -> str:
     if target is not None:
         placement = f"target={target.label()}"
@@ -533,6 +549,8 @@ def _attempt_log(
         sections.extend(("--- stderr ---", stderr))
     if watchdog:
         sections.extend(("--- CUTracer watchdog ---", *watchdog))
+    if late_writes:
+        sections.extend(("--- CUTracer exit quarantine ---", *late_writes))
     if error:
         sections.extend(("--- error ---", error))
     return "\n".join(sections)
@@ -591,7 +609,15 @@ def _targeting_args(
         args += ["--delay-patterns", patterns]
     if config.kernel_timeout_s > 0:
         args += ["--kernel-timeout-s", str(config.kernel_timeout_s)]
+    if config.exit_quarantine_ns > 0:
+        args += ["--exit-quarantine-ns", str(config.exit_quarantine_ns)]
     return args
+
+
+def _late_writes(config: StressConfig, directory: str, before: set[str]) -> list[str]:
+    if config.exit_quarantine_ns <= 0:
+        return []
+    return exit_quarantine_changes(directory, before=before)
 
 
 def reduce_args(config: StressConfig, triggering: TriggeringConfig) -> List[str]:
@@ -1138,6 +1164,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
     logs_before = main_logs(instrumentation_output_dir)
     proc: Optional[subprocess.CompletedProcess[str]] = None
     timeout_error = ""
+    timeout_output: tuple[str | bytes | None, ...] = ()
     try:
         proc = run_instrumented_target(
             config.oracle_argv,
@@ -1157,6 +1184,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
                 delay_seed=secrets.randbits(64),
                 kernel_timeout_s=config.kernel_timeout_s,
                 no_data_timeout_s=_no_data_timeout_s(config),
+                exit_quarantine_ns=config.exit_quarantine_ns,
                 cwd=config.cwd,
                 timeout=config.timeout,
                 base_env=config.base_env,
@@ -1170,6 +1198,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
         )
     except subprocess.TimeoutExpired as exc:
         timeout_error = f"timed out: {exc}"
+        timeout_output = (exc.stdout, exc.stderr)
     except (click.ClickException, OSError, ValueError) as exc:
         _unlink(config_path)
         return _AttemptResult(
@@ -1195,6 +1224,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
     # A hang ended by CUTracer's watchdog is the symptom itself; the oracle's
     # exit code (or its absence after an outer timeout) then carries nothing.
     hung = bool(watchdog) and config.hang_is_bug
+    late_writes = _late_writes(config, instrumentation_output_dir, logs_before)
     returncode = None if proc is None else proc.returncode
     log = _attempt_log(
         delay_ns=delay_ns,
@@ -1206,12 +1236,29 @@ def _run_attempt_in_output_dir(  # noqa: C901
         error=timeout_error,
         watchdog=watchdog,
         target=target,
+        late_writes=late_writes,
     )
-    if returncode is None and not hung:
+    fatal = exit_quarantine_failures(
+        instrumentation_output_dir,
+        before=logs_before,
+        output=timeout_output if proc is None else (proc.stdout, proc.stderr),
+    )
+    if fatal:
+        rejected = _preserve_rejected_config(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + "\n--- native tool failure ---\n" + fatal[0],
+            rejected_config_path=rejected,
+            hangs=hangs,
+        )
+    if returncode is None and not hung and not late_writes:
         _unlink(config_path)
         return _AttemptResult(0, 0, 0, None, log, timed_out=1, hangs=hangs)
 
-    is_interesting = hung or returncode == 0
+    is_interesting = hung or bool(late_writes) or returncode == 0
     is_clean = not is_interesting and (
         not config.not_interesting_exit_codes
         or returncode in config.not_interesting_exit_codes
@@ -1307,7 +1354,13 @@ def _run_attempt_in_output_dir(  # noqa: C901
                 enable_prob=config.enable_prob,
                 attempt_index=attempt,
                 enabled_point_count=enabled_point_count,
-                symptom=SYMPTOM_HANG if hung else SYMPTOM_FAILURE,
+                symptom=(
+                    SYMPTOM_HANG
+                    if hung
+                    else SYMPTOM_FAILURE
+                    if returncode == 0
+                    else SYMPTOM_LATE_WRITE
+                ),
                 target=None if target is None else target.to_dict(),
                 replay_args=_replay_args(
                     config, delay_ns=delay_ns, warpgroup=warpgroup, target=target
@@ -1459,11 +1512,14 @@ def _prepare_stress_log(
 
 @dataclass(frozen=True)
 class _BaselineRun:
-    """One control run: the oracle's exit code (None when the run timed out)
-    and whether CUTracer's watchdog ended a hung kernel in it."""
+    """One control run: the oracle's exit code (None when the run timed out),
+    whether CUTracer's watchdog ended a hung kernel in it, and whether its exit
+    quarantine saw a late write."""
 
     returncode: Optional[int]
     hung: bool
+    late_write: bool = False
+    infra_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -1506,8 +1562,11 @@ def _baseline_from_runs(
     completed = reproduced = timed_out = infra_errors = hangs = 0
     for run in runs:
         hangs += 1 if run.hung else 0
-        if run.hung and config.hang_is_bug:
-            # The target hangs without any injected delay.
+        if run.infra_error:
+            infra_errors += 1
+            continue
+        if (run.hung and config.hang_is_bug) or run.late_write:
+            # The target hangs, or writes a finished CTA, without injected delay.
             completed += 1
             reproduced += 1
         elif run.returncode is None:
@@ -1602,6 +1661,7 @@ def _run_baseline(
         logs_before = main_logs(run_dir)
         proc: Optional[subprocess.CompletedProcess[str]] = None
         error = "baseline (injection disabled)"
+        timeout_output: tuple[str | bytes | None, ...] = ()
         try:
             proc = run_instrumented_target(
                 config.oracle_argv,
@@ -1621,6 +1681,7 @@ def _run_baseline(
                     kernel_events="nostack" if capture else None,
                     kernel_timeout_s=config.kernel_timeout_s,
                     no_data_timeout_s=_no_data_timeout_s(config),
+                    exit_quarantine_ns=config.exit_quarantine_ns,
                     cwd=config.cwd,
                     timeout=_run_timeout(config, remaining),
                     base_env=config.base_env,
@@ -1630,7 +1691,16 @@ def _run_baseline(
             )
         except subprocess.TimeoutExpired as exc:
             error = f"baseline timed out: {exc}"
+            timeout_output = (exc.stdout, exc.stderr)
+        fatal = exit_quarantine_failures(
+            run_dir,
+            before=logs_before,
+            output=timeout_output if proc is None else (proc.stdout, proc.stderr),
+        )
+        if fatal:
+            error += "\n" + fatal[0]
         watchdog = watchdog_terminations(run_dir, before=logs_before)
+        late_writes = _late_writes(config, run_dir, logs_before)
         if dump_path is not None:
             geometries = _merge_geometries(
                 geometries, _instrumented_geometries(run_dir, dump_path)
@@ -1646,10 +1716,16 @@ def _run_baseline(
                 stderr="" if proc is None else proc.stderr or "",
                 error=error,
                 watchdog=watchdog,
+                late_writes=late_writes,
             )
         )
         runs.append(
-            _BaselineRun(None if proc is None else proc.returncode, bool(watchdog))
+            _BaselineRun(
+                None if proc is None else proc.returncode,
+                bool(watchdog),
+                late_write=bool(late_writes),
+                infra_error=bool(fatal),
+            )
         )
     return _baseline_from_runs(
         config,

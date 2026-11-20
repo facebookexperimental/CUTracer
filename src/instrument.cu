@@ -212,6 +212,14 @@ void instrument_delay_injection(Instr* instr, uint32_t delay_ns) {
   nvbit_add_call_arg_const_val32(instr, delay_ns);
 }
 
+void instrument_exit_quarantine(Instr* instr, ExitQuarantineState* state, uint32_t quarantine_ns) {
+  nvbit_insert_call(instr, "instrument_exit_quarantine", IPOINT_BEFORE);
+  nvbit_add_call_arg_guard_pred_val(instr);
+  nvbit_add_call_arg_const_val64(instr, reinterpret_cast<uint64_t>(state));
+  nvbit_add_call_arg_launch_val64(instr, 0);
+  nvbit_add_call_arg_const_val32(instr, quarantine_ns);
+}
+
 void instrument_random_delay_injection(Instr* instr, uint32_t min_delay_ns, uint32_t max_delay_ns) {
   /* insert call to the per-thread random delay function */
   nvbit_insert_call(instr, "instrument_delay_random",

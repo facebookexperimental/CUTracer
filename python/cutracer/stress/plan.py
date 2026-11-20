@@ -177,6 +177,7 @@ def _profile(config: StressConfig) -> tuple[Any, ...]:
         config.exact_kernel_name,
         config.exact_kernel_checksum,
         config.kernel_timeout_s,
+        config.exit_quarantine_ns,
         config.timeout,
         config.baseline_runs,
     )

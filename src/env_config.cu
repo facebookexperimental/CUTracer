@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <sstream>
@@ -140,6 +141,7 @@ int channel_buffer_size;
 
 // Kernel execution time limit in seconds (0 = disabled)
 uint32_t kernel_timeout_s;
+uint32_t exit_quarantine_ns;
 
 // No-data hang detection timeout in seconds (default: 15)
 uint32_t no_data_timeout_s;
@@ -1388,6 +1390,31 @@ void init_config_from_env() {
   }
 
   init_nonblocking_launches();
+
+  exit_quarantine_ns = 0;
+  if (const char* value = getenv("CUTRACER_EXIT_QUARANTINE_NS")) {
+    errno = 0;
+    char* end = nullptr;
+    const auto parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || strchr(value, '-') != nullptr || parsed > UINT32_MAX) {
+      fprintf(stderr, "FATAL: exit quarantine: CUTRACER_EXIT_QUARANTINE_NS must be an unsigned 32-bit integer.\n");
+      flush_log_files();
+      fflush(stderr);
+      exit(2);
+    }
+    exit_quarantine_ns = static_cast<uint32_t>(parsed);
+  }
+  loprintf("CUTRACER_EXIT_QUARANTINE_NS = %u (direct, blocking SM90+ launches only)\n", exit_quarantine_ns);
+  if (exit_quarantine_ns > 0) {
+    const char* plan = getenv("CUTRACER_INSTRUMENTATION_PLAN");
+    if (nonblocking_launches || (plan && *plan) || !has_any_instrumentation_enabled()) {
+      fprintf(stderr,
+              "FATAL: exit quarantine: requires an instrumentation mode and blocking launches; "
+              "instrumentation plans are unsupported.\n");
+      flush_log_files();
+      exit(2);
+    }
+  }
 
   // Trace file size limit (MB, 0 = disabled)
   get_var_uint32(trace_size_limit_mb, "CUTRACER_TRACE_SIZE_LIMIT_MB", 0,

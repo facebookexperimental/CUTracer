@@ -104,6 +104,17 @@ void instrument_tma_trace(Instr* instr, int opcode_id, CTXstate* ctx_state, CUco
  */
 void instrument_delay_injection(Instr* instr, uint32_t delay_ns);
 
+struct ExitQuarantineState;
+
+/**
+ * @brief Instruments an EXIT to quarantine the CTA's shared memory when its last thread exits.
+ *
+ * @param instr The EXIT instruction
+ * @param state The context's exit quarantine state (device memory)
+ * @param quarantine_ns How long to watch the poisoned shared memory
+ */
+void instrument_exit_quarantine(Instr* instr, ExitQuarantineState* state, uint32_t quarantine_ns);
+
 /**
  * @brief Instruments an instruction to inject a per-thread random delay.
  *

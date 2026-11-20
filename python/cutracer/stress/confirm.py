@@ -100,6 +100,7 @@ def replay_config(
         delay_patterns=_delay_patterns(config),
         kernel_timeout_s=config.kernel_timeout_s,
         hang_is_bug=triggering.symptom == SYMPTOM_HANG,
+        exit_quarantine_ns=config.exit_quarantine_ns,
         output_dir=output_dir,
         timeout=config.timeout,
         cwd=config.cwd,

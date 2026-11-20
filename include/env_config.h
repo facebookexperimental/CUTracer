@@ -261,6 +261,15 @@ bool has_trace_category_filter_enabled();
 // Set via CUTRACER_KERNEL_TIMEOUT_S environment variable
 extern uint32_t kernel_timeout_s;
 
+// Exit quarantine in nanoseconds (0 = off). When the last thread of an
+// instrumented CTA reaches EXIT, it fills the CTA's shared memory with a poison
+// pattern, waits this long, and logs every word that changed: a write that
+// landed after the CTA finished (an st.async or bulk copy it never waited
+// for). Supported only for direct, blocking SM90+ launches. Graphs, plans,
+// mixed static/dynamic shared-memory layouts and unsupported launch APIs are rejected.
+// Set via CUTRACER_EXIT_QUARANTINE_NS environment variable
+extern uint32_t exit_quarantine_ns;
+
 // No-data hang detection timeout in seconds (default: 15)
 // Independent of deadlock detection (does not require -a deadlock_detection).
 // When no trace data arrives for this duration, the kernel is considered hung.

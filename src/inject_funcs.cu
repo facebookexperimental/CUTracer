@@ -17,6 +17,7 @@
 
 /* for channel */
 #include "common.h"
+#include "exit_quarantine.h"
 #include "utils/channel.hpp"
 
 /* Based on NVIDIA NVBit reg_trace example with Meta modifications for
@@ -671,5 +672,163 @@ extern "C" __device__ __noinline__ void instrument_delay_cluster_warp(int pred, 
   (void)warp_mask;
   (void)cluster_seed;
   (void)cta_id_override;
+#endif
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+__device__ __forceinline__ uint32_t lane_id() {
+  uint32_t lane;
+  asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane));
+  return lane;
+}
+
+__device__ __forceinline__ void record_exit_quarantine_change(ExitQuarantineState* state, uint64_t cta, uint32_t offset,
+                                                              uint64_t observed, uint64_t mask) {
+  const unsigned long long slot = atomicAdd(&state->changed_words, 1ull);
+  if (slot >= kExitQuarantineMaxReports) {
+    return;
+  }
+  ExitQuarantineReport& report = state->reports[slot];
+  report.ctaid[0] = blockIdx.x;
+  report.ctaid[1] = blockIdx.y;
+  report.ctaid[2] = blockIdx.z;
+  report.offset = offset;
+  report.expected = exit_quarantine_poison(offset, cta) & mask;
+  report.observed = observed & mask;
+  report.mask = mask;
+}
+
+// The address of this CTA's shared-memory byte `offset`. In a cluster launch a
+// CTA's own shared addresses carry its cluster rank above bit 24 (kernel code
+// adds SR_CgaCtaId); a bare offset would name rank 0's shared memory.
+__device__ __forceinline__ uint32_t own_shared_address(uint32_t rank, uint32_t offset) {
+  uint32_t address;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(address) : "r"(offset), "r"(rank));
+  return address;
+}
+
+/**
+ * @brief Poison this CTA's shared memory, wait, and report the words that changed.
+ *
+ * Runs in the warp of the CTA's last exiting thread, before that EXIT, so the
+ * shared memory is still the CTA's. The kernel's window starts after the
+ * reserved region, at the device's reserved size per block (tool code cannot
+ * read %reserved_smem_offset_cap: in an NVBit-injected function it does not
+ * give the kernel's value, and poisoning the reserved region of a cluster CTA
+ * faults). The host supplies the supported direct launch's static plus dynamic
+ * shared-memory size; graph and plan execution are rejected before launch.
+ */
+__device__ void quarantine_shared_memory(ExitQuarantineState* state, uint64_t cta, uint32_t active,
+                                         uint32_t quarantine_ns) {
+  const uint32_t base = state->smem_base;
+  const uint32_t size = state->launch_smem_bytes;
+  uint32_t cluster_rank;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(cluster_rank));
+  const uint32_t lane = lane_id();
+  const uint32_t rank = __popc(active & ((1u << lane) - 1u));
+  const uint32_t lanes = __popc(active);
+  const uint32_t words = size / 8u + (size % 8u != 0u);
+  for (uint32_t word = rank; word < words; word += lanes) {
+    const uint32_t offset = base + word * 8u;
+    const uint32_t bytes = min(8u, size - word * 8u);
+    const uint64_t poison = exit_quarantine_poison(offset, cta);
+    if (bytes == 8u) {
+      asm volatile("st.shared::cluster.u64 [%0], %1;" ::"r"(own_shared_address(cluster_rank, offset)), "l"(poison)
+                   : "memory");
+    } else {
+      for (uint32_t b = 0; b < bytes; ++b) {
+        const uint32_t value = static_cast<uint32_t>(poison >> (b * 8u)) & 0xffu;
+        asm volatile("st.shared::cluster.u8 [%0], %1;" ::"r"(own_shared_address(cluster_rank, offset + b)), "r"(value)
+                     : "memory");
+      }
+    }
+  }
+  __syncwarp(active);
+  sleep_for_ns(quarantine_ns);
+  for (uint32_t word = rank; word < words; word += lanes) {
+    const uint32_t offset = base + word * 8u;
+    const uint32_t bytes = min(8u, size - word * 8u);
+    const uint64_t mask = exit_quarantine_word_mask(bytes);
+    uint64_t observed = 0;
+    if (bytes == 8u) {
+      asm volatile("ld.volatile.shared::cluster.u64 %0, [%1];"
+                   : "=l"(observed)
+                   : "r"(own_shared_address(cluster_rank, offset))
+                   : "memory");
+    } else {
+      for (uint32_t b = 0; b < bytes; ++b) {
+        uint32_t value;
+        asm volatile("ld.volatile.shared::cluster.u8 %0, [%1];"
+                     : "=r"(value)
+                     : "r"(own_shared_address(cluster_rank, offset + b))
+                     : "memory");
+        observed |= static_cast<uint64_t>(value) << (b * 8u);
+      }
+    }
+    if (observed != (exit_quarantine_poison(offset, cta) & mask)) {
+      record_exit_quarantine_change(state, cta, offset, observed, mask);
+    }
+  }
+  if (rank == 0u) {
+    atomicAdd(&state->ctas_quarantined, 1u);
+  }
+}
+#endif
+
+/**
+ * @brief Quarantine a CTA's shared memory when its last thread exits.
+ *
+ * Inserted before every EXIT, independently of the instruction interval.
+ * Each warp adds its exiting lanes; the last cohort runs the quarantine.
+ * The host resets counters at the next verified idle launch boundary.
+ *
+ * @param pred          Guard predicate of the EXIT (lanes that exit here).
+ * @param pstate        ExitQuarantineState in device memory.
+ * @param launch_id     Existing NVBit per-launch value.
+ * @param quarantine_ns How long to wait after poisoning before the check.
+ */
+extern "C" __device__ __noinline__ void instrument_exit_quarantine(int pred, uint64_t pstate, uint64_t launch_id,
+                                                                   uint32_t quarantine_ns) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  auto* state = reinterpret_cast<ExitQuarantineState*>(pstate);
+  if (!exit_quarantine_launch_matches(*state, launch_id)) return;
+  const uint32_t active = __activemask();
+  const uint32_t exiting = __ballot_sync(active, pred);
+  if (exiting == 0u) {
+    return;
+  }
+  // Every reaching lane orders its earlier shared stores before the leader counts EXIT.
+  __threadfence_block();
+  __syncwarp(active);
+  const uint32_t leader = __ffs(exiting) - 1u;
+  const uint64_t cta =
+      blockIdx.x + static_cast<uint64_t>(gridDim.x) * (blockIdx.y + static_cast<uint64_t>(gridDim.y) * blockIdx.z);
+  const uint32_t threads = blockDim.x * blockDim.y * blockDim.z;
+  uint32_t last = 0u;
+  if (lane_id() == leader) {
+    if (cta < state->capacity) {
+      const uint32_t count = __popc(exiting);
+      uint32_t previous;
+      const uint64_t counter = reinterpret_cast<uint64_t>(&state->exited_threads[cta]);
+      asm volatile("atom.acq_rel.cta.global.add.u32 %0, [%1], %2;"
+                   : "=r"(previous)
+                   : "l"(counter), "r"(count)
+                   : "memory");
+      last = previous + count == threads ? 1u : 0u;
+    } else {
+      atomicAdd(&state->exits_skipped, 1u);
+    }
+  }
+  last = __shfl_sync(active, last, leader);
+  if (last) {
+    __syncwarp(active);
+    __threadfence_block();
+    quarantine_shared_memory(state, cta, active, quarantine_ns);
+  }
+#else
+  (void)pred;
+  (void)pstate;
+  (void)launch_id;
+  (void)quarantine_ns;
 #endif
 }

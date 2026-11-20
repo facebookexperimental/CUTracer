@@ -21,8 +21,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -60,6 +63,7 @@
 
 /* env config */
 #include "env_config.h"
+#include "exit_quarantine.h"
 #include "python_callstack.h"
 #include "trace_writer.h"
 
@@ -742,6 +746,15 @@ static bool matches_exact_kernel_selector(CUcontext ctx, CUfunction func) {
  * @param func The `CUfunction` to inspect and potentially instrument.
  * @return `true` if instrumentation should be enabled, `false` otherwise.
  */
+static void instrument_function_exits(CUcontext ctx, CTXstate* state, CUfunction func) {
+  if (state->exit_quarantine == nullptr || !state->exit_quarantine_functions.insert(func).second) return;
+  for (auto* instr : nvbit_get_instrs(ctx, func)) {
+    if (strcmp(instr->getOpcodeShort(), "EXIT") == 0) {
+      instrument_exit_quarantine(instr, state->exit_quarantine, exit_quarantine_ns);
+    }
+  }
+}
+
 bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
   if (!has_any_instrumentation_enabled() || !matches_exact_kernel_selector(ctx, func)) {
     return false;
@@ -1068,6 +1081,9 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
       }
     }
 
+    // Insert EXIT hooks after trace/delay calls, outside their interval.
+    instrument_function_exits(ctx, ctx_state, f);
+
     // Statically identify special instructions for this function:
     // - "clock" (CS2R SR_CLOCKLO) used for histogram region boundaries
     // - "EXIT" used as a candidate signal for warp completion on host side
@@ -1104,6 +1120,7 @@ bool instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     /* ============================================ */
   }
 
+  if (should_instrument) instrument_function_exits(ctx, ctx_state, func);
   if (delay_config_grew) {
     save_delay_config();
   }
@@ -1156,7 +1173,20 @@ static void init_drain_worker(CUcontext ctx, CTXstate* ctx_state) {
            nonblocking_launches ? ", so --nonblocking-launches has no effect in this context" : "");
 }
 
-// Reference code from NVIDIA nvbit mem_trace tool
+[[noreturn]] static void exit_quarantine_error(const char* reason) {
+  loprintf("FATAL: exit quarantine: %s\n", reason);
+  fprintf(stderr, "FATAL: exit quarantine: %s\n", reason);
+  flush_log_files();
+  fflush(stderr);
+  std::_Exit(2);
+}
+
+static void exit_quarantine_cuda_check(cudaError_t status, const char* operation) {
+  if (status != cudaSuccess) {
+    exit_quarantine_error((std::string(operation) + ": " + cudaGetErrorString(status)).c_str());
+  }
+}
+
 // Reference code from NVIDIA nvbit mem_trace tool
 void init_context_state(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
@@ -1168,8 +1198,82 @@ void init_context_state(CUcontext ctx) {
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, channel_buffer_size, ctx_state->channel_dev,
                                recv_thread_fun, ctx);
   nvbit_set_tool_thread(ctx_state->channel_host.get_thread_id());
+  if (exit_quarantine_ns > 0) {
+    int device = 0, major = 0, reserved_smem = 0;
+    exit_quarantine_cuda_check(cudaGetDevice(&device), "get device");
+    exit_quarantine_cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device),
+                               "get compute capability");
+    if (major < 9) exit_quarantine_error("requires SM90 or newer");
+    exit_quarantine_cuda_check(cudaDeviceGetAttribute(&reserved_smem, cudaDevAttrReservedSharedMemoryPerBlock, device),
+                               "get reserved shared memory size");
+    if (reserved_smem <= 0 || reserved_smem % 8 != 0) {
+      exit_quarantine_error("unsupported reserved shared memory window");
+    }
+    exit_quarantine_cuda_check(cudaMalloc(&ctx_state->exit_quarantine, sizeof(ExitQuarantineState)), "allocate state");
+    ctx_state->exit_quarantine_host = new ExitQuarantineState{};
+    ctx_state->exit_quarantine_host->smem_base = static_cast<uint32_t>(reserved_smem);
+    exit_quarantine_cuda_check(cudaMemcpy(ctx_state->exit_quarantine, ctx_state->exit_quarantine_host,
+                                          sizeof(ExitQuarantineState), cudaMemcpyHostToDevice),
+                               "initialize state");
+    exit_quarantine_cuda_check(cudaDeviceSynchronize(), "initialize state boundary");
+    loprintf("Exit quarantine: %u ns per CTA (direct, blocking launches only)\n", exit_quarantine_ns);
+  }
   init_drain_worker(ctx, ctx_state);
   if (runtime_plan_requested.load()) apply_runtime_plan([&](auto& plan) { plan.initialize_context(ctx); });
+}
+
+// The caller has verified that the device is idle. Injected calls hold the
+// stable state pointer, not the counter buffer being replaced.
+static void ensure_exit_quarantine_capacity(CTXstate* ctx_state, uint64_t ctas) {
+  ExitQuarantineState* state = ctx_state->exit_quarantine_host;
+  if (ctas <= state->capacity) return;
+  if (ctas > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+    exit_quarantine_error("counter size exceeds host allocation range");
+  }
+  uint32_t* counters = nullptr;
+  exit_quarantine_cuda_check(cudaMalloc(&counters, ctas * sizeof(uint32_t)), "allocate counters");
+  if (state->exited_threads != nullptr) {
+    exit_quarantine_cuda_check(cudaFree(state->exited_threads), "replace counters");
+  }
+  state->exited_threads = counters;
+  state->capacity = ctas;
+}
+
+static void prepare_exit_quarantine(CTXstate* ctx_state, uint64_t launch_id, const KernelDimensions& dims,
+                                    uint64_t static_smem, uint64_t dynamic_smem) {
+  ExitQuarantineState* state = ctx_state->exit_quarantine_host;
+  if (state == nullptr) return;
+  if (static_smem != 0 && dynamic_smem != 0) {
+    exit_quarantine_error("mixed static/dynamic shared-memory extent is unavailable; alignment may insert a gap");
+  }
+  const uint64_t smem_bytes = static_smem + dynamic_smem;
+  if (dims.gridDimX == 0 || dims.gridDimX > INT32_MAX || dims.gridDimY == 0 || dims.gridDimY > 65535 ||
+      dims.gridDimZ == 0 || dims.gridDimZ > 65535 || dims.blockDimX == 0 || dims.blockDimX > 1024 ||
+      dims.blockDimY == 0 || dims.blockDimY > 1024 || dims.blockDimZ == 0 || dims.blockDimZ > 64 ||
+      static_cast<uint64_t>(dims.blockDimX) * dims.blockDimY * dims.blockDimZ > 1024) {
+    exit_quarantine_error("unsupported launch geometry");
+  }
+  if (smem_bytes > UINT32_MAX - state->smem_base) {
+    exit_quarantine_error("shared memory window must fit in 32 bits");
+  }
+  const uint64_t ctas = static_cast<uint64_t>(dims.gridDimX) * dims.gridDimY * dims.gridDimZ;
+  if (ctas > UINT32_MAX) exit_quarantine_error("CTA count exceeds the quarantine report range");
+  ensure_exit_quarantine_capacity(ctx_state, ctas);
+  uint32_t* counters = state->exited_threads;
+  const uint64_t capacity = state->capacity;
+  const uint32_t base = state->smem_base;
+  *state = ExitQuarantineState{};
+  state->exited_threads = counters;
+  state->capacity = capacity;
+  state->smem_base = base;
+  state->launch_id = launch_id;
+  state->launch_smem_bytes = static_cast<uint32_t>(smem_bytes);
+  state->enabled = 1u;
+  exit_quarantine_cuda_check(cudaMemset(counters, 0, ctas * sizeof(uint32_t)), "reset counters");
+  exit_quarantine_cuda_check(
+      cudaMemcpy(ctx_state->exit_quarantine, state, sizeof(ExitQuarantineState), cudaMemcpyHostToDevice),
+      "prepare launch state");
+  exit_quarantine_cuda_check(cudaDeviceSynchronize(), "prepare launch boundary");
 }
 
 /**
@@ -1374,6 +1478,9 @@ static const std::vector<const void*>& launch_code_functions(CUcontext ctx, CTXs
 static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<uint64_t>& launched_id,
                                 nvbit_api_cuda_t cbid, void* params, bool stream_capture = false,
                                 bool build_graph = false) {
+  if (exit_quarantine_ns > 0 && (stream_capture || build_graph)) {
+    exit_quarantine_error("graph capture and graph construction are unsupported");
+  }
   launched_id.reset();
   if (runtime_plan_requested.load() &&
       (cbid == API_CUDA_cuLaunch || cbid == API_CUDA_cuLaunchGrid || cbid == API_CUDA_cuLaunchGridAsync)) {
@@ -1387,6 +1494,9 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   auto [cpu_callstack, callstack_source] = capture_cpu_callstack();
 
   CTXstate* ctx_state = ctx_state_map[ctx];
+  if (exit_quarantine_ns > 0 && ctx_state->channel_failed) {
+    exit_quarantine_error("capture channel is unavailable for subsequent launches");
+  }
 
   // Graph nodes take their cluster geometry from graph construction. A function
   // captured with different cluster shapes leaves its graph launches unknown.
@@ -1420,7 +1530,8 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
   const bool launching = !stream_capture && !build_graph;
   if (launching && !nonblocking_launches && !ctx_state->channel_failed) {
     /* Make sure GPU is idle */
-    cudaDeviceSynchronize();
+    const auto idle_status = cudaDeviceSynchronize();
+    if (exit_quarantine_ns > 0) exit_quarantine_cuda_check(idle_status, "idle launch boundary");
     CUDA_CHECK_LAST_ERROR();
   }
 
@@ -1511,6 +1622,10 @@ static bool enter_kernel_launch(CUcontext ctx, CUfunction func, std::optional<ui
       cuLaunchKernel_params* p = (cuLaunchKernel_params*)params;
       dims = {p->gridDimX, p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ};
       dynamic_shmem = p->sharedMemBytes;
+    }
+    if (should_instrument) {
+      prepare_exit_quarantine(ctx_state, kernel_launch_id, dims, static_cast<uint64_t>(meta.shmem_static_nbytes),
+                              dynamic_shmem);
     }
     {
       std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
@@ -1618,6 +1733,52 @@ struct CaptureDrainResult {
   bool kernel_completed;
   bool channel_drained;
 };
+
+// Called only after the direct launch's device-completion boundary.
+static void report_exit_quarantine(CTXstate* ctx_state, uint64_t launch_id) {
+  ExitQuarantineState* state = ctx_state->exit_quarantine_host;
+  if (state == nullptr || state->enabled == 0u) return;
+  if (state->launch_id != launch_id) exit_quarantine_error("completion does not match the prepared launch");
+  constexpr size_t kResults = offsetof(ExitQuarantineState, ctas_quarantined);
+  auto* device_results = reinterpret_cast<char*>(ctx_state->exit_quarantine) + kResults;
+  exit_quarantine_cuda_check(cudaMemcpy(reinterpret_cast<char*>(state) + kResults, device_results,
+                                        sizeof(ExitQuarantineState) - kResults, cudaMemcpyDeviceToHost),
+                             "read completed launch reports");
+  state->enabled = 0u;
+  exit_quarantine_cuda_check(
+      cudaMemcpy(reinterpret_cast<char*>(ctx_state->exit_quarantine) + offsetof(ExitQuarantineState, enabled),
+                 &state->enabled, sizeof(state->enabled), cudaMemcpyHostToDevice),
+      "disable completed launch");
+  std::string name, checksum;
+  uint64_t expected_ctas = 0;
+  {
+    std::lock_guard<std::mutex> lock(kernel_launch_state_mutex);
+    const auto launch = kernel_launch_to_func_map.find(launch_id);
+    if (launch == kernel_launch_to_func_map.end()) exit_quarantine_error("launch metadata is unavailable");
+    const auto& meta = kernel_metadata_by_func.at(launch->second.second);
+    const auto& dims = kernel_launch_to_dimensions_map.at(launch_id);
+    expected_ctas = static_cast<uint64_t>(dims.gridDimX) * dims.gridDimY * dims.gridDimZ;
+    name = meta.mangled_name;
+    checksum = meta.kernel_checksum;
+  }
+  const uint32_t reports =
+      static_cast<uint32_t>(std::min<unsigned long long>(state->changed_words, kExitQuarantineMaxReports));
+  for (uint32_t i = 0; i < reports; ++i) {
+    const ExitQuarantineReport& report = state->reports[i];
+    loprintf(
+        "Exit quarantine: shared memory of CTA (%u,%u,%u) changed after its last thread exited: offset 0x%x "
+        "poison 0x%016lx observed 0x%016lx mask 0x%016lx (launch_id %lu, kernel=%s, checksum=%s)\n",
+        report.ctaid[0], report.ctaid[1], report.ctaid[2], report.offset, report.expected, report.observed, report.mask,
+        launch_id, name.c_str(), checksum.c_str());
+  }
+  loprintf("Exit quarantine: %u CTA(s) quarantined, %llu changed word(s)%s (launch_id %lu, kernel=%s, checksum=%s)\n",
+           state->ctas_quarantined, state->changed_words, state->changed_words > reports ? ", first reports shown" : "",
+           launch_id, name.c_str(), checksum.c_str());
+  flush_log_files();
+  if (state->exits_skipped != 0u || state->ctas_quarantined != expected_ctas) {
+    exit_quarantine_error("incomplete CTA EXIT coverage");
+  }
+}
 
 static bool flush_channel(CUcontext ctx, CTXstate* ctx_state, CUstream stream) {
   void* flush_args[] = {&ctx_state->channel_dev};
@@ -1748,6 +1909,19 @@ static bool finish_kernel_launch(CUcontext ctx, CTXstate* ctx_state, std::option
                                      : drain_after_device_sync(ctx, ctx_state, launch_succeeded);
   const bool kernel_completed = completion.kernel_completed;
   const bool channel_drained = completion.channel_drained;
+  if (kernel_completed && launch_id) {
+    report_exit_quarantine(ctx_state, *launch_id);
+  } else if (ctx_state->exit_quarantine_host != nullptr && ctx_state->exit_quarantine_host->enabled != 0u) {
+    auto* state = ctx_state->exit_quarantine_host;
+    state->enabled = 0u;
+    ctx_state->channel_failed = true;
+    const auto disabled =
+        cudaMemcpy(reinterpret_cast<char*>(ctx_state->exit_quarantine) + offsetof(ExitQuarantineState, enabled),
+                   &state->enabled, sizeof(state->enabled), cudaMemcpyHostToDevice);
+    loprintf("Exit quarantine: launch_id %lu not quarantined: kernel did not complete; quarantine disabled%s\n",
+             launch_id.value_or(state->launch_id), disabled == cudaSuccess ? "" : " (device disable unavailable)");
+    flush_log_files();
+  }
   if (launch_id) {
     bool identified = false;
     {
@@ -1864,6 +2038,18 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
     return;
   }
   cutracer::ScopedCudaCallbackSuppression suppress_callbacks;
+  if (exit_quarantine_ns > 0 && !is_exit) {
+    const bool graph = strncmp(name, "cuGraphLaunch", 13) == 0 || strncmp(name, "cuGraphAddKernelNode", 20) == 0 ||
+                       strncmp(name, "cuGraphAddNode", 14) == 0 || strncmp(name, "cuStreamBeginCapture", 20) == 0;
+    if (graph) exit_quarantine_error("graph capture, construction and launches are unsupported");
+    const bool direct = cbid == API_CUDA_cuLaunchKernel || cbid == API_CUDA_cuLaunchKernel_ptsz ||
+                        cbid == API_CUDA_cuLaunchKernelEx || cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
+                        cbid == API_CUDA_cuLaunchCooperativeKernel || cbid == API_CUDA_cuLaunchCooperativeKernel_ptsz;
+    const bool kernel_api = cbid == API_CUDA_cuLaunch || cbid == API_CUDA_cuLaunchGrid ||
+                            cbid == API_CUDA_cuLaunchGridAsync || strncmp(name, "cuLaunchKernel", 14) == 0 ||
+                            strncmp(name, "cuLaunchCooperativeKernel", 25) == 0;
+    if (kernel_api && !direct) exit_quarantine_error("unsupported kernel launch API");
+  }
   // Driver calls may nest between their entry and exit callbacks. Preserve
   // each call's launch ID and lock ownership, including stream-capture calls.
   using LaunchCallback = cutracer::ScopedCudaLaunchCallback;
@@ -1965,7 +2151,11 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid, cons
       if (!is_exit) {
         cudaStreamCaptureStatus streamStatus;
         /* check if the stream is capturing, if yes, do not sync */
-        CUDA_SAFECALL(cudaStreamIsCapturing(hStream, &streamStatus));
+        if (exit_quarantine_ns > 0) {
+          exit_quarantine_cuda_check(cudaStreamIsCapturing(hStream, &streamStatus), "query stream capture");
+        } else {
+          CUDA_SAFECALL(cudaStreamIsCapturing(hStream, &streamStatus));
+        }
         bool stream_capture = (streamStatus == cudaStreamCaptureStatusActive);
         if (!stream_capture) {
           ctx_state->need_sync = true;
@@ -2134,6 +2324,13 @@ void nvbit_at_ctx_term(CUcontext ctx) {
     ctx_state->channel_host.destroy(false);
     cudaFree(ctx_state->channel_dev);
   }
+  if (ctx_state->exit_quarantine != nullptr) {
+    if (ctx_state->exit_quarantine_host != nullptr) {
+      cudaFree(ctx_state->exit_quarantine_host->exited_threads);
+      delete ctx_state->exit_quarantine_host;
+    }
+    cudaFree(ctx_state->exit_quarantine);
+  }
   ctx_state_map.erase(ctx);
   delete ctx_state;
   forget_runtime_module(ctx, nullptr);
@@ -2168,6 +2365,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
 // Reference code from NVIDIA nvbit mem_trace tool
 void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream, uint64_t launch_handle) {
   cutracer::ScopedCudaCallbackSuppression suppress_callbacks;
+  if (exit_quarantine_ns > 0) exit_quarantine_error("graph node execution is unsupported");
   func_config_t config = {0};
   const char* func_name = nvbit_get_func_name(ctx, func);
   uint64_t pc = nvbit_get_func_addr(ctx, func);

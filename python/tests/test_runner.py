@@ -318,7 +318,39 @@ class BuildCutracerEnvTest(unittest.TestCase):
         self.assertEqual(env["CUTRACER_HANG_CHECK_INTERVAL_MS"], "1000")
         self.assertEqual(env["CUTRACER_HANG_CHECK_HITS"], "3")
         self.assertEqual(env["CUTRACER_HANG_MIN_STALL_S"], "0")
+        self.assertEqual(env["CUTRACER_EXIT_QUARANTINE_NS"], "0")
         self.assertEqual(env["CUTRACER_NONBLOCKING_LAUNCHES"], "0")
+
+    @patch("cutracer.runner.resources")
+    def test_sets_the_exit_quarantine(self, mock_resources: MagicMock) -> None:
+        mock_resources.files.side_effect = ModuleNotFoundError("no resource")
+        common = {
+            "cutracer_so": "/path/to/cutracer.so",
+            "instrument": "random_delay",
+            "analysis": None,
+            "kernel_filters": None,
+            "instr_categories": None,
+            "trace_format": None,
+            "output_dir": None,
+            "verbose": None,
+            "zstd_level": None,
+            "delay_ns": None,
+        }
+        env = _build_cutracer_env(**common, exit_quarantine_ns=50000)
+        self.assertEqual(env["CUTRACER_EXIT_QUARANTINE_NS"], "50000")
+        for invalid in (-1, 1 << 32):
+            with self.subTest(exit_quarantine_ns=invalid):
+                with self.assertRaisesRegex(ValueError, "unsigned 32-bit"):
+                    _build_cutracer_env(**common, exit_quarantine_ns=invalid)
+        disabled = _build_cutracer_env(
+            **common, exit_quarantine_ns=0, nonblocking_launches=True
+        )
+        self.assertEqual(disabled["CUTRACER_EXIT_QUARANTINE_NS"], "0")
+        # Overlapping kernels would share the per-CTA exit counters.
+        with self.assertRaisesRegex(ValueError, "blocking launches"):
+            _build_cutracer_env(
+                **common, exit_quarantine_ns=50000, nonblocking_launches=True
+            )
 
     @patch("cutracer.runner.resources")
     def test_sets_the_deadlock_check_policy(self, mock_resources: MagicMock) -> None:

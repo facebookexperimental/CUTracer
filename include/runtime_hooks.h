@@ -207,6 +207,7 @@ static void forget_runtime_module(CUcontext ctx, CUmodule module) {
           state->exit_opcode_ids.erase(f);
         }
         state->instrumented_launch_roots.erase(f);
+        state->exit_quarantine_functions.erase(f);
         state->launch_code.forget(f);
         // A cached callee list may name the retired function.
         state->launch_code_functions.clear();

@@ -29,6 +29,9 @@ class StressMode:
     # Probability that each delay point is on in an attempt (ignored by
     # isolate, which turns every point on).
     enable_prob: float = 1.0
+    # CUTracer's exit quarantine in every run (ns, 0 = off): a CTA whose shared
+    # memory changes after its last thread exited counts as a reproduction.
+    exit_quarantine_ns: int = 0
 
 
 # The defaults below come from three known races reproduced on GB200

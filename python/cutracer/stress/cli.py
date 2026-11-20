@@ -41,6 +41,7 @@ from cutracer.stress.stress import (
     StressConfig,
     StressResult,
     SYMPTOM_HANG,
+    SYMPTOM_LATE_WRITE,
     Verdict,
     VERDICT_FINDING,
 )
@@ -89,6 +90,7 @@ _MODE_OPTIONS: dict[str, Callable[[str], Any]] = {
     "isolate_rotation": int,
     "kernel_timeout_s": int,
     "hang_is_bug": _parse_bool,
+    "exit_quarantine_ns": int,
 }
 
 
@@ -148,6 +150,7 @@ def _mode_config(
         "enable_prob": mode.enable_prob,
         "kernel_timeout_s": mode.kernel_timeout_s,
         "hang_is_bug": mode.hang_is_bug,
+        "exit_quarantine_ns": mode.exit_quarantine_ns,
         **shared,
         **options,
     }
@@ -186,7 +189,7 @@ def _mode_config(
     help="Set one option of one mode, e.g. 'random.delay_ladder_ns=10000,100000' "
     "or 'isolate.isolate_warps=0-7'. Keys: delay_ladder_ns, attempts_per_delay, "
     "delay_patterns, enable_prob, warpgroup_ids, isolate_ranks, isolate_warps, "
-    "kernel_timeout_s, hang_is_bug. Repeatable.",
+    "kernel_timeout_s, hang_is_bug, exit_quarantine_ns. Repeatable.",
 )
 @click.option(
     "--confirm/--no-confirm",
@@ -327,6 +330,15 @@ def _mode_config(
     "reproduction, whatever the oracle's exit code. Pair with --kernel-timeout-s. "
     "Default: off (random), on (isolate).",
 )
+@click.option(
+    "--exit-quarantine-ns",
+    type=click.IntRange(min=0, max=0xFFFFFFFF),
+    default=None,
+    help="CUTracer's exit quarantine in every run (see `cutracer trace "
+    "--exit-quarantine-ns`): a run in which a CTA's shared memory changed after "
+    "its last thread exited is a reproduction (symptom late_write), whatever "
+    "the oracle's exit code. Default: each mode's own (0 = off).",
+)
 @click.argument("oracle", nargs=-1, type=click.UNPROCESSED, required=True)
 def stress_command(  # noqa: C901
     strategy: str,
@@ -351,6 +363,7 @@ def stress_command(  # noqa: C901
     timeout: int,
     kernel_timeout_s: int | None,
     hang_is_bug: bool | None,
+    exit_quarantine_ns: int | None,
     oracle: tuple[str, ...],
 ) -> None:
     """Search for a delay config that triggers a bug.
@@ -427,6 +440,8 @@ def stress_command(  # noqa: C901
         shared["kernel_timeout_s"] = kernel_timeout_s
     if hang_is_bug is not None:
         shared["hang_is_bug"] = hang_is_bug
+    if exit_quarantine_ns is not None:
+        shared["exit_quarantine_ns"] = exit_quarantine_ns
     configs = [
         _mode_config(
             name,
@@ -709,7 +724,9 @@ def _echo_reproduction(
 ) -> None:
     triggering = result.triggering
     assert triggering is not None
-    symptom = " (hang)" if triggering.symptom == SYMPTOM_HANG else ""
+    symptom = {SYMPTOM_HANG: " (hang)", SYMPTOM_LATE_WRITE: " (late write)"}.get(
+        triggering.symptom, ""
+    )
     target = triggering.target
     if target is None:
         placement = f"warpgroup={triggering.warpgroup_id}"
