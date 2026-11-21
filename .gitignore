@@ -140,6 +140,7 @@ tests/unit/test_cuda_callback_guard
 # tree, so an ignored fixture still resolves and the test passes, while CI
 # builds from the commit and finds an empty directory.
 !python/tests/fb/data/**/*.ndjson
+!python/tests/fb/data/**/*.zst
 
 # Exception for example trace files
 !examples/proton_trace/*.csv
