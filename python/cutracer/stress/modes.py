@@ -6,6 +6,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# What one attempt of a mode that isolates targets stalls, with a fixed delay.
+# One CTA-local warp of one cluster rank, before the mode's delay points.
+ISOLATE_BY_WARP = "warp"
+# Every warp, before the points of one named barrier only: every site of one
+# immediate barrier id, or one site of a barrier whose id is in a register.
+ISOLATE_BY_BARRIER = "barrier"
+ISOLATE_KINDS = (ISOLATE_BY_WARP, ISOLATE_BY_BARRIER)
+
 
 @dataclass(frozen=True)
 class StressMode:
@@ -20,18 +28,23 @@ class StressMode:
     kernel_timeout_s: int
     # Whether a hang that CUTracer's watchdog ends counts as a reproduction.
     hang_is_bug: bool
-    # SASS substrings to delay at; None = CUTracer's built-in patterns.
+    # SASS substrings to delay at; None = CUTracer's built-in patterns. A mode
+    # that isolates targets discovers them at these points in its control arm.
     delay_patterns: str | None
-    # True: each attempt stalls one (cluster rank, CTA-local warp) target with a
-    # fixed delay, and the targets come from the control arm's launches.
-    # False: every warp (or one warpgroup) gets random per-thread delays.
-    isolates_targets: bool
+    # One of ISOLATE_KINDS: each attempt stalls one target, and the targets
+    # come from the control arm. None: every warp (or one warpgroup) is
+    # delayed at the mode's delay points.
+    isolate_by: str | None
     # Probability that each delay point is on in an attempt (ignored by
-    # isolate, which turns every point on).
+    # modes that isolate targets, which turn every point of a target on).
     enable_prob: float = 1.0
     # CUTracer's exit quarantine in every run (ns, 0 = off): a CTA whose shared
     # memory changes after its last thread exited counts as a reproduction.
     exit_quarantine_ns: int = 0
+
+    @property
+    def isolates_targets(self) -> bool:
+        return self.isolate_by is not None
 
 
 # The defaults below come from three known races reproduced on GB200
@@ -52,7 +65,7 @@ LDS = StressMode(
     kernel_timeout_s=0,
     hang_is_bug=False,
     delay_patterns="LDS",
-    isolates_targets=False,
+    isolate_by=None,
 )
 
 # CUTracer's built-in point set (memory accesses and synchronization) delays
@@ -70,7 +83,7 @@ RANDOM = StressMode(
     kernel_timeout_s=0,
     hang_is_bug=False,
     delay_patterns=None,
-    isolates_targets=False,
+    isolate_by=None,
     enable_prob=0.1,
 )
 
@@ -90,7 +103,7 @@ ISOLATE = StressMode(
     kernel_timeout_s=60,
     hang_is_bug=True,
     delay_patterns="SYNCS.PHASECHK",
-    isolates_targets=True,
+    isolate_by=ISOLATE_BY_WARP,
 )
 
 

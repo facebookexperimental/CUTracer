@@ -30,6 +30,8 @@ from cutracer.stress.stress import (
     _delay_patterns,
     _remaining_s,
     _run_timeout,
+    _target_fields,
+    _triggering_target,
     MIN_RUN_BUDGET_S,
     StressConfig,
     StressResult,
@@ -81,23 +83,20 @@ def replay_config(
     """The replay of the triggering config with the targeting, kernel timeout
     and hang rule the search ran it under (the in-process form of the
     `Reduce:` line `cutracer stress` prints)."""
-    target = triggering.target or {}
-    warp = target.get("warp")
-    rank = target.get("cluster_rank")
-    delay_mode: Optional[str] = None
-    if warp is not None:
-        delay_mode = "fixed" if rank is None else "cluster_fixed"
+    target = _triggering_target(triggering)
+    fields: Dict[str, Any] = (
+        {"delay_patterns": _delay_patterns(config)}
+        if target is None
+        else _target_fields(config, target)
+    )
     return ReplayConfig(
         oracle_argv=list(config.oracle_argv),
         cutracer_so=cutracer_so,
         kernel_filters=config.kernel_filters,
         exact_kernel_name=config.exact_kernel_name,
         exact_kernel_checksum=config.exact_kernel_checksum,
-        delay_mode=delay_mode,
-        delay_warpgroup_id=None if warp is not None else triggering.warpgroup_id,
-        delay_warp_mask=None if warp is None else hex(1 << int(warp)),
-        delay_cluster_cta_id=None if warp is None else rank,
-        delay_patterns=_delay_patterns(config),
+        delay_warpgroup_id=triggering.warpgroup_id if target is None else None,
+        **fields,
         kernel_timeout_s=config.kernel_timeout_s,
         hang_is_bug=triggering.symptom == SYMPTOM_HANG,
         exit_quarantine_ns=config.exit_quarantine_ns,

@@ -17,11 +17,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from cutracer.runner import RunTarget
-from cutracer.stress.modes import get_mode
+from cutracer.stress.modes import ISOLATE_BY_BARRIER, ISOLATE_BY_WARP
 from cutracer.stress.stress import (
+    _barrier_targets,
     _baseline_from_runs,
     _BaselineResult,
     _delay_patterns,
+    _isolate_by,
     _remaining_s,
     _run_baseline,
     ATTRIBUTION_BASELINE_INCOMPLETE,
@@ -184,13 +186,17 @@ def _profile(config: StressConfig) -> tuple[Any, ...]:
 
 
 def _explicit_targets(config: StressConfig) -> bool:
-    return config.isolate_ranks is not None and config.isolate_warps is not None
+    return (
+        _isolate_by(config) == ISOLATE_BY_WARP
+        and config.isolate_ranks is not None
+        and config.isolate_warps is not None
+    )
 
 
 def _not_searched(run: ModeRun, baseline: _BaselineResult) -> Optional[tuple[str, str]]:
     """Why `run`'s mode should not search, as (status, reason), from what its
     control arm learned about the instrumented launches; None to search."""
-    needs_targets = get_mode(run.mode).isolates_targets
+    needs_targets = _isolate_by(run.config) is not None
     if needs_targets and _explicit_targets(run.config):
         return None
     if not baseline.requested:
@@ -201,6 +207,15 @@ def _not_searched(run: ModeRun, baseline: _BaselineResult) -> Optional[tuple[str
             )
         return None
     if baseline.geometries:
+        if _isolate_by(run.config) == ISOLATE_BY_BARRIER and not _barrier_targets(
+            run.config, baseline.barriers
+        ):
+            return (
+                MODE_SKIPPED,
+                "no instrumented launch has a named barrier to delay at this "
+                "mode's delay points (BAR.SYNC or BAR.RED, or BAR.ARV with "
+                "barrier_arrives)",
+            )
         return None
     if baseline.instrumented_kernels:
         return (
@@ -289,6 +304,7 @@ def _baseline_summary(
             {"checksum": g.checksum, "warps": g.warps, "cluster_size": g.cluster_size}
             for g in baseline.geometries
         ],
+        "barrier_sites": len(baseline.barriers),
     }
 
 

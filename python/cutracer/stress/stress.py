@@ -8,10 +8,9 @@ deterministic replay / reduction. This is the *discovery* counterpart to
 ``cutracer reduce`` (which minimizes an already-known triggering config); both
 own their oracle-driven delay loops inside CUTracer.
 
-Two strategies: ``random`` injects random per-thread delays at every candidate
-point (optionally one warpgroup at a time); ``isolate`` stalls one (cluster
-rank, CTA-local warp) at a time with a fixed delay while every other warp runs
-at full speed (see ``StressConfig.strategy``).
+Each mode of ``cutracer.stress.modes`` either delays every warp (or one
+warpgroup) at its delay points, or isolates one target per attempt with a fixed
+delay (see ``StressConfig.strategy`` and ``StressConfig.isolate_by``).
 
 The loop reuses CUTracer's public instrumented-target runner, so a single
 attempt is exactly what ``cutracer trace -i random_delay`` would run -- no
@@ -21,16 +20,18 @@ self-subprocessing.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import click
 from cutracer.runner import (
@@ -39,7 +40,15 @@ from cutracer.runner import (
     run_process_group,
     RunTarget,
 )
-from cutracer.stress.modes import get_mode, get_modes, ISOLATE, RANDOM
+from cutracer.stress.modes import (
+    get_mode,
+    get_modes,
+    ISOLATE,
+    ISOLATE_BY_BARRIER,
+    ISOLATE_BY_WARP,
+    ISOLATE_KINDS,
+    RANDOM,
+)
 from cutracer.stress.retention import (
     MAX_REJECTED_CONFIGS as _MAX_REJECTED_CONFIGS,
     retain_oldest_and_newest,
@@ -73,33 +82,212 @@ ISOLATE_DEFAULT_PATTERNS: str | None = ISOLATE.delay_patterns
 # CUTracer warp masks are 32 bits wide (CUDA allows 32 warps per CTA).
 _MAX_WARPS = 32
 
+# Opcode, kind and barrier operand of `@P0 BAR.SYNC.DEFER_BLOCKING 0x5, 0x40 ;`.
+_BARRIER_SASS = re.compile(
+    r"^\s*(?:@!?\w+\s+)?(BAR\.(SYNC|ARV|RED)(?:\.\w+)*)\s+([^\s,;]+)"
+)
+_IMMEDIATE = re.compile(r"^(?:0x[0-9a-fA-F]+|0|[1-9][0-9]*)$")
+_CHECKSUM = re.compile(r"^[0-9a-f]+$")
+
+
+def _barrier_operation(sass: str) -> Optional[Tuple[str, str, str]]:
+    """(opcode, kind, barrier operand) of a named-barrier instruction; None
+    for any other instruction."""
+    match = _BARRIER_SASS.match(sass)
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _pattern_list(patterns: Optional[str]) -> List[str]:
+    """`CUTRACER_DELAY_PATTERNS` as CUTracer splits it."""
+    return [p.strip() for p in (patterns or "").split(",") if p.strip()]
+
+
+def _selects_named_barriers(patterns: Optional[str], arrives: bool) -> bool:
+    """Whether delay patterns can match a named barrier a target delays: a
+    pattern that is part of an opcode it delays (`BAR`, `BAR.SYNC`) or that
+    names one (`@P0 BAR.SYNC.DEFER_BLOCKING`), but not `MEMBAR`."""
+    kinds = ("SYNC", "RED", "ARV") if arrives else ("SYNC", "RED")
+    opcode = re.compile(rf"(?<![A-Z_.])BAR\.(?:{'|'.join(kinds)})")
+    return any(
+        pattern == "*"
+        or any(pattern in f"BAR.{kind}" for kind in kinds)
+        or opcode.search(pattern) is not None
+        for pattern in _pattern_list(patterns)
+    )
+
+
+@dataclass(frozen=True)
+class BarrierSite:
+    """One named-barrier instruction of an instrumented kernel."""
+
+    kernel_name: str
+    kernel_checksum: str
+    pc: int
+    sass: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kernel_name": self.kernel_name,
+            "kernel_checksum": self.kernel_checksum,
+            "pc": self.pc,
+            "sass": self.sass,
+        }
+
+    @classmethod
+    def from_dict(cls, entry: object) -> "BarrierSite":
+        if not isinstance(entry, Mapping):
+            raise ValueError("a named-barrier site must be a site record")
+        name, checksum = entry.get("kernel_name"), entry.get("kernel_checksum")
+        pc, sass = entry.get("pc"), entry.get("sass")
+        if not isinstance(name, str) or not name:
+            raise ValueError("a named-barrier site names no kernel")
+        if not isinstance(checksum, str) or not _CHECKSUM.match(checksum):
+            raise ValueError("a named-barrier site has an invalid kernel checksum")
+        if type(pc) is not int or pc < 0:
+            raise ValueError("a named-barrier site has an invalid pc")
+        if not isinstance(sass, str) or _barrier_operation(sass) is None:
+            raise ValueError("a named-barrier site is not a named-barrier instruction")
+        return cls(name, checksum, pc, sass)
+
+
+@dataclass(frozen=True)
+class NamedBarrier:
+    """The points one named-barrier target delays.
+
+    An immediate barrier id (``barrier_id``) covers every instruction that
+    names it, in every instrumented kernel. A barrier whose id is in a
+    register is a single site (``barrier_id`` None): two sites that read the
+    same register need not name the same barrier. ``patterns`` are SASS
+    substrings that select exactly ``sites``; without them, an attempt
+    replays a delay config that turns on only ``sites``.
+    """
+
+    barrier_id: Optional[int]
+    sites: Tuple[BarrierSite, ...]
+    patterns: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.sites:
+            raise ValueError("a named barrier has at least one site")
+        operations = [_barrier_operation(site.sass) for site in self.sites]
+        if any(operation is None for operation in operations):
+            raise ValueError("a named-barrier site is not a named-barrier instruction")
+        operands = {operation[2] for operation in operations if operation}
+        if self.barrier_id is None:
+            if len(self.sites) != 1 or _IMMEDIATE.match(operands.pop()):
+                raise ValueError("a register-id named barrier is one register site")
+            if self.patterns:
+                raise ValueError("a register-id named barrier has no patterns")
+        elif any(
+            not _IMMEDIATE.match(operand) or int(operand, 0) != self.barrier_id
+            for operand in operands
+        ):
+            raise ValueError("every site of a named barrier names its id")
+        allowed = {f"{op[0]} {op[2]}" for op in operations if op}
+        if any(pattern not in allowed for pattern in self.patterns):
+            raise ValueError(
+                "named-barrier patterns are the opcodes and id of its sites"
+            )
+
+    def label(self) -> str:
+        if self.barrier_id is not None:
+            return f"named barrier {self.barrier_id:#x}"
+        site = self.sites[0]
+        operation = _barrier_operation(site.sass)
+        operand = "?" if operation is None else operation[2]
+        return f"named barrier {operand} at pc {site.pc:#x}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.barrier_id,
+            "patterns": list(self.patterns),
+            "sites": [site.to_dict() for site in self.sites],
+        }
+
+    @classmethod
+    def from_dict(cls, entry: object) -> "NamedBarrier":
+        if not isinstance(entry, Mapping):
+            raise ValueError("a named barrier must be a barrier record")
+        barrier_id, sites = entry.get("id"), entry.get("sites")
+        patterns = entry.get("patterns", [])
+        if barrier_id is not None and type(barrier_id) is not int:
+            raise ValueError("a named barrier has an invalid id")
+        if not isinstance(sites, list) or not isinstance(patterns, list):
+            raise ValueError("a named barrier lists its sites and patterns")
+        if not all(isinstance(pattern, str) for pattern in patterns):
+            raise ValueError("named-barrier patterns must be strings")
+        return cls(
+            barrier_id,
+            tuple(BarrierSite.from_dict(site) for site in sites),
+            tuple(patterns),
+        )
+
 
 @dataclass(frozen=True)
 class DelayTarget:
-    """One actor of an isolate search: a CTA-local warp on one cluster rank.
+    """What one attempt of a mode that isolates targets stalls, with a fixed
+    delay: one CTA-local ``warp`` before the mode's delay points, or every
+    warp before the points of one named ``barrier`` only.
 
-    ``cluster_rank`` is None for launches without clusters, where the warp is
-    delayed in every CTA.
+    ``cluster_rank`` is None for every CTA: launches without clusters, where
+    the warp is delayed in every CTA, and named-barrier targets.
     """
 
-    warp: int
+    warp: Optional[int] = None
     cluster_rank: Optional[int] = None
+    barrier: Optional[NamedBarrier] = None
+
+    def __post_init__(self) -> None:
+        if (self.warp is None) == (self.barrier is None):
+            raise ValueError("a delay target names one warp or one named barrier")
+        if self.barrier is not None and self.cluster_rank is not None:
+            raise ValueError("a named-barrier target delays every CTA")
 
     @property
-    def warp_mask(self) -> str:
-        return hex(1 << self.warp)
+    def warp_mask(self) -> Optional[str]:
+        """The CUTracer warp mask of the target; None for every warp."""
+        return None if self.warp is None else hex(1 << self.warp)
 
     def label(self) -> str:
+        if self.barrier is not None:
+            return self.barrier.label()
         if self.cluster_rank is None:
             return f"warp {self.warp}"
         return f"cluster rank {self.cluster_rank}, warp {self.warp}"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        record: Dict[str, Any] = {
             "cluster_rank": self.cluster_rank,
             "warp": self.warp,
             "warp_mask": self.warp_mask,
         }
+        if self.barrier is not None:
+            record["barrier"] = self.barrier.to_dict()
+        return record
+
+    @classmethod
+    def from_dict(cls, entry: object) -> "DelayTarget":
+        """The target a `to_dict()` record (or an older report's) names."""
+        if not isinstance(entry, Mapping):
+            raise ValueError("a delay target must be a target record")
+        rank = entry.get("cluster_rank")
+        if rank is not None and (type(rank) is not int or rank < 0):
+            raise ValueError("a delay target names an invalid cluster rank")
+        if entry.get("barrier") is not None:
+            if entry.get("warp") is not None or entry.get("warp_mask") is not None:
+                raise ValueError("a named-barrier target names no warp")
+            return cls(
+                cluster_rank=rank, barrier=NamedBarrier.from_dict(entry["barrier"])
+            )
+        warp = entry.get("warp")
+        if type(warp) is not int or not 0 <= warp < _MAX_WARPS:
+            raise ValueError("a delay target names a warp outside the CTA")
+        target = cls(warp, rank)
+        if "warp_mask" in entry and entry["warp_mask"] != target.warp_mask:
+            raise ValueError("a delay target names an inconsistent warp mask")
+        return target
 
 
 @dataclass
@@ -143,31 +331,42 @@ class StressConfig:
     exit_quarantine_ns: int = 0
     # A mode of `cutracer.stress.modes`. STRATEGY_RANDOM: random per-thread
     # delays at every candidate point, all warps at once or one warpgroup at a
-    # time (`warpgroup_ids`). STRATEGY_ISOLATE: one target (cluster rank,
-    # CTA-local warp) per attempt, with a fixed delay before each matching
-    # instruction (`enable_prob` is ignored) while every other warp runs at
-    # full speed. Random delays slow a producer down together with its
-    # consumers, so they cannot show that a consumer is missing from the
-    # release protocol; isolating that consumer lets the producer lap it.
+    # time (`warpgroup_ids`). A mode that isolates targets (STRATEGY_ISOLATE:
+    # one cluster rank and CTA-local warp) stalls one target per attempt, with
+    # a fixed delay before each matching instruction (`enable_prob` is
+    # ignored) while everything else runs at full speed. Random delays slow a
+    # producer down together with its consumers, so they cannot show that a
+    # consumer is missing from the release protocol; isolating that consumer
+    # lets the producer lap it.
     strategy: str = STRATEGY_RANDOM
+    # What each attempt of a mode that isolates targets stalls (one of
+    # `cutracer.stress.modes.ISOLATE_KINDS`); None = the mode's own.
+    isolate_by: Optional[str] = None
     # Isolate targets: cluster ranks (tried high to low) and CTA-local warps.
     # None = every rank / warp of the instrumented launches the control arm
     # observed, which needs `baseline_runs >= 1`.
     isolate_ranks: Optional[List[int]] = None
     isolate_warps: Optional[List[int]] = None
-    # Isolate only: try at most this many targets, a window of the full target
-    # list that `isolate_rotation` moves (window k starts at target
-    # k * isolate_max_targets and wraps around), so that successive searches
-    # with an increasing rotation cover every target.
+    # Modes that isolate targets: try at most this many targets, a window of
+    # the full target list that `isolate_rotation` moves (window k starts at
+    # target k * isolate_max_targets and wraps around), so that successive
+    # searches with an increasing rotation cover every target.
     isolate_max_targets: Optional[int] = None
     isolate_rotation: int = 0
-    # SASS substrings to delay at (CUTRACER_DELAY_PATTERNS). None = mbarrier
-    # waits for isolate, CUTracer's built-in patterns for random.
+    # Named-barrier targets: also delay the barrier's arrives (`BAR.ARV`),
+    # not only its syncs and reductions.
+    barrier_arrives: bool = False
+    # SASS substrings to delay at (CUTRACER_DELAY_PATTERNS). None = the
+    # mode's own (mbarrier waits for isolate, CUTracer's built-in patterns
+    # for random).
     delay_patterns: Optional[str] = None
     cwd: Optional[str] = None
     base_env: Optional[Mapping[str, str]] = None
     resume_result: Optional["StressResult"] = None
     progress_callback: Optional[Callable[["StressResult"], None]] = None
+    # Called once the targets are known, before the first attempt, with the
+    # strategy, the number of targets (0 without targets) and of attempts.
+    schedule_callback: Optional[Callable[[str, int, int], None]] = None
     use_bundled_cuda_tools: bool = True
     expected_kernel_name: Optional[str] = None
     expected_kernel_checksum: Optional[str] = None
@@ -203,19 +402,39 @@ class StressConfig:
             raise ValueError("exit_quarantine_ns must be an unsigned 32-bit ns value")
         if self.strategy not in get_modes():
             raise ValueError(f"unknown stress strategy {self.strategy!r}")
+        if self.isolate_by is not None and self.isolate_by not in ISOLATE_KINDS:
+            raise ValueError(
+                f"isolate_by must be one of {', '.join(ISOLATE_KINDS)}, got "
+                f"{self.isolate_by!r}"
+            )
         if get_mode(self.strategy).isolates_targets:
             if self.warpgroup_ids:
                 raise ValueError("warpgroup_ids do not apply to an isolate search")
         elif (
-            self.isolate_ranks is not None
-            or self.isolate_warps is not None
+            self.isolate_by is not None
             or self.isolate_max_targets is not None
             or self.isolate_rotation
         ):
             raise ValueError(
-                "isolate_ranks, isolate_warps, isolate_max_targets and "
-                "isolate_rotation need strategy isolate"
+                "isolate_by, isolate_max_targets and isolate_rotation need a mode "
+                "that isolates targets"
             )
+        if _isolate_by(self) != ISOLATE_BY_WARP and (
+            self.isolate_ranks is not None or self.isolate_warps is not None
+        ):
+            raise ValueError(
+                "isolate_ranks and isolate_warps need strategy isolate (one warp "
+                "of one cluster rank per attempt)"
+            )
+        if _isolate_by(self) == ISOLATE_BY_BARRIER:
+            if not _selects_named_barriers(_delay_patterns(self), self.barrier_arrives):
+                raise ValueError(
+                    "a named-barrier search needs delay patterns that match "
+                    "BAR.SYNC or BAR.RED (BAR.ARV with barrier_arrives), e.g. "
+                    "'BAR.SYNC,BAR.ARV,BAR.RED'"
+                )
+        elif self.barrier_arrives:
+            raise ValueError("barrier_arrives needs isolate_by barrier")
         if self.isolate_max_targets is not None and self.isolate_max_targets < 1:
             raise ValueError("isolate_max_targets must be >= 1")
         if self.isolate_rotation < 0:
@@ -353,12 +572,19 @@ class StressResult:
     # before it ran them all (see `result_verdict`).
     planned_trials: Optional[int] = None
     budget_exhausted: bool = False
+    # What each attempt isolated (`StressConfig.isolate_by` and
+    # `barrier_arrives`); a resume must reuse them. None for results
+    # reconstructed from older reports, which skip the check.
+    isolate_by: Optional[str] = None
+    barrier_arrives: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "strategy": self.strategy,
             "verdict": result_verdict(self).to_dict(),
             "planned_trials": self.planned_trials,
+            "isolate_by": self.isolate_by,
+            "barrier_arrives": self.barrier_arrives,
             "budget_exhausted": self.budget_exhausted,
             "targets": list(self.targets),
             "targets_total": self.targets_total,
@@ -565,6 +791,56 @@ def _delay_patterns(config: StressConfig) -> Optional[str]:
     return config.delay_patterns or get_mode(config.strategy).delay_patterns
 
 
+def _isolate_by(config: StressConfig) -> Optional[str]:
+    """What each attempt of `config`'s search stalls (`ISOLATE_KINDS`); None
+    for a mode that does not isolate targets."""
+    mode = get_mode(config.strategy)
+    if not mode.isolates_targets:
+        return None
+    return config.isolate_by or mode.isolate_by
+
+
+def _target_patterns(config: StressConfig, target: DelayTarget) -> Optional[str]:
+    """The delay patterns of an attempt on `target`: its named barrier's own,
+    when patterns select exactly its sites, else the mode's."""
+    if target.barrier is not None and target.barrier.patterns:
+        return ",".join(target.barrier.patterns)
+    return _delay_patterns(config)
+
+
+def _replays_a_config(target: Optional[DelayTarget]) -> bool:
+    """Whether an attempt on `target` replays a delay config written for it
+    (`_write_barrier_config`) rather than dumping the points CUTracer chose."""
+    return (
+        target is not None
+        and target.barrier is not None
+        and not target.barrier.patterns
+    )
+
+
+def _target_fields(config: StressConfig, target: DelayTarget) -> Dict[str, Any]:
+    """The `InstrumentationConfig` / `ReplayConfig` fields that restore the
+    targeting of an attempt on `target`."""
+    return {
+        "delay_mode": "fixed" if target.cluster_rank is None else "cluster_fixed",
+        "delay_cluster_cta_id": target.cluster_rank,
+        "delay_warp_mask": target.warp_mask,
+        "delay_patterns": _target_patterns(config, target),
+    }
+
+
+def _triggering_target(triggering: TriggeringConfig) -> Optional[DelayTarget]:
+    """The target a triggering config was recorded under; None for a random
+    search, or for a partial record that names no target (which then loses
+    the targeting rather than failing the summary)."""
+    if triggering.target is None:
+        return None
+    try:
+        return DelayTarget.from_dict(triggering.target)
+    except ValueError:
+        return None
+
+
 def _replay_args(
     config: StressConfig,
     *,
@@ -595,16 +871,17 @@ def _targeting_args(
     args: List[str] = []
     if config.kernel_filters:
         args += ["-k", config.kernel_filters]
+    patterns = _delay_patterns(config)
     if target is not None:
-        if target.cluster_rank is None:
-            args += ["--delay-mode", "fixed"]
-        else:
-            args += ["--delay-mode", "cluster_fixed"]
+        fields = _target_fields(config, target)
+        args += ["--delay-mode", fields["delay_mode"]]
+        if target.cluster_rank is not None:
             args += ["--delay-cluster-cta-id", str(target.cluster_rank)]
-        args += ["--delay-warp-mask", target.warp_mask]
+        if target.warp_mask is not None:
+            args += ["--delay-warp-mask", target.warp_mask]
+        patterns = fields["delay_patterns"]
     elif warpgroup is not None:
         args += ["--delay-warpgroup-id", str(warpgroup)]
-    patterns = _delay_patterns(config)
     if patterns:
         args += ["--delay-patterns", patterns]
     if config.kernel_timeout_s > 0:
@@ -623,15 +900,11 @@ def _late_writes(config: StressConfig, directory: str, before: set[str]) -> list
 def reduce_args(config: StressConfig, triggering: TriggeringConfig) -> List[str]:
     """`cutracer reduce` options that replay the triggering config the way the
     search ran it; add `-c <config> -t <oracle>`."""
-    target = None
-    if triggering.target is not None:
-        warp = triggering.target.get("warp")
-        if warp is not None:
-            target = DelayTarget(
-                warp=int(warp),
-                cluster_rank=triggering.target.get("cluster_rank"),
-            )
-    args = _targeting_args(config, warpgroup=triggering.warpgroup_id, target=target)
+    args = _targeting_args(
+        config,
+        warpgroup=triggering.warpgroup_id,
+        target=_triggering_target(triggering),
+    )
     # Reduce's per-replay outer timeout defaults to 300 s while a search runs
     # its attempts with `config.timeout` (1800 s by default): a replay killed
     # by the outer timeout before CUTracer's kernel timeout fires cannot be
@@ -760,6 +1033,66 @@ def _launched_instrumented_kernels(output_dir: str, config_path: str) -> set[str
     }
 
 
+def _barrier_sites(output_dir: str, config_path: str) -> List[BarrierSite]:
+    """The named-barrier points of the launched kernels in a run's delay
+    dump, by kernel in first-launch order, then by PC."""
+    try:
+        with open(config_path) as source:
+            kernels = json.load(source).get("kernels", {})
+    except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
+        # `_launched_instrumented_kernels` warns about the same dump.
+        return []
+    by_checksum: Dict[str, List[BarrierSite]] = {}
+    malformed = 0
+    for kernel in kernels.values() if isinstance(kernels, dict) else ():
+        if not isinstance(kernel, dict):
+            continue
+        name, checksum = kernel.get("kernel_name"), kernel.get("kernel_checksum")
+        points = kernel.get("instrumentation_points")
+        if not isinstance(points, dict):
+            continue
+        sites: List[BarrierSite] = []
+        for point in points.values():
+            sass = point.get("sass") if isinstance(point, dict) else None
+            if isinstance(sass, str) and _barrier_operation(sass) is None:
+                # Another instruction the delay patterns matched.
+                continue
+            try:
+                sites.append(
+                    BarrierSite.from_dict(
+                        {**point, "kernel_name": name, "kernel_checksum": checksum}
+                    )
+                )
+            except (TypeError, ValueError):
+                malformed += 1
+        by_checksum[str(checksum)] = sorted(sites, key=lambda site: site.pc)
+    if malformed:
+        logger.warning(
+            "skipped %d malformed named-barrier point(s) of the delay dump %s",
+            malformed,
+            config_path,
+        )
+    launched = dict.fromkeys(
+        checksum
+        for event in _kernel_launch_events(output_dir)
+        if isinstance(checksum := event.get("kernel_checksum"), str)
+    )
+    return [site for checksum in launched for site in by_checksum.get(checksum, [])]
+
+
+def _merge_barrier_sites(
+    sites: List[BarrierSite], new: List[BarrierSite]
+) -> List[BarrierSite]:
+    """Fold another control run's named-barrier sites into `sites`."""
+    seen = {(site.kernel_checksum, site.pc) for site in sites}
+    merged = list(sites)
+    for site in new:
+        if (site.kernel_checksum, site.pc) not in seen:
+            seen.add((site.kernel_checksum, site.pc))
+            merged.append(site)
+    return merged
+
+
 def _merge_geometries(
     geometries: List[_LaunchGeometry], new: List[_LaunchGeometry]
 ) -> List[_LaunchGeometry]:
@@ -777,20 +1110,120 @@ def _merge_geometries(
     return [by_checksum[checksum] for checksum in order]
 
 
-def _isolate_targets(  # noqa: C901
-    config: StressConfig, geometries: Sequence[_LaunchGeometry]
-) -> List[DelayTarget]:
-    """The isolate targets in search order.
+def _barrier_patterns(
+    group: Sequence[BarrierSite],
+    sites: Sequence[BarrierSite],
+    mode_patterns: Optional[str],
+) -> Tuple[str, ...]:
+    """SASS substrings (opcode and barrier id) that select exactly the sites
+    of `group`; () when they could select another instruction, so that the
+    group needs a delay config that names its sites.
 
-    Targets are grouped by instrumented kernel in first-launch order; within
-    each kernel, cluster ranks run high to low and warps ascending. Higher
-    ranks come first: in a multi-CTA kernel rank 0 usually leads, and a
-    warp of a peer CTA whose work is predicated off is the one most easily left
-    out of the release protocol. Targets are collected from every instrumented
-    launch shape, without combining one kernel's warps with another's cluster
-    ranks; a target named for several kernels is tried once, because one
-    attempt delays that warp of every kernel it launches in.
+    An attempt's patterns replace the mode's, so they may only match
+    instructions the control arm saw: the mode's patterns must match every
+    instruction of each kind in `group`, and no pattern another site.
     """
+    patterns = set()
+    for site in group:
+        operation = _barrier_operation(site.sass)
+        if operation is None:
+            continue
+        opcode, kind, operand = operation
+        if not any(
+            pattern == "*" or pattern in f"BAR.{kind}"
+            for pattern in _pattern_list(mode_patterns)
+        ):
+            return ()
+        patterns.add(f"{opcode} {operand}")
+    members = set(group)
+    if any(
+        pattern in site.sass
+        for site in sites
+        if site not in members
+        for pattern in patterns
+    ):
+        return ()
+    return tuple(sorted(patterns))
+
+
+def _barrier_targets(
+    config: StressConfig, sites: Sequence[BarrierSite]
+) -> List[DelayTarget]:
+    """One target per named barrier, in search order.
+
+    Sites group by immediate barrier id across the instrumented kernels; a
+    site whose barrier id is in a register is a target of its own. A target
+    delays its barrier's syncs and reductions, and its arrives with
+    `barrier_arrives`. Barriers that some warps only arrive at come first: a
+    late sync there lets the arriving warps run a phase ahead. Register-id
+    sites follow, then the barriers every participant syncs on, whose arrival
+    order a delay on every warp keeps.
+    """
+    delayed = {"SYNC", "RED", "ARV"} if config.barrier_arrives else {"SYNC", "RED"}
+    by_id: Dict[int, List[BarrierSite]] = {}
+    arrived: set[int] = set()
+    by_site: List[BarrierSite] = []
+    for site in sites:
+        operation = _barrier_operation(site.sass)
+        if operation is None:
+            continue
+        _opcode, kind, operand = operation
+        if not _IMMEDIATE.match(operand):
+            if kind in delayed:
+                by_site.append(site)
+            continue
+        barrier_id = int(operand, 0)
+        if kind == "ARV":
+            arrived.add(barrier_id)
+        if kind in delayed:
+            by_id.setdefault(barrier_id, []).append(site)
+    mode_patterns = _delay_patterns(config)
+    immediate = [
+        NamedBarrier(
+            barrier_id, tuple(group), _barrier_patterns(group, sites, mode_patterns)
+        )
+        for barrier_id, group in sorted(by_id.items())
+    ]
+    ordered = [
+        *(barrier for barrier in immediate if barrier.barrier_id in arrived),
+        *(NamedBarrier(None, (site,)) for site in by_site),
+        *(barrier for barrier in immediate if barrier.barrier_id not in arrived),
+    ]
+    return [DelayTarget(barrier=barrier) for barrier in ordered]
+
+
+def _isolate_targets(  # noqa: C901
+    config: StressConfig,
+    geometries: Sequence[_LaunchGeometry],
+    barriers: Sequence[BarrierSite] = (),
+) -> List[DelayTarget]:
+    """The targets of a mode that isolates them, in search order.
+
+    Named-barrier targets come from the `barriers` the control arm's delay
+    dumps list (see `_barrier_targets`). Warp targets are grouped by
+    instrumented kernel in first-launch order; within each kernel, cluster
+    ranks run high to low and warps ascending. Higher ranks come first: in a
+    multi-CTA kernel rank 0 usually leads, and a warp of a peer CTA whose work
+    is predicated off is the one most easily left out of the release
+    protocol. Targets are collected from every instrumented launch shape,
+    without combining one kernel's warps with another's cluster ranks; a
+    target named for several kernels is tried once, because one attempt
+    delays that warp of every kernel it launches in.
+    """
+    if _isolate_by(config) == ISOLATE_BY_BARRIER:
+        targets = _barrier_targets(config, barriers)
+        if targets:
+            return targets
+        if config.baseline_runs <= 0:
+            raise ValueError(
+                "a named-barrier search discovers its targets from the control "
+                "arm and needs baseline_runs >= 1"
+            )
+        raise ValueError(
+            "the control arm recorded no named barrier (BAR.SYNC, BAR.ARV or "
+            "BAR.RED) in the instrumented launches, so there is nothing to "
+            "isolate; check the kernel filter and the delay patterns"
+        )
     if config.isolate_ranks is None or config.isolate_warps is None:
         if not geometries:
             if config.baseline_runs <= 0:
@@ -864,31 +1297,40 @@ def _target_window(
     return [targets[(start + i) % len(targets)] for i in range(limit)]
 
 
+def _delays_its_sites(config: StressConfig, target: DelayTarget) -> bool:
+    """Whether every site of a named-barrier target is a point this search
+    instruments and delays: CUTracer only looks up a replayed config's points
+    among the instructions the delay patterns match."""
+    assert target.barrier is not None
+    patterns = _pattern_list(_delay_patterns(config))
+    for site in target.barrier.sites:
+        operation = _barrier_operation(site.sass)
+        if operation is None or (operation[1] == "ARV" and not config.barrier_arrives):
+            return False
+        if not any(pattern == "*" or pattern in site.sass for pattern in patterns):
+            return False
+    return True
+
+
 def _restored_targets(checkpoint: Sequence[Mapping[str, Any]]) -> List[DelayTarget]:
-    """The isolate targets a checkpoint recorded, in their original order.
+    """The targets a checkpoint recorded, in their original order.
 
     A discovered target list is a per-kernel union, so it is not always the
     Cartesian product an explicit `isolate_ranks` / `isolate_warps` pair
     reconstructs (and a launch without clusters contributes targets whose
-    cluster rank is None, which no explicit rank names). A resume therefore
-    restores the recorded list rather than rebuilding it; the entries are
-    still checked, because the resumed schedule is located by counting the
-    trials the checkpoint already ran against this list.
+    cluster rank is None, which no explicit rank names); named-barrier targets
+    have no explicit form at all. A resume therefore restores the recorded
+    list rather than rebuilding it; the entries are still checked, because the
+    resumed schedule is located by counting the trials the checkpoint already
+    ran against this list.
     """
     targets: List[DelayTarget] = []
     seen: set[DelayTarget] = set()
     for entry in checkpoint:
-        if not isinstance(entry, Mapping):
-            raise ValueError("resumed isolate targets must be target records")
-        warp = entry.get("warp")
-        rank = entry.get("cluster_rank")
-        if type(warp) is not int or not 0 <= warp < _MAX_WARPS:
-            raise ValueError("resumed isolate targets name a warp outside the CTA")
-        if rank is not None and (type(rank) is not int or rank < 0):
-            raise ValueError("resumed isolate targets name an invalid cluster rank")
-        target = DelayTarget(warp, rank)
-        if "warp_mask" in entry and entry["warp_mask"] != target.warp_mask:
-            raise ValueError("resumed isolate targets name an inconsistent warp mask")
+        try:
+            target = DelayTarget.from_dict(entry)
+        except ValueError as exc:
+            raise ValueError(f"resumed isolate targets: {exc}") from exc
         if target in seen:
             raise ValueError("resumed isolate targets contain a duplicate target")
         seen.add(target)
@@ -1043,11 +1485,12 @@ def _validate_target_launch(  # noqa: C901
     output_dir: str,
     *,
     kernel_identities: Sequence[tuple[str, str]],
-    warp: int,
+    warp: Optional[int],
     cluster_rank: Optional[int],
     label: str,
 ) -> Optional[str]:
-    """Verify that a matching launch has CTA-local `warp` (and cluster rank).
+    """Verify that a matching launch has CTA-local `warp` (any warp when None)
+    and cluster rank.
 
     A target outside every launch makes the attempt inject nothing, so its
     "not reproduced" would be meaningless. Any eligible kernel may provide
@@ -1085,7 +1528,9 @@ def _validate_target_launch(  # noqa: C901
                         continue
                     matched_launch = True
                     block_warps = _block_warps(event)
-                    if block_warps is None or warp >= block_warps:
+                    if block_warps is None or (
+                        warp is not None and warp >= block_warps
+                    ):
                         multi_cta_without_warp |= (
                             cluster_rank is not None and _cluster_size(event) > 1
                         )
@@ -1124,13 +1569,34 @@ def _attempt_targeting(
             "delay_mode": "random",
             "delay_enable_prob": config.enable_prob,
             "delay_warpgroup_id": warpgroup,
+            "delay_patterns": _delay_patterns(config),
         }
-    return {
-        "delay_mode": "fixed" if target.cluster_rank is None else "cluster_fixed",
-        "delay_enable_prob": 1.0,
-        "delay_cluster_cta_id": target.cluster_rank,
-        "delay_warp_mask": target.warp_mask,
-    }
+    return {"delay_enable_prob": 1.0, **_target_fields(config, target)}
+
+
+def _write_barrier_config(path: str, barrier: NamedBarrier, delay_ns: int) -> None:
+    """A delay config that turns on `barrier`'s sites, and names no other
+    point: replay mode leaves every point it does not list undelayed."""
+    kernels: Dict[str, Dict[str, Any]] = {}
+    timestamp = datetime.datetime.now().isoformat(timespec="milliseconds")
+    for site in barrier.sites:
+        kernel = kernels.setdefault(
+            f"{site.kernel_name}_{site.kernel_checksum}",
+            {
+                "kernel_name": site.kernel_name,
+                "kernel_checksum": site.kernel_checksum,
+                "timestamp": timestamp,
+                "instrumentation_points": {},
+            },
+        )
+        kernel["instrumentation_points"][str(site.pc)] = {
+            "pc": site.pc,
+            "sass": site.sass,
+            "delay": delay_ns,
+            "on": True,
+        }
+    with open(path, "w") as output:
+        json.dump({"version": "1.0", "delay_ns": delay_ns, "kernels": kernels}, output)
 
 
 def _attempt_config_name(
@@ -1138,6 +1604,14 @@ def _attempt_config_name(
 ) -> str:
     if target is None:
         return f"delay-{delay_ns}-wg-{warpgroup}-attempt-{attempt}.json"
+    if target.barrier is not None:
+        barrier = target.barrier
+        if barrier.barrier_id is not None:
+            key = f"{barrier.barrier_id:#x}"
+        else:
+            site = barrier.sites[0]
+            key = f"{site.kernel_checksum[:16]}-pc-{site.pc:#x}"
+        return f"delay-{delay_ns}-barrier-{key}-attempt-{attempt}.json"
     rank = "all" if target.cluster_rank is None else target.cluster_rank
     return f"delay-{delay_ns}-rank-{rank}-warp-{target.warp}-attempt-{attempt}.json"
 
@@ -1161,11 +1635,15 @@ def _run_attempt_in_output_dir(  # noqa: C901
         os.unlink(config_path)
     except FileNotFoundError:
         pass
+    replays = _replays_a_config(target)
     logs_before = main_logs(instrumentation_output_dir)
     proc: Optional[subprocess.CompletedProcess[str]] = None
     timeout_error = ""
     timeout_output: tuple[str | bytes | None, ...] = ()
     try:
+        if replays:
+            assert target is not None and target.barrier is not None
+            _write_barrier_config(config_path, target.barrier, delay_ns)
         proc = run_instrumented_target(
             config.oracle_argv,
             InstrumentationConfig(
@@ -1177,8 +1655,10 @@ def _run_attempt_in_output_dir(  # noqa: C901
                 exact_kernel_checksum=config.exact_kernel_checksum,
                 output_dir=instrumentation_output_dir,
                 delay_ns=delay_ns,
-                delay_patterns=_delay_patterns(config),
-                delay_dump_path=config_path,
+                # CUTracer cannot dump and replay in one run; a replayed
+                # config already is the attempt's record.
+                delay_dump_path=None if replays else config_path,
+                delay_load_path=config_path if replays else None,
                 # A fresh seed per attempt, even when the caller's environment
                 # pins one: every process of the attempt shares it.
                 delay_seed=secrets.randbits(64),
@@ -1547,6 +2027,9 @@ class _BaselineResult:
     # delay points (recorded with `geometries`): instrumented launches but no
     # geometry mean the delay patterns match nothing in those kernels.
     instrumented_kernels: set[str] = field(default_factory=set)
+    # The named-barrier delay points of those launches (recorded with
+    # `geometries`), from which named-barrier targets are discovered.
+    barriers: List[BarrierSite] = field(default_factory=list)
 
 
 def _baseline_from_runs(
@@ -1557,6 +2040,7 @@ def _baseline_from_runs(
     geometries: List[_LaunchGeometry],
     requested: Optional[int] = None,
     instrumented_kernels: Optional[set[str]] = None,
+    barriers: Sequence[BarrierSite] = (),
 ) -> _BaselineResult:
     """Count control runs under `config`'s oracle contract and hang rule."""
     completed = reproduced = timed_out = infra_errors = hangs = 0
@@ -1594,6 +2078,7 @@ def _baseline_from_runs(
         geometries=geometries,
         runs=list(runs),
         instrumented_kernels=set(instrumented_kernels or ()),
+        barriers=list(barriers),
     )
 
 
@@ -1637,6 +2122,7 @@ def _run_baseline(
     runs: List[_BaselineRun] = []
     geometries: List[_LaunchGeometry] = []
     instrumented: set[str] = set()
+    barriers: List[BarrierSite] = []
     logs: List[str] = []
     if config.baseline_runs <= 0:
         # A caller that opted out of the control arm must not pay for anything
@@ -1706,6 +2192,9 @@ def _run_baseline(
                 geometries, _instrumented_geometries(run_dir, dump_path)
             )
             instrumented |= _launched_instrumented_kernels(run_dir, dump_path)
+            barriers = _merge_barrier_sites(
+                barriers, _barrier_sites(run_dir, dump_path)
+            )
             shutil.rmtree(run_dir, ignore_errors=True)
         logs.append(
             _attempt_log(
@@ -1733,6 +2222,7 @@ def _run_baseline(
         logs=logs,
         geometries=geometries,
         instrumented_kernels=instrumented,
+        barriers=barriers,
     )
 
 
@@ -1864,7 +2354,8 @@ def result_verdict(result: StressResult) -> Verdict:
         return Verdict(
             VERDICT_CLEAN,
             [
-                f"isolate covered {len(result.targets)} of {result.targets_total} "
+                f"{result.strategy} covered {len(result.targets)} of "
+                f"{result.targets_total} "
                 "targets (a rotating window)"
             ],
         )
@@ -1911,6 +2402,7 @@ def run_stress(  # noqa: C901
             geometries=baseline.geometries,
             requested=baseline.requested,
             instrumented_kernels=baseline.instrumented_kernels,
+            barriers=baseline.barriers,
         )
     elif resume is None:
         baseline = _run_baseline(
@@ -1925,6 +2417,26 @@ def run_stress(  # noqa: C901
             infra_errors=resume.baseline_infra_errors,
             logs=[],
             hangs=resume.baseline_hangs,
+        )
+    log_path: Optional[str] = None
+    log_size_bytes = 0
+    if resume is None:
+        # Written before target discovery can raise: the control arm's logs
+        # are what explain a launch that has nothing to isolate.
+        log_path, log_size_bytes = _prepare_stress_log(config.output_dir, None)
+        if baseline.logs:
+            log_path, log_size_bytes = _write_stress_log(
+                config.output_dir, "\n".join(baseline.logs), append=False
+            )
+    elif (
+        resume.isolate_by is not None and resume.isolate_by != _isolate_by(config)
+    ) or (
+        resume.barrier_arrives is not None
+        and resume.barrier_arrives != config.barrier_arrives
+    ):
+        raise ValueError(
+            "resuming a stress search needs the original isolate_by and "
+            "barrier_arrives; its recorded targets were chosen under them"
         )
     rejected_config_paths: List[str] = _bounded_rejected_config_paths(
         [] if resume is None else list(resume.rejected_config_paths),
@@ -1942,6 +2454,20 @@ def run_stress(  # noqa: C901
             # explicit ranks and warps.
             targets = _restored_targets(resume.targets)
             restored_targets = True
+            barrier_search = _isolate_by(config) == ISOLATE_BY_BARRIER
+            if any(
+                (target.barrier is not None) != barrier_search for target in targets
+            ):
+                raise ValueError(
+                    f"resumed isolate targets are not {_isolate_by(config)} targets"
+                )
+            if barrier_search and not all(
+                _delays_its_sites(config, target) for target in targets
+            ):
+                raise ValueError(
+                    "resumed named-barrier targets name sites that this search's "
+                    "delay patterns and barrier_arrives do not delay"
+                )
             if (
                 config.isolate_ranks is not None
                 and any(
@@ -1964,10 +2490,17 @@ def run_stress(  # noqa: C901
                 # The control arm that chose the targets does not run again,
                 # and an older checkpoint recorded no targets to restore.
                 raise ValueError(
-                    "resuming an isolate search needs explicit isolate_ranks and "
-                    "isolate_warps"
+                    "resuming an isolate search needs the targets its checkpoint "
+                    "recorded"
+                    + (
+                        ""
+                        if _isolate_by(config) == ISOLATE_BY_BARRIER
+                        else ", or explicit isolate_ranks and isolate_warps"
+                    )
                 )
-            discovered = _isolate_targets(config, baseline.geometries)
+            discovered = _isolate_targets(
+                config, baseline.geometries, baseline.barriers
+            )
             targets = _target_window(config, discovered)
             if len(targets) < len(discovered):
                 targets_total = len(discovered)
@@ -2008,13 +2541,10 @@ def run_stress(  # noqa: C901
         raise ValueError("resumed triggering config is unavailable")
     if reproductions > 0 and triggering is None:
         raise ValueError("resumed reproduction is missing its triggering config")
-    log_path, log_size_bytes = _prepare_stress_log(config.output_dir, resume)
-    if baseline.logs:
-        log_path, log_size_bytes = _write_stress_log(
-            config.output_dir,
-            "\n".join(baseline.logs),
-            append=log_path is not None,
-        )
+    if resume is not None:
+        log_path, log_size_bytes = _prepare_stress_log(config.output_dir, resume)
+    if config.schedule_callback is not None:
+        config.schedule_callback(config.strategy, len(targets), planned_trials)
     if triggering is not None and config.stop_on_first:
         stop = True
     budget_exhausted = False
@@ -2052,6 +2582,8 @@ def run_stress(  # noqa: C901
             attempts_per_delay=config.attempts_per_delay,
             planned_trials=planned_trials,
             budget_exhausted=budget_exhausted,
+            isolate_by=_isolate_by(config),
+            barrier_arrives=config.barrier_arrives,
         )
 
     for trial in schedule[attempted_trials:]:
@@ -2142,6 +2674,8 @@ def run_stress(  # noqa: C901
         attempts_per_delay=config.attempts_per_delay,
         planned_trials=planned_trials,
         budget_exhausted=budget_exhausted,
+        isolate_by=_isolate_by(config),
+        barrier_arrives=config.barrier_arrives,
     )
 
 

@@ -29,6 +29,7 @@ from cutracer.stress.confirm import (
 from cutracer.stress.modes import get_mode, get_modes
 from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
 from cutracer.stress.stress import (
+    _triggering_target,
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
     ATTRIBUTION_NO_BASELINE,
@@ -88,10 +89,16 @@ _MODE_OPTIONS: dict[str, Callable[[str], Any]] = {
     "isolate_warps": _parse_int_ranges,
     "isolate_max_targets": int,
     "isolate_rotation": int,
+    "barrier_arrives": _parse_bool,
     "kernel_timeout_s": int,
     "hang_is_bug": _parse_bool,
     "exit_quarantine_ns": int,
 }
+
+
+def _echo_schedule(strategy: str, targets: int, attempts: int) -> None:
+    shape = f"{targets} target(s), " if targets else ""
+    click.echo(f"{strategy}: {shape}{attempts} attempt(s) planned", err=True)
 
 
 def _parse_modes(strategy: str) -> list[str]:
@@ -189,7 +196,9 @@ def _mode_config(
     help="Set one option of one mode, e.g. 'random.delay_ladder_ns=10000,100000' "
     "or 'isolate.isolate_warps=0-7'. Keys: delay_ladder_ns, attempts_per_delay, "
     "delay_patterns, enable_prob, warpgroup_ids, isolate_ranks, isolate_warps, "
-    "kernel_timeout_s, hang_is_bug, exit_quarantine_ns. Repeatable.",
+    "isolate_max_targets, isolate_rotation, barrier_arrives (a named-barrier "
+    "search also delays the barrier's arrives), kernel_timeout_s, hang_is_bug, exit_quarantine_ns. "
+    "Repeatable.",
 )
 @click.option(
     "--confirm/--no-confirm",
@@ -436,6 +445,7 @@ def stress_command(  # noqa: C901
         "kernel_filters": kernel_filters,
         "timeout": timeout,
     }
+    shared["schedule_callback"] = _echo_schedule
     if kernel_timeout_s is not None:
         shared["kernel_timeout_s"] = kernel_timeout_s
     if hang_is_bug is not None:
@@ -727,16 +737,13 @@ def _echo_reproduction(
     symptom = {SYMPTOM_HANG: " (hang)", SYMPTOM_LATE_WRITE: " (late write)"}.get(
         triggering.symptom, ""
     )
-    target = triggering.target
-    if target is None:
-        placement = f"warpgroup={triggering.warpgroup_id}"
-    elif target.get("cluster_rank") is None:
-        placement = f"target=warp {target.get('warp')}"
+    target = _triggering_target(triggering)
+    if target is not None:
+        placement = f"target={target.label()}"
+    elif triggering.target is not None:
+        placement = f"target={triggering.target}"
     else:
-        placement = (
-            f"target=cluster rank {target.get('cluster_rank')}, "
-            f"warp {target.get('warp')}"
-        )
+        placement = f"warpgroup={triggering.warpgroup_id}"
     click.echo(
         f"Reproduced{symptom}: delay_ns={triggering.delay_ns} {placement} "
         f"rate={result.reproduction_rate:.2f} -> {dump_out}"
