@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -39,8 +40,6 @@ _FAKE_WORKER = textwrap.dedent(
     args = sys.argv[2:]
     report = args[args.index("--worker-report") + 1]
     script = json.loads(os.environ["FAKE_SCRIPT"])
-    if script.get("sleep"):
-        time.sleep(script["sleep"])
     dump = os.environ.get("CUTRACER_DELAY_DUMP_PATH")
     if dump and "config" in script:
         with open(dump, "w") as fh:
@@ -51,6 +50,10 @@ _FAKE_WORKER = textwrap.dedent(
         with open(os.path.join(out, name), "w") as fh:
             fh.write(json.dumps({"type": "kernel_launch", "kernel_name": "my_kernel",
                                  "kernel_checksum": "beef"}) + "\\n")
+    if "signal" in script:
+        os.kill(os.getpid(), script["signal"])
+    if script.get("sleep"):
+        time.sleep(script["sleep"])
     with open(os.environ["FAKE_SEEN"], "w") as fh:
         json.dump({"argv": sys.argv[1:], "dump": dump,
                    "load": os.environ.get("CUTRACER_DELAY_LOAD_PATH"),
@@ -180,6 +183,20 @@ class RunOracleTest(_OracleTestCase):
         outcome = self.fx.outcome()
         self.assertEqual((outcome["exit"], outcome["coverage"]), (PASSED, True))
 
+    def test_a_worker_killed_before_its_report_still_returns_the_dump(self) -> None:
+        # CUTracer's kernel timeout ends the process that runs a hung kernel
+        # (here the worker) after CUTracer dumped the delay config.
+        requested = self.root / "requested.json"
+        script = {
+            "report": _report(),
+            "config": _config(),
+            "launch": True,
+            "signal": int(signal.SIGTERM),
+        }
+        code = self.fx.run(script, env={"CUTRACER_DELAY_DUMP_PATH": str(requested)})
+        self.assertEqual(code, INCOMPLETE)
+        self.assertEqual(json.loads(requested.read_text()), _config())
+
     def test_a_correctness_failure_reproduces_and_pins_its_signature(self) -> None:
         sig = self.root / "sig"
         script = {"report": _report("failed"), "config": _config(), "launch": True}
@@ -266,13 +283,20 @@ class RunOracleTest(_OracleTestCase):
         self.assertEqual(code, REPRODUCED)
         seen = json.loads(self.fx.seen.read_text())
         self.assertIsNone(seen["dump"])
+        self.assertFalse((self.root / "x.json").exists())
         (attempt,) = (self.root / "evidence").glob("attempt-*")
         self.assertEqual(json.loads((attempt / "delay.json").read_text()), _config())
 
     def test_a_node_past_its_timeout_is_incomplete(self) -> None:
+        requested = self.root / "requested.json"
         script = {"report": _report(), "config": _config(), "launch": True, "sleep": 30}
-        self.assertEqual(self.fx.run(script, timeout_s=0.5), INCOMPLETE)
+        code = self.fx.run(
+            script, timeout_s=3, env={"CUTRACER_DELAY_DUMP_PATH": str(requested)}
+        )
+        self.assertEqual(code, INCOMPLETE)
         self.assertIn("ran past", self.fx.outcome()["errors"][0])
+        # The worker ran far enough to dump its delay config; the caller gets it.
+        self.assertEqual(json.loads(requested.read_text()), _config())
 
     def test_without_an_output_dir_nothing_is_kept(self) -> None:
         script = {"report": _report(), "config": _config(), "launch": True}

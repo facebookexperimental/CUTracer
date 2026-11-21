@@ -383,24 +383,29 @@ def _arm_injection(env: Dict[str, str], evidence: Path, replay: Optional[str]) -
         shutil.copyfile(replay, evidence)
     else:
         # Always dump (a control run may not ask for it) so coverage
-        # can be checked; copied back to the requested path below.
+        # can be checked; `_copy_dump_back` copies it to the requested path.
         env["CUTRACER_DELAY_DUMP_PATH"] = str(evidence)
+
+
+def _copy_dump_back(evidence: Path, dump: Optional[str], replay: Optional[str]) -> None:
+    """Give the caller the attempt's delay config at the path it asked CUTracer
+    to dump to. Runs as soon as the child exits, before anything that can
+    return early: a child that CUTracer's kernel timeout ended wrote no report,
+    and the caller still needs the config to attribute the hang."""
+    if dump and not replay and evidence.is_file():
+        shutil.copyfile(evidence, dump)
 
 
 def _check_coverage(
     evidence: Path,
-    dump: Optional[str],
-    replay: Optional[str],
     events_dir: Path,
     events_before: set[Path],
     kernels: Optional[str],
 ) -> tuple[bool, Optional[str]]:
-    """Copy the dump back, then whether a launched kernel of interest has
-    delay points in the config; the reason when it does not."""
+    """Whether a launched kernel of interest has delay points in the attempt's
+    delay config; the reason when it does not."""
     if not evidence.is_file():
         return False, "CUTracer wrote no delay config"
-    if dump and not replay:
-        shutil.copyfile(evidence, dump)
     config = json.loads(evidence.read_text())
     launches = kernel_launches(sorted(_event_files(events_dir) - events_before))
     if covered(config, launches, kernels):
@@ -515,6 +520,8 @@ def run_oracle(options: OracleOptions) -> int:  # noqa: C901
             options.timeout_s,
         )
         outcome.update(child_exit=returncode, errors=errors)
+        if not options.plain:
+            _copy_dump_back(evidence, dump, replay)
         if errors:
             return finish(INCOMPLETE, "; ".join(errors))
         report = json.loads(report_path.read_text())
@@ -538,7 +545,7 @@ def run_oracle(options: OracleOptions) -> int:  # noqa: C901
             )
         if not options.plain:
             coverage, failure = _check_coverage(
-                evidence, dump, replay, events_dir, events_before, options.kernels
+                evidence, events_dir, events_before, options.kernels
             )
             outcome["coverage"] = coverage
             if failure is not None:
@@ -610,6 +617,8 @@ def run_cmd_oracle(options: CmdOptions) -> int:
             what="the command",
         )
         outcome.update(child_exit=returncode, errors=errors)
+        if not options.plain:
+            _copy_dump_back(evidence, dump, replay)
         if errors or returncode is None:
             return finish(
                 INCOMPLETE,
@@ -628,7 +637,7 @@ def run_cmd_oracle(options: CmdOptions) -> int:
         outcome["signature"] = sig
         if not options.plain:
             coverage, failure = _check_coverage(
-                evidence, dump, replay, events_dir, events_before, options.kernels
+                evidence, events_dir, events_before, options.kernels
             )
             outcome["coverage"] = coverage
             if failure is not None:

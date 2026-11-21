@@ -34,8 +34,6 @@ _FAKE_CMD = textwrap.dedent(
     """
     import json, os, sys, time
     script = json.loads(os.environ["FAKE_SCRIPT"])
-    if script.get("sleep"):
-        time.sleep(script["sleep"])
     if "signal" in script:
         os.kill(os.getpid(), script["signal"])
     dump = os.environ.get("CUTRACER_DELAY_DUMP_PATH")
@@ -48,6 +46,8 @@ _FAKE_CMD = textwrap.dedent(
         with open(os.path.join(out, name), "w") as fh:
             fh.write(json.dumps({"type": "kernel_launch", "kernel_name": "my_kernel",
                                  "kernel_checksum": "beef"}) + "\\n")
+    if script.get("sleep"):
+        time.sleep(script["sleep"])
     with open(os.environ["FAKE_SEEN"], "w") as fh:
         json.dump({"argv": sys.argv[1:], "dump": dump,
                    "load": os.environ.get("CUTRACER_DELAY_LOAD_PATH"),
@@ -178,9 +178,15 @@ class RunCmdOracleTest(_OracleTestCase):
         self.assertEqual(self.fx.run(injected, output_dir=None), INCOMPLETE)
 
     def test_a_command_past_its_timeout_is_incomplete(self) -> None:
+        requested = self.root / "requested.json"
         script = {"exit": 0, "sleep": 30, "config": _config(), "launch": True}
-        self.assertEqual(self.fx.run(script, timeout_s=0.5), INCOMPLETE)
+        code = self.fx.run(
+            script, timeout_s=3, env={"CUTRACER_DELAY_DUMP_PATH": str(requested)}
+        )
+        self.assertEqual(code, INCOMPLETE)
         self.assertIn("ran past", self.fx.outcome()["errors"][0])
+        # The command ran far enough to dump its delay config; the caller gets it.
+        self.assertEqual(json.loads(requested.read_text()), _config())
 
     def test_a_fail_pattern_must_match(self) -> None:
         matched = {
@@ -318,6 +324,7 @@ class RunCmdOracleTest(_OracleTestCase):
         self.assertEqual(code, REPRODUCED)
         seen = json.loads(self.fx.seen.read_text())
         self.assertIsNone(seen["dump"])
+        self.assertFalse((self.root / "x.json").exists())
         (attempt,) = (self.root / "evidence").glob("attempt-*")
         self.assertEqual(json.loads((attempt / "delay.json").read_text()), _config())
 
