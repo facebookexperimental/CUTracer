@@ -54,15 +54,31 @@ class CheckerTool(str, Enum):
 
 @dataclass(frozen=True)
 class RacecheckAccess:
-    """One access participating in a racecheck finding."""
+    """One access participating in a racecheck finding.
+
+    ``file``/``line`` are ``None`` when racecheck printed no source location,
+    which is what CUDA 13 does for kernels compiled without line info.
+    """
 
     role: str
     access_type: str
     function: str
     offset: str
-    file: str
-    line: int
+    file: Optional[str] = None
+    line: Optional[int] = None
     hazards: Optional[int] = None
+
+    @property
+    def site(self) -> str:
+        """``function+offset``, the identity racecheck always prints."""
+        return f"{self.function}+{self.offset}"
+
+    @property
+    def location(self) -> Optional[str]:
+        """``file:line`` when racecheck resolved one, else ``None``."""
+        if self.file is None or self.line is None:
+            return None
+        return f"{self.file}:{self.line}"
 
 
 @dataclass(frozen=True)
@@ -90,13 +106,22 @@ class RacecheckFinding:
 
     @property
     def locations(self) -> List[str]:
-        """Source locations in first-seen order."""
+        """Resolved source locations in first-seen order."""
         locations: List[str] = []
         for access in self.accesses:
-            location = f"{access.file}:{access.line}"
-            if location not in locations:
+            location = access.location
+            if location is not None and location not in locations:
                 locations.append(location)
         return locations
+
+    @property
+    def sites(self) -> List[str]:
+        """``function+offset`` sites in first-seen order."""
+        sites: List[str] = []
+        for access in self.accesses:
+            if access.site not in sites:
+                sites.append(access.site)
+        return sites
 
 
 @dataclass(frozen=True)
@@ -128,7 +153,12 @@ class RacecheckSummary:
 
 @dataclass(frozen=True)
 class RacecheckParseResult:
-    """Structured output from one racecheck log."""
+    """Structured output from one racecheck log.
+
+    ``unparsed_blocks`` counts race blocks the parser could not turn into a
+    whole finding: an unknown header format, an unparsable conflict line, or a
+    header without any conflict. Each one also sets a diagnostic.
+    """
 
     findings: List[RacecheckFinding]
     summary: Optional[RacecheckSummary] = None
@@ -136,6 +166,7 @@ class RacecheckParseResult:
     diagnostics: List[RacecheckParseDiagnostic] = field(default_factory=list)
     output_truncated: bool = False
     invalid_accesses: List[RacecheckInvalidAccess] = field(default_factory=list)
+    unparsed_blocks: int = 0
 
     @property
     def has_positive_signal(self) -> bool:
@@ -158,15 +189,15 @@ class RacecheckParseResult:
 # output can be interleaved without it and must not terminate an open block.
 _PREFIX = "========="
 
+# CUDA 13 racecheck prints no `in file:line` for kernels compiled without line
+# info (CuTe DSL by default), and demangled C++ names can contain spaces.
+_SITE = r"(?P<func>.+?)\+(?P<offset>0x[0-9a-fA-F]+)(?: in (?P<file>.+?):(?P<line>\d+))?"
+_ACCESS_SITE = r"(?P<type>\w+) access at " + _SITE
 _HEADER_RE = re.compile(
-    r"^(?P<level>Error|Warning): Race reported between "
-    r"(?P<type>\w+) access at (?P<func>\S+)\+(?P<offset>0x[0-9a-fA-F]+) "
-    r"in (?P<file>.+?):(?P<line>\d+)\s*$"
+    r"^(?P<level>Error|Warning): Race reported between " + _ACCESS_SITE + r"\s*$"
 )
 _CONFLICT_RE = re.compile(
-    r"^and (?P<type>\w+) access at (?P<func>\S+)\+(?P<offset>0x[0-9a-fA-F]+) "
-    r"in (?P<file>.+?):(?P<line>\d+)"
-    r"(?:\s*\[(?P<hazards>\d+) hazards?\])?\s*$"
+    r"^and " + _ACCESS_SITE + r"(?:\s*\[(?P<hazards>\d+) hazards?\])?\s*$"
 )
 _SUMMARY_RE = re.compile(
     r"^RACECHECK SUMMARY: (?P<total>\d+) hazards? displayed "
@@ -177,10 +208,8 @@ _INTERNAL_TOOL_ERROR_PREFIX = "Internal Sanitizer Error:"
 _INVALID_ACCESS_RE = re.compile(
     r"^Potential invalid __shared__ (?P<type>\w+) of size (?P<size>\d+) bytes\s*$"
 )
-_INVALID_SITE_RE = re.compile(
-    r"^at (?P<func>.+?)\+(?P<offset>0x[0-9a-fA-F]+)"
-    r"(?: in (?P<file>.+?):(?P<line>\d+))?\s*$"
-)
+_INVALID_SITE_RE = re.compile(r"^at " + _SITE + r"\s*$")
+_RACE_HEADER_TEXT = "Race reported between"
 
 # How many sanitizer lines after a message may still carry its ``at`` site.
 _SITE_LOOKAHEAD = 3
@@ -207,15 +236,18 @@ def _required(groups: Dict[str, Optional[str]], name: str) -> str:
     return value
 
 
-def _build_access(groups: Dict[str, Optional[str]], role: str) -> RacecheckAccess:
+def _build_access(
+    groups: Dict[str, Optional[str]], role: str, access_type: str
+) -> RacecheckAccess:
     hazards = groups.get("hazards")
+    line = groups.get("line")
     return RacecheckAccess(
         role=role,
-        access_type=_required(groups, "type"),
+        access_type=access_type,
         function=_required(groups, "func"),
         offset=_required(groups, "offset"),
-        file=_required(groups, "file"),
-        line=int(_required(groups, "line")),
+        file=groups.get("file"),
+        line=int(line) if line is not None else None,
         hazards=int(hazards) if hazards is not None else None,
     )
 
@@ -230,8 +262,11 @@ def _build_finding(
         if _required(header, "level") == "Error"
         else RacecheckSeverity.WARNING
     )
-    accesses = [_build_access(header, "primary")]
-    accesses.extend(_build_access(conflict, "conflict") for conflict in conflicts)
+    accesses = [_build_access(header, "primary", _required(header, "type"))]
+    accesses.extend(
+        _build_access(conflict, "conflict", _required(conflict, "type"))
+        for conflict in conflicts
+    )
     return RacecheckFinding(
         severity=severity,
         accesses=accesses,
@@ -246,18 +281,7 @@ def _build_invalid_access(
 ) -> RacecheckInvalidAccess:
     access_type = _required(groups, "type")
     size_bytes = int(_required(groups, "size"))
-    access: Optional[RacecheckAccess] = None
-    if site is not None:
-        line = site.get("line")
-        file = site.get("file")
-        access = RacecheckAccess(
-            role="primary",
-            access_type=access_type,
-            function=_required(site, "func"),
-            offset=_required(site, "offset"),
-            file=file if file is not None else "",
-            line=int(line) if line is not None else 0,
-        )
+    access = None if site is None else _build_access(site, "primary", access_type)
     return RacecheckInvalidAccess(
         message=(
             f"Potential invalid __shared__ {access_type} of size {size_bytes} bytes"
@@ -273,8 +297,16 @@ def _summary_consistency_diagnostics(
     summary: RacecheckSummary,
     findings: List[RacecheckFinding],
     invalid_accesses: List[RacecheckInvalidAccess],
+    output_truncated: bool,
 ) -> List[RacecheckParseDiagnostic]:
-    """Report contradictions between a parsed summary and finding blocks."""
+    """Report contradictions between a parsed summary and finding blocks.
+
+    When every hazard was displayed (no display cap, and the displayed total
+    covers the error and warning counts), a severity the summary counts must
+    have at least one parsed report: a block in a wording this parser does not
+    know is otherwise dropped without a trace. Racecheck bills invalid
+    accesses as errors.
+    """
     diagnostics: List[RacecheckParseDiagnostic] = []
     total_is_zero = summary.total_hazards == 0
     severities_are_zero = summary.errors == 0 and summary.warnings == 0
@@ -293,7 +325,28 @@ def _summary_consistency_diagnostics(
     )
     missing_report = summary_is_positive and not reported_anything
     unexpected_report = not summary_is_positive and reported_anything
-    if missing_report or unexpected_report or errors_mismatch or warnings_mismatch:
+    all_displayed = (
+        not output_truncated
+        and summary.total_hazards >= summary.errors + summary.warnings
+    )
+    missing_severity = all_displayed and (
+        (
+            summary.errors > 0
+            and not invalid_accesses
+            and not any(f.severity == RacecheckSeverity.ERROR for f in findings)
+        )
+        or (
+            summary.warnings > 0
+            and not any(f.severity == RacecheckSeverity.WARNING for f in findings)
+        )
+    )
+    if (
+        missing_report
+        or unexpected_report
+        or errors_mismatch
+        or warnings_mismatch
+        or missing_severity
+    ):
         diagnostics.append(RacecheckParseDiagnostic.SUMMARY_FINDING_MISMATCH)
     return diagnostics
 
@@ -311,10 +364,15 @@ class _RacecheckParser:
     raw_lines: List[str] = field(default_factory=list)
     pending_invalid: Optional[Dict[str, Optional[str]]] = None
     invalid_lookahead: int = 0
+    unparsed_blocks: int = 0
 
     def diagnose(self, issue: RacecheckParseDiagnostic) -> None:
         if issue not in self.diagnostics:
             self.diagnostics.append(issue)
+
+    def reject_block(self, issue: RacecheckParseDiagnostic) -> None:
+        self.unparsed_blocks += 1
+        self.diagnose(issue)
 
     def flush(self) -> None:
         if self.header is not None:
@@ -323,7 +381,7 @@ class _RacecheckParser:
                     _build_finding(self.header, self.conflicts, self.raw_lines)
                 )
             else:
-                self.diagnose(RacecheckParseDiagnostic.INCOMPLETE_FINDING)
+                self.reject_block(RacecheckParseDiagnostic.INCOMPLETE_FINDING)
         if self.pending_invalid is not None:
             self.invalid_accesses.append(
                 _build_invalid_access(self.pending_invalid, None, self.raw_lines)
@@ -367,7 +425,7 @@ class _RacecheckParser:
             return True
 
         if self.pending_invalid is not None:
-            if _HEADER_RE.match(body):
+            if _RACE_HEADER_TEXT in body:
                 self.flush()
                 return False
             site_match = _INVALID_SITE_RE.match(body)
@@ -412,9 +470,9 @@ class _RacecheckParser:
             self.raw_lines = [body]
             return
 
-        if "Race reported between" in body:
+        if _RACE_HEADER_TEXT in body:
             self.flush()
-            self.diagnose(RacecheckParseDiagnostic.UNPARSED_FINDING)
+            self.reject_block(RacecheckParseDiagnostic.UNPARSED_FINDING)
             return
 
         if self.header is None:
@@ -425,7 +483,11 @@ class _RacecheckParser:
             self.raw_lines.append(body)
             return
         if body.startswith("and ") and " access " in body:
-            self.diagnose(RacecheckParseDiagnostic.UNPARSED_FINDING)
+            # Keep the conflicts parsed so far; the block still is not whole.
+            self.raw_lines.append(body)
+            self.reject_block(RacecheckParseDiagnostic.UNPARSED_FINDING)
+            if not self.conflicts:
+                self.header = None
         self.flush()
 
     def finish(self) -> RacecheckParseResult:
@@ -440,6 +502,7 @@ class _RacecheckParser:
                 self.summary,
                 self.findings,
                 self.invalid_accesses,
+                self.output_truncated,
             ):
                 self.diagnose(issue)
         return RacecheckParseResult(
@@ -448,6 +511,7 @@ class _RacecheckParser:
             diagnostics=self.diagnostics,
             output_truncated=self.output_truncated,
             invalid_accesses=self.invalid_accesses,
+            unparsed_blocks=self.unparsed_blocks,
         )
 
 
@@ -783,8 +847,8 @@ def _racecheck_as_checker_result(text: str) -> CheckerParseResult:
                         CheckerSite(
                             symbol=access.function,
                             offset=access.offset,
-                            file=access.file or None,
-                            line=access.line or None,
+                            file=access.file,
+                            line=access.line,
                         )
                     ]
                 ),

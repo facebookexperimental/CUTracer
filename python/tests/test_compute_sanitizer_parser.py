@@ -330,6 +330,180 @@ class ComputeSanitizerParserTest(unittest.TestCase):
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(result.findings[0].accesses[0].function, "kernel")
 
+    def test_cuda13_sites_without_source_location_parse(self) -> None:
+        # CUDA 13 racecheck on a kernel built without line info prints no
+        # `in file:line`; these headers used to be dropped as unparsed.
+        text = (
+            "========= Error: Race reported between Read access at "
+            "_cute_gemm_kernel+0x5960\n"
+            "=========     and Write access at _cute_gemm_kernel+0x2340 "
+            "[116 hazards]\n"
+            "=========     and Write access at _cute_gemm_kernel+0x2350 "
+            "[116 hazards]\n"
+            "========= \n"
+            "========= Warning: Race reported between Read access at "
+            "_cute_gemm_kernel+0x2530\n"
+            "=========     and Write access at _cute_gemm_kernel+0x2790 "
+            "[8 hazards]\n"
+            "========= RACECHECK SUMMARY: 2 hazards displayed "
+            "(1 error, 1 warning)\n"
+        )
+        result = parse_racecheck_log(text)
+        self.assertTrue(result.is_complete)
+        self.assertEqual(result.unparsed_blocks, 0)
+        error, warning = result.findings
+        self.assertEqual(error.severity, RacecheckSeverity.ERROR)
+        self.assertEqual(error.max_hazards, 116)
+        self.assertEqual(error.locations, [])
+        self.assertEqual(
+            error.sites,
+            [
+                "_cute_gemm_kernel+0x5960",
+                "_cute_gemm_kernel+0x2340",
+                "_cute_gemm_kernel+0x2350",
+            ],
+        )
+        self.assertIsNone(error.accesses[0].file)
+        self.assertIsNone(error.accesses[0].line)
+        self.assertEqual(warning.severity, RacecheckSeverity.WARNING)
+        checker = parse_checker_log(CheckerTool.RACECHECK, text)
+        self.assertEqual(
+            [site.location for site in checker.issues[0].sites], [None, None, None]
+        )
+
+    def test_demangled_function_name_with_spaces_parses(self) -> None:
+        text = (
+            "========= Error: Race reported between Write access at "
+            "void add<float>(float *, int)+0x1d0 in /src/my kernels/add.cu:12\n"
+            "========= and Read access at void add<float>(float *, int)+0x200 "
+            "in /src/my kernels/add.cu:14 [3 hazards]\n"
+            "========= RACECHECK SUMMARY: 1 hazard displayed "
+            "(1 error, 0 warnings)\n"
+        )
+        result = parse_racecheck_log(text)
+        self.assertTrue(result.is_complete)
+        primary = result.findings[0].accesses[0]
+        self.assertEqual(
+            (primary.function, primary.offset, primary.file, primary.line),
+            ("void add<float>(float *, int)", "0x1d0", "/src/my kernels/add.cu", 12),
+        )
+
+    def test_demangled_function_name_containing_plus_hex_parses(self) -> None:
+        # Sites are anchored at the line end, so the name extends to the last
+        # `+0x` that leaves a valid site.
+        name = "void scale<(char *)+0x10>(int)"
+        text = (
+            f"========= Error: Race reported between Write access at {name}+0x1d0\n"
+            f"========= and Read access at {name}+0x200 in /src/k.cu:14 [3 hazards]\n"
+            "========= RACECHECK SUMMARY: 1 hazard displayed "
+            "(1 error, 0 warnings)\n"
+        )
+        result = parse_racecheck_log(text)
+        self.assertTrue(result.is_complete)
+        self.assertEqual(
+            [
+                (a.function, a.offset, a.file, a.line)
+                for a in result.findings[0].accesses
+            ],
+            [(name, "0x1d0", None, None), (name, "0x200", "/src/k.cu", 14)],
+        )
+
+    def test_every_block_that_is_not_parsed_whole_is_counted(self) -> None:
+        header = (
+            "========= Error: Race reported between Read access at "
+            "kernel+0x100 in test.py:7\n"
+        )
+        conflict = (
+            "========= and Write access at kernel+0x200 in test.py:9 [1 hazard]\n"
+        )
+        bad_conflict = "========= and Write access at an unknown site\n"
+        summary = (
+            "========= RACECHECK SUMMARY: 2 hazards displayed (2 errors, 0 warnings)\n"
+        )
+        cases = (
+            # (log, findings kept, unparsed blocks)
+            ("========= Error: Race reported between two things\n" * 2, 0, 2),
+            (header + header + conflict, 1, 1),
+            (header + conflict + bad_conflict, 1, 1),
+            (header + bad_conflict + conflict, 0, 1),
+        )
+        for text, findings, unparsed in cases:
+            with self.subTest(text=text):
+                result = parse_racecheck_log(text + summary)
+                self.assertEqual(len(result.findings), findings)
+                self.assertEqual(result.unparsed_blocks, unparsed)
+                self.assertFalse(result.is_complete)
+
+    def test_summary_severity_without_a_parsed_report_is_inconsistent(self) -> None:
+        # A block in a wording the parser does not know leaves no other trace.
+        warning_block = (
+            "========= Warning: Race reported between Read access at k+0x10\n"
+            "========= and Write access at k+0x20 [8 hazards]\n"
+        )
+        unknown_error = (
+            "========= Error: Data race between Read access at k+0x30\n"
+            "========= and Write access at k+0x40 [116 hazards]\n"
+        )
+        summary = (
+            "========= RACECHECK SUMMARY: 2 hazards displayed (1 error, 1 warning)\n"
+        )
+        result = parse_racecheck_log(warning_block + unknown_error + summary)
+        self.assertIn(
+            RacecheckParseDiagnostic.SUMMARY_FINDING_MISMATCH, result.diagnostics
+        )
+        self.assertFalse(result.is_complete)
+        capped = parse_racecheck_log(
+            warning_block
+            + "========= Warning: Maximum number of hazards reached\n"
+            + summary
+        )
+        self.assertTrue(capped.is_complete)
+
+    def test_race_header_after_an_invalid_access_without_site_is_counted(
+        self,
+    ) -> None:
+        text = (
+            "========= Potential invalid __shared__ read of size 8 bytes\n"
+            "========= Error: Race reported between two accesses somewhere\n"
+            "========= RACECHECK SUMMARY: 2 hazards displayed "
+            "(2 errors, 0 warnings)\n"
+        )
+        result = parse_racecheck_log(text)
+        self.assertEqual(len(result.invalid_accesses), 1)
+        self.assertEqual(result.unparsed_blocks, 1)
+        self.assertFalse(result.is_complete)
+
+    def test_header_without_conflicts_counts_once_whatever_follows(self) -> None:
+        header = "========= Error: Race reported between Read access at k+0x10\n"
+        followers = {
+            "summary": "",
+            "invalid access": (
+                "========= Potential invalid __shared__ read of size 8 bytes\n"
+                "=========     at k+0x20\n"
+            ),
+            "display cap": "========= Warning: Maximum number of hazards reached\n",
+            "internal error": "========= Internal Sanitizer Error: failed\n",
+        }
+        summary = (
+            "========= RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)\n"
+        )
+        for name, follower in followers.items():
+            with self.subTest(follower=name):
+                result = parse_racecheck_log(header + follower + summary)
+                self.assertEqual(result.unparsed_blocks, 1)
+                self.assertEqual(result.findings, [])
+        self.assertEqual(parse_racecheck_log(header).unparsed_blocks, 1)
+
+    def test_partly_parsed_block_keeps_the_bad_line_in_its_raw_block(self) -> None:
+        text = (
+            "========= Error: Race reported between Read access at k+0x10\n"
+            "========= and Write access at k+0x20 [1 hazard]\n"
+            "========= and Write access at an unknown site\n"
+        )
+        finding = parse_racecheck_log(text).findings[0]
+        self.assertEqual(len(finding.accesses), 2)
+        self.assertIn("an unknown site", finding.raw_block)
+
 
 class CheckerLayerTest(unittest.TestCase):
     """The tool-agnostic projection used by evidence conversion."""
