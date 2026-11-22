@@ -24,13 +24,18 @@ from cutracer.stress.stress import (
     _barrier_targets,
     _baseline_from_runs,
     _BaselineResult,
+    _CONTROL_REPRODUCED,
     _delay_patterns,
     _isolate_by,
     _pdl_hold_reason,
     _pdl_skip_reason,
     _PdlEvidence,
+    _plain_failure,
+    _plain_outcome,
+    _PlainRun,
     _remaining_s,
     _run_baseline,
+    _run_plain,
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
     ATTRIBUTION_NO_BASELINE,
@@ -103,6 +108,8 @@ class PlanResult:
     elapsed_s: float
     # One entry per control arm: the modes it served and its counts.
     baselines: List[Dict[str, Any]] = field(default_factory=list)
+    # The plain oracle's one run, which every mode shares; None without one.
+    plain: Optional[Dict[str, Any]] = None
 
     @property
     def triggering_run(self) -> Optional[ModeRun]:
@@ -158,9 +165,13 @@ class PlanResult:
                     "baseline_timed_out",
                     "baseline_infra_errors",
                     "baseline_hangs",
+                    "plain_requested",
+                    "plain_outcome",
+                    "plain_returncode",
                 )
             },
             "baselines": list(self.baselines),
+            "plain": self.plain,
             "modes": [run.to_dict() for run in self.runs],
         }
 
@@ -387,6 +398,21 @@ def plan_verdict(runs: Sequence[ModeRun]) -> Verdict:
     )
 
 
+def _with_plain(
+    verdict: Verdict, config: StressConfig, plain: Optional[_PlainRun]
+) -> Verdict:
+    """`verdict` with the plain oracle's run folded in. Every mode that ran
+    already counts it; this covers a plan in which none did."""
+    outcome = _plain_outcome(config, plain)
+    if outcome == _CONTROL_REPRODUCED and verdict.status != VERDICT_SUSPECT:
+        reason = "the plain oracle reproduced the bug without CUTracer"
+        return Verdict(VERDICT_SUSPECT, [reason, *verdict.reasons])
+    failure = _plain_failure(outcome, None if plain is None else plain.returncode)
+    if failure is not None and verdict.status == VERDICT_CLEAN:
+        return Verdict(VERDICT_INCOMPLETE, [failure, *verdict.reasons])
+    return verdict
+
+
 def _baseline_summary(
     modes: Sequence[str], baseline: _BaselineResult, log_path: Optional[str]
 ) -> Dict[str, Any]:
@@ -440,9 +466,22 @@ def run_stress_plan(  # noqa: C901
     """
     if not configs:
         raise ValueError("a stress plan needs at least one mode")
+    if any(c.plain_oracle_argv != configs[0].plain_oracle_argv for c in configs):
+        raise ValueError("the modes of a stress plan share one plain oracle")
     os.makedirs(output_dir, exist_ok=True)
     started = time.monotonic()
     deadline = None if budget_s is None else started + budget_s
+    plain = _run_plain(configs[0], runner=runner, deadline=deadline)
+    plain_summary: Optional[Dict[str, Any]] = None
+    if plain is not None:
+        plain_log = os.path.join(output_dir, "plain.log")
+        with open(plain_log, "w") as output:
+            output.write(plain.log)
+        plain_summary = {
+            "argv": list(configs[0].plain_oracle_argv or []),
+            "returncode": plain.returncode,
+            "log_path": plain_log,
+        }
     runs = [ModeRun(config) for config in configs]
     named = [run.mode for run in runs] if named_modes is None else named_modes
     members: Dict[tuple[Any, ...], List[ModeRun]] = {}
@@ -512,6 +551,7 @@ def run_stress_plan(  # noqa: C901
             runner=runner,
             baseline=baseline,
             deadline=deadline,
+            plain=plain,
         )
         run.status = MODE_RAN
         save_report(run.result, run.report_path)
@@ -528,8 +568,9 @@ def run_stress_plan(  # noqa: C901
             _record_pdl_check(run, (MODE_NOT_RUN, later), named)
     return PlanResult(
         runs=runs,
-        verdict=plan_verdict(runs),
+        verdict=_with_plain(plan_verdict(runs), configs[0], plain),
         budget_s=budget_s,
         elapsed_s=time.monotonic() - started,
         baselines=summaries,
+        plain=plain_summary,
     )

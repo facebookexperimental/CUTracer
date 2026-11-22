@@ -185,8 +185,8 @@ Every report carries a `verdict`, with `reasons`:
 
 | `verdict.status` | Meaning |
 |------------------|---------|
-| `finding` | An attempt reproduced the bug, and neither the control arm nor an attempt that injected nothing did, so the injected delay made the difference |
-| `suspect` | The bug reproduced, but not attributably to a delay: it also reproduced with injection disabled, in an attempt that injected nothing, or without a complete control arm. In a search over several modes, one suspect mode makes the whole search `suspect`, even when another mode has a finding |
+| `finding` | An attempt reproduced the bug, and neither the plain oracle (`--plain-oracle`), the control arm nor an attempt that injected nothing did, so the injected delay made the difference |
+| `suspect` | The bug reproduced, but not attributably to a delay: it also reproduced without CUTracer (the plain oracle), with injection disabled, in an attempt that injected nothing, or without a complete control arm or plain run. In a search over several modes, one suspect mode makes the whole search `suspect`, even when another mode has a finding |
 | `clean` | Every planned attempt ran and measured something (no infra error, timeout or unexplained hang), after a complete control arm, and nothing reproduced. It covers only the attempts made; a search with several modes lists a mode it could not test and that `--strategy` did not name, as `<mode>: skipped: <reason>` |
 | `incomplete` | Anything else, including a mode that did not run and a search the budget cut short |
 
@@ -194,7 +194,8 @@ Every report carries a `verdict`, with `reasons`:
 
 The exit code stays 0 whenever the search itself ran; read the report for the outcome.
 
-Two oracle rules:
+Three oracle rules:
+- An oracle that compares floating-point outputs bitwise fails on its own when the kernel's result varies from launch to launch (fp32 atomics or bulk reduce-adds that land in no fixed order), often at a rate of about 1% that a few control runs miss, and the search then credits those failures to the delay. Give such an oracle `--plain-oracle '<command>'`: a command that runs the workload without CUTracer, many times in one process, and exits like the oracle (the oracle with an iteration count, or `cutracer oracle cmd --plain ...`). It runs once before the control arm (once per search with several modes); if it reproduces, the attribution is `natural` and the verdict `suspect`. Reports record `plain_requested`, `plain_outcome` (`reproduced`, `completed`, `timed_out` or `infra_error`) and `plain_returncode`, and its output goes to `stress.log`, or `plain.log` for a search with several modes. Then compare with a tolerance or make the kernel deterministic.
 - Let CUTracer's kernel timeout end a hang (`--kernel-timeout-s`, `--hang-is-bug`). An oracle that exits 0 when its own timeout fires turns any slowdown into a reproduction in every mode, and must not be used with the default plan.
 - CUTracer prints its launch lines to the program's stdout, where they can interleave mid-line with the program's own output. Do not grep stdout for a line that starts with a marker (`^RESULT`); write the program's verdict to a file or match it anywhere in a line.
 

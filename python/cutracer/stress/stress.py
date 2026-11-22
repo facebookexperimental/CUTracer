@@ -325,6 +325,15 @@ class StressConfig:
     # where a human reads a verdict, while programmatic callers (the service)
     # own their own budget and should opt in explicitly.
     baseline_runs: int = 0
+    # A command that runs the workload without CUTracer and exits like the
+    # oracle (0 when the bug reproduced). It runs once, before the control
+    # arm, and can loop over many launches in one process, which control
+    # runs (one instrumented process each) cannot afford: an oracle that
+    # compares outputs bitwise fails on a kernel whose result varies from
+    # launch to launch (an unordered floating-point reduction) at a rate a
+    # few control runs miss, and the search would credit those failures to
+    # the delay. None: no plain run.
+    plain_oracle_argv: Optional[List[str]] = None
     output_dir: str = "."
     timeout: int = 1800
     # CUTracer's per-kernel timeout for every run (0 = off). random_delay sends
@@ -409,6 +418,8 @@ class StressConfig:
             raise ValueError("warpgroup_ids must be in [0, 8)")
         if self.baseline_runs < 0:
             raise ValueError(f"baseline_runs must be >= 0, got {self.baseline_runs}")
+        if self.plain_oracle_argv is not None and not self.plain_oracle_argv:
+            raise ValueError("plain_oracle_argv must name a command")
         if self.kernel_timeout_s < 0:
             raise ValueError(
                 f"kernel_timeout_s must be >= 0, got {self.kernel_timeout_s}"
@@ -549,6 +560,12 @@ class StressResult:
     baseline_infra_errors: int = 0
     baseline_hangs: int = 0
     attribution: str = ATTRIBUTION_NO_BASELINE
+    # The plain oracle's run (`StressConfig.plain_oracle_argv`): how the oracle
+    # contract counted it (a `_CONTROL_*` outcome) and its exit code (None when
+    # it timed out or did not start); all unset without a plain oracle.
+    plain_requested: bool = False
+    plain_outcome: Optional[str] = None
+    plain_returncode: Optional[int] = None
 
     @property
     def baseline_rate(self) -> float:
@@ -623,6 +640,9 @@ class StressResult:
             "baseline_infra_errors": self.baseline_infra_errors,
             "baseline_hangs": self.baseline_hangs,
             "baseline_rate": self.baseline_rate,
+            "plain_requested": self.plain_requested,
+            "plain_outcome": self.plain_outcome,
+            "plain_returncode": self.plain_returncode,
             "attribution": self.attribution,
             "triggering_config": (
                 None if self.triggering is None else self.triggering.to_dict()
@@ -762,6 +782,32 @@ def _record_rejected_config(
     paths[:] = retained
 
 
+def _run_log(
+    header: str,
+    *,
+    returncode: Optional[int] = None,
+    stdout: str = "",
+    stderr: str = "",
+    error: str = "",
+    watchdog: Sequence[str] = (),
+    late_writes: Sequence[str] = (),
+) -> str:
+    sections = [header]
+    if returncode is not None:
+        sections.append(f"returncode={returncode}")
+    if stdout:
+        sections.extend(("--- stdout ---", stdout))
+    if stderr:
+        sections.extend(("--- stderr ---", stderr))
+    if watchdog:
+        sections.extend(("--- CUTracer watchdog ---", *watchdog))
+    if late_writes:
+        sections.extend(("--- CUTracer exit quarantine ---", *late_writes))
+    if error:
+        sections.extend(("--- error ---", error))
+    return "\n".join(sections)
+
+
 def _attempt_log(
     *,
     delay_ns: int,
@@ -779,22 +825,15 @@ def _attempt_log(
         placement = f"target={target.label()}"
     else:
         placement = f"warpgroup={'all' if warpgroup is None else warpgroup}"
-    sections = [
+    return _run_log(
         f"=== delay_ns={delay_ns} {placement} attempt={attempt} ===",
-    ]
-    if returncode is not None:
-        sections.append(f"returncode={returncode}")
-    if stdout:
-        sections.extend(("--- stdout ---", stdout))
-    if stderr:
-        sections.extend(("--- stderr ---", stderr))
-    if watchdog:
-        sections.extend(("--- CUTracer watchdog ---", *watchdog))
-    if late_writes:
-        sections.extend(("--- CUTracer exit quarantine ---", *late_writes))
-    if error:
-        sections.extend(("--- error ---", error))
-    return "\n".join(sections)
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        error=error,
+        watchdog=watchdog,
+        late_writes=late_writes,
+    )
 
 
 def _no_data_timeout_s(config: StressConfig) -> int:
@@ -2634,14 +2673,78 @@ def _run_baseline(
     )
 
 
+@dataclass(frozen=True)
+class _PlainRun:
+    """The plain oracle's one run: its exit code (None when it timed out or
+    did not start) and its log."""
+
+    returncode: Optional[int]
+    log: str
+
+
+def _plain_outcome(config: StressConfig, run: Optional[_PlainRun]) -> Optional[str]:
+    """How `config`'s oracle contract counts the plain run (a `_CONTROL_*`
+    outcome); None without one. It runs without CUTracer, so no watchdog can
+    end a hang in it."""
+    if run is None:
+        return None
+    return _control_outcome(config, _BaselineRun(run.returncode, hung=False))
+
+
+def _run_plain(
+    config: StressConfig,
+    *,
+    runner: Optional[RunTarget],
+    deadline: Optional[float] = None,
+) -> Optional[_PlainRun]:
+    """Run `config.plain_oracle_argv` once, without CUTracer; None when the
+    config has no plain oracle. It does not start with less than
+    `MIN_RUN_BUDGET_S` left before `deadline`, which leaves it without a
+    sample."""
+    if config.plain_oracle_argv is None:
+        return None
+    header = "=== plain oracle (no CUTracer) ==="
+    remaining = _remaining_s(deadline)
+    if remaining is not None and remaining < MIN_RUN_BUDGET_S:
+        return _PlainRun(
+            None, _run_log(header, error="not started: the time budget ran out")
+        )
+    env = dict(os.environ if config.base_env is None else config.base_env)
+    # An injection inherited from the caller would instrument the run.
+    env.pop("CUDA_INJECTION64_PATH", None)
+    try:
+        proc = (runner or run_process_group)(
+            list(config.plain_oracle_argv),
+            env=env,
+            cwd=config.cwd,
+            timeout=_run_timeout(config, remaining),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _PlainRun(None, _run_log(header, error=f"timed out: {exc}"))
+    log = _run_log(
+        header,
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+    )
+    return _PlainRun(proc.returncode, log)
+
+
 def _attribution(
     *,
     baseline_requested: int,
     baseline_completed: int,
     baseline_reproductions: int,
     triggering: object,
+    plain_outcome: Optional[str] = None,
 ) -> str:
     """Classify what a reproduction can be credited to."""
+    if plain_outcome == _CONTROL_REPRODUCED:
+        # The program fails without CUTracer at all.
+        return ATTRIBUTION_NATURAL
     if baseline_requested == 0:
         return ATTRIBUTION_NO_BASELINE
     if baseline_reproductions > 0:
@@ -2652,7 +2755,10 @@ def _attribution(
         # DID reproduce is positive evidence, and stays the stronger answer even
         # if its siblings never finished.
         return ATTRIBUTION_NATURAL
-    if baseline_completed < baseline_requested:
+    if baseline_completed < baseline_requested or plain_outcome in (
+        _CONTROL_TIMED_OUT,
+        _CONTROL_INFRA_ERROR,
+    ):
         # A control arm was asked for and did not deliver. "0 of 3 control runs
         # produced a sample" is not the same claim as "no control was wanted",
         # and it must not be reported as one.
@@ -2678,7 +2784,22 @@ class Verdict:
         return {"status": self.status, "reasons": list(self.reasons)}
 
 
+def _plain_failure(outcome: Optional[str], returncode: Optional[int]) -> Optional[str]:
+    """Why the plain oracle's run produced no sample; None when it did or there
+    was none."""
+    if outcome == _CONTROL_TIMED_OUT:
+        return "the plain oracle timed out or did not start"
+    if outcome == _CONTROL_INFRA_ERROR:
+        return (
+            f"the plain oracle exited with {returncode}, which the oracle "
+            "contract does not cover"
+        )
+    return None
+
+
 def _unattributed_reason(result: StressResult) -> str:
+    if result.plain_outcome == _CONTROL_REPRODUCED:
+        return "the plain oracle reproduced the bug without CUTracer"
     if result.baseline_reproductions:
         return (
             f"the control arm reproduced {result.baseline_reproductions} of "
@@ -2691,6 +2812,11 @@ def _unattributed_reason(result: StressResult) -> str:
         )
     if result.attribution == ATTRIBUTION_NO_BASELINE:
         return "reproduced, but no control arm ran"
+    plain_failure = _plain_failure(result.plain_outcome, result.plain_returncode)
+    if plain_failure is not None and (
+        result.baseline_completed >= result.baseline_requested
+    ):
+        return f"reproduced, but {plain_failure}"
     return (
         f"reproduced, but only {result.baseline_completed} of "
         f"{result.baseline_requested} control run(s) produced a sample"
@@ -2699,6 +2825,9 @@ def _unattributed_reason(result: StressResult) -> str:
 
 def _incomplete_reasons(result: StressResult) -> List[str]:
     reasons: List[str] = []
+    plain_failure = _plain_failure(result.plain_outcome, result.plain_returncode)
+    if plain_failure is not None:
+        reasons.append(plain_failure)
     if result.baseline_completed < result.baseline_requested:
         reasons.append(
             f"only {result.baseline_completed} of {result.baseline_requested} "
@@ -2728,15 +2857,17 @@ def _incomplete_reasons(result: StressResult) -> List[str]:
 def result_verdict(result: StressResult) -> Verdict:
     """Classify one search.
 
-    - finding: an attempt reproduced the bug, and neither the control arm nor
-      an attempt that injected nothing did, so the injected delay is what made
-      the difference.
+    - finding: an attempt reproduced the bug, and neither the plain oracle,
+      the control arm nor an attempt that injected nothing did, so the
+      injected delay is what made the difference.
     - suspect: the bug reproduced, but not attributably to an injected delay:
-      it also reproduced with injection disabled, or in an attempt that
-      injected nothing, or without a complete control arm.
+      it also reproduced without CUTracer (the plain oracle), with injection
+      disabled, or in an attempt that injected nothing, or without a complete
+      control arm.
     - clean: every planned attempt ran and measured something (no infra error,
-      timeout or unexplained hang), after a complete control arm if one was
-      requested, and nothing reproduced. It covers only the attempts made.
+      timeout or unexplained hang), after a complete control arm and plain run
+      if they were requested, and nothing reproduced. It covers only the
+      attempts made.
     - incomplete: anything else.
     """
     triggering = result.triggering
@@ -2753,6 +2884,7 @@ def result_verdict(result: StressResult) -> Verdict:
         triggering is not None
         or result.baseline_reproductions
         or result.unattributed_reproductions
+        or result.plain_outcome == _CONTROL_REPRODUCED
     ):
         return Verdict(VERDICT_SUSPECT, [_unattributed_reason(result)])
     reasons = _incomplete_reasons(result)
@@ -2777,6 +2909,7 @@ def run_stress(  # noqa: C901
     runner: Optional[RunTarget] = None,
     baseline: Optional[_BaselineResult] = None,
     deadline: Optional[float] = None,
+    plain: Optional[_PlainRun] = None,
 ) -> StressResult:
     """Run the planned attempts (see `_trial_schedule`) until the oracle reproduces.
 
@@ -2788,7 +2921,9 @@ def run_stress(  # noqa: C901
 
     `baseline` is a control arm that already ran with this search's
     instrumentation (see `cutracer.stress.plan`); it is counted under this
-    search's oracle contract instead of running the control arm again. No
+    search's oracle contract instead of running the control arm again. `plain`
+    is likewise the plain oracle's run when the caller already ran it; else a
+    search that does not resume runs it before its control arm. No
     attempt starts with less than `MIN_RUN_BUDGET_S` left before `deadline`
     (a `time.monotonic()` value); the result then says `budget_exhausted`.
 
@@ -2807,6 +2942,8 @@ def run_stress(  # noqa: C901
     checks_pdl = (
         baseline is None and resume is None and get_mode(config.strategy).needs_pdl
     )
+    # The plain run's log goes into this search's log only when it ran here.
+    plain_logs: List[str] = []
     if baseline is not None:
         if resume is not None:
             raise ValueError("a shared control arm cannot resume a search")
@@ -2820,6 +2957,9 @@ def run_stress(  # noqa: C901
             barriers=baseline.barriers,
         )
     elif resume is None:
+        if plain is None:
+            plain = _run_plain(config, runner=runner, deadline=deadline)
+            plain_logs = [] if plain is None else [plain.log]
         baseline = _run_baseline(
             config, cutracer_so=cutracer_so, runner=runner, deadline=deadline
         )
@@ -2833,15 +2973,23 @@ def run_stress(  # noqa: C901
             logs=[],
             hangs=resume.baseline_hangs,
         )
+    if resume is None:
+        plain_requested = plain is not None
+        plain_outcome = _plain_outcome(config, plain)
+        plain_returncode = None if plain is None else plain.returncode
+    else:
+        plain_requested = resume.plain_requested
+        plain_outcome = resume.plain_outcome
+        plain_returncode = resume.plain_returncode
     log_path: Optional[str] = None
     log_size_bytes = 0
     if resume is None:
         # Written before target discovery can raise: the control arm's logs
         # are what explain a launch that has nothing to isolate.
         log_path, log_size_bytes = _prepare_stress_log(config.output_dir, None)
-        if baseline.logs:
+        if plain_logs or baseline.logs:
             log_path, log_size_bytes = _write_stress_log(
-                config.output_dir, "\n".join(baseline.logs), append=False
+                config.output_dir, "\n".join(plain_logs + baseline.logs), append=False
             )
     elif (
         resume.isolate_by is not None and resume.isolate_by != _isolate_by(config)
@@ -2997,7 +3145,11 @@ def run_stress(  # noqa: C901
                 baseline_completed=baseline.completed,
                 baseline_reproductions=baseline.reproductions,
                 triggering=triggering,
+                plain_outcome=plain_outcome,
             ),
+            plain_requested=plain_requested,
+            plain_outcome=plain_outcome,
+            plain_returncode=plain_returncode,
             log_size_bytes=log_size_bytes if log_path is not None else None,
             rejected_config_paths=list(rejected_config_paths),
             strategy=config.strategy,
@@ -3089,7 +3241,11 @@ def run_stress(  # noqa: C901
             baseline_completed=baseline.completed,
             baseline_reproductions=baseline.reproductions,
             triggering=triggering,
+            plain_outcome=plain_outcome,
         ),
+        plain_requested=plain_requested,
+        plain_outcome=plain_outcome,
+        plain_returncode=plain_returncode,
         log_size_bytes=log_size_bytes if log_path is not None else None,
         rejected_config_paths=list(rejected_config_paths),
         strategy=config.strategy,

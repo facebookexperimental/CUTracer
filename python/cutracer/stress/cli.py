@@ -29,6 +29,10 @@ from cutracer.stress.confirm import (
 from cutracer.stress.modes import get_mode, get_modes, StressMode
 from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
 from cutracer.stress.stress import (
+    _CONTROL_REPRODUCED,
+    _plain_failure,
+    _plain_outcome,
+    _PlainRun,
     _triggering_target,
     ATTRIBUTION_BASELINE_INCOMPLETE,
     ATTRIBUTION_NATURAL,
@@ -311,6 +315,18 @@ def _strategy_help() -> str:
     "report says so. 0 skips the control and leaves attribution unproven.",
 )
 @click.option(
+    "--plain-oracle",
+    default=None,
+    metavar="COMMAND",
+    help="A command (shell words) that runs the workload without CUTracer and "
+    "exits like the oracle, run once before the control arm. Let it loop over "
+    "many launches in one process (for example the oracle with an iteration "
+    "count): an oracle that compares floating-point outputs bitwise fails on a "
+    "kernel whose result varies from launch to launch, such as an unordered "
+    "reduction, at a rate a few control runs miss. If it reproduces, the "
+    "verdict is suspect.",
+)
+@click.option(
     "--stop-on-first/--no-stop-on-first",
     default=True,
     show_default=True,
@@ -401,6 +417,7 @@ def stress_command(  # noqa: C901
     stop_on_first: bool,
     not_interesting_exit_codes: str,
     baseline_runs: int,
+    plain_oracle: str | None,
     kernel_filters: str | None,
     output_dir: str,
     dump_path: str | None,
@@ -473,14 +490,18 @@ def stress_command(  # noqa: C901
         if isolate_warps:
             flags[STRATEGY_ISOLATE]["isolate_warps"] = _parse_int_ranges(isolate_warps)
         not_interesting = _parse_int_list(not_interesting_exit_codes)
+        plain_argv = None if plain_oracle is None else shlex.split(plain_oracle)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
+    if plain_argv == []:
+        raise click.UsageError("--plain-oracle names no command")
     overrides = _parse_mode_options(mode_options, modes)
     shared: dict[str, Any] = {
         "oracle_argv": list(oracle),
         "stop_on_first": stop_on_first,
         "not_interesting_exit_codes": not_interesting,
         "baseline_runs": baseline_runs,
+        "plain_oracle_argv": plain_argv,
         "kernel_filters": kernel_filters,
         "timeout": timeout,
     }
@@ -533,6 +554,10 @@ def stress_command(  # noqa: C901
     # Exit 0 whenever the search itself ran; callers read the report/config to
     # learn whether the bug reproduced (a non-zero exit means the search failed).
     sys.exit(0)
+
+
+def _plain_line(config: StressConfig) -> str:
+    return "1 plain (no CUTracer) + " if config.plain_oracle_argv else ""
 
 
 def _plan_line(config: StressConfig) -> str:
@@ -597,7 +622,8 @@ def _run_single(
     oracle: tuple[str, ...],
 ) -> None:
     click.echo(
-        f"Running stress ({config.strategy}): {config.baseline_runs} baseline + "
+        f"Running stress ({config.strategy}): {_plain_line(config)}"
+        f"{config.baseline_runs} baseline + "
         f"{_plan_line(config)} -- {' '.join(config.oracle_argv)}",
         err=True,
     )
@@ -646,7 +672,10 @@ def _echo_notes(config: StressConfig, result: StressResult) -> None:
             err=True,
         )
 
-    if result.attribution == ATTRIBUTION_NATURAL:
+    plain_failure = _plain_failure(result.plain_outcome, result.plain_returncode)
+    if result.plain_outcome == _CONTROL_REPRODUCED:
+        _echo_plain_reproduction(result.plain_returncode)
+    elif result.attribution == ATTRIBUTION_NATURAL:
         click.echo(
             f"WARNING: the control arm reproduced {result.baseline_reproductions}/"
             f"{result.baseline_completed} times with injection DISABLED. This "
@@ -654,6 +683,17 @@ def _echo_notes(config: StressConfig, result: StressResult) -> None:
             f"the injected delay. Any triggering config is a coincidence until "
             f"shown otherwise -- reduce it, or compare its failure magnitude "
             f"against the baseline.",
+            err=True,
+        )
+    elif result.attribution == ATTRIBUTION_BASELINE_INCOMPLETE and (
+        plain_failure is not None
+        and result.baseline_completed >= result.baseline_requested
+    ):
+        click.echo(
+            f"WARNING: {plain_failure}, so the program's failure rate without "
+            f"CUTracer is unmeasured and nothing found here is corroborated. Fix "
+            f"the plain oracle (--timeout, --not-interesting-exit-codes) and "
+            f"re-run.",
             err=True,
         )
     elif result.attribution == ATTRIBUTION_BASELINE_INCOMPLETE:
@@ -686,6 +726,17 @@ def _echo_notes(config: StressConfig, result: StressResult) -> None:
         )
 
 
+def _echo_plain_reproduction(returncode: int | None) -> None:
+    click.echo(
+        f"WARNING: the plain oracle reproduced the bug WITHOUT CUTracer (exit "
+        f"{returncode}). The program fails on its own, so nothing found here can "
+        f"be credited to the injected delay. If the oracle compares "
+        f"floating-point outputs bitwise, compare with a tolerance or make the "
+        f"kernel deterministic, and re-run.",
+        err=True,
+    )
+
+
 def _echo_verdict(status: str, reasons: list[str]) -> None:
     click.echo(f"Verdict: {status}" + (f" ({'; '.join(reasons)})" if reasons else ""))
 
@@ -716,6 +767,7 @@ def _run_plan(
 ) -> None:
     click.echo(
         f"Running stress ({','.join(c.strategy for c in configs)}): "
+        f"{_plain_line(configs[0])}"
         f"{configs[0].baseline_runs} baseline per instrumentation, then "
         + "; ".join(f"{c.strategy}: {_plan_line(c)}" for c in configs)
         + f" -- {' '.join(configs[0].oracle_argv)}",
@@ -766,6 +818,11 @@ def _run_plan(
             shutil.copyfile(triggering.config_path, dump_out)
             _echo_reproduction(trigger.config, result, dump_out, oracle)
         _echo_notes(trigger.config, result)
+    elif plan.plain is not None:
+        returncode = plan.plain["returncode"]
+        plain = _PlainRun(returncode, "")
+        if _plain_outcome(configs[0], plain) == _CONTROL_REPRODUCED:
+            _echo_plain_reproduction(returncode)
     _echo_verdict(verdict.status, verdict.reasons)
 
 
