@@ -26,7 +26,7 @@ from cutracer.stress.confirm import (
     CONFIRMED,
     confirmed_verdict,
 )
-from cutracer.stress.modes import get_mode, get_modes
+from cutracer.stress.modes import get_mode, get_modes, StressMode
 from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
 from cutracer.stress.stress import (
     _triggering_target,
@@ -105,7 +105,7 @@ def _parse_modes(strategy: str) -> list[str]:
     """`all`, or comma-separated mode names, in the order they run."""
     known = list(get_modes())
     if strategy.strip() == STRATEGY_ALL:
-        return known
+        return [mode.name for mode in get_modes().values() if mode.in_default_plan]
     names = [name.strip() for name in strategy.split(",") if name.strip()]
     unknown = [name for name in names if name not in known]
     if not names or unknown:
@@ -171,22 +171,60 @@ def _mode_config(
         raise click.UsageError(f"{name}: {exc}") from exc
 
 
-@click.command(name="stress", context_settings={"ignore_unknown_options": True})
+class _StressCommand(click.Command):
+    """`cutracer stress`, whose help ends with the defaults of every mode."""
+
+    def format_epilog(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        super().format_epilog(ctx, formatter)
+        rows = [(mode.name, _mode_defaults(mode)) for mode in get_modes().values()]
+        with formatter.section("Mode defaults"):
+            formatter.write_dl(rows)
+
+
+def _mode_defaults(mode: StressMode) -> str:
+    """`mode`'s row of the "Mode defaults" help."""
+    ladder = ",".join(str(delay_ns) for delay_ns in mode.delay_ladder_ns)
+    points = mode.points or (
+        "every point of the target"
+        if mode.isolates_targets
+        else f"enable prob {mode.enable_prob:g}"
+    )
+    hang = "a hang counts" if mode.hang_is_bug else "the oracle judges a hang"
+    notes = [mode.notes] if mode.notes else []
+    if not mode.in_default_plan:
+        notes.append("runs only when named")
+    return (
+        f"delay ladder {ladder} ns, {mode.attempts_per_delay} attempt(s) per "
+        f"delay, patterns {mode.delay_patterns or 'built-in'}, {points}, kernel "
+        f"timeout {mode.kernel_timeout_s} s, {hang}"
+        + "".join(f"; {note}" for note in notes)
+    )
+
+
+def _strategy_help() -> str:
+    """The `--strategy` help, which lists every mode."""
+    modes = ", ".join(
+        f"'{mode.name}' ({mode.summary})" for mode in get_modes().values()
+    )
+    return (
+        "Delay modes to search with, in order: 'all' (every mode but those that "
+        "run only when named; see Mode defaults), or a comma-separated list of "
+        f"{modes}. With several modes, each writes its own report under "
+        "<output-dir>/<mode>, modes with the same instrumentation share one "
+        "control arm, and the search stops at the first mode that reproduces."
+    )
+
+
+@click.command(
+    name="stress",
+    cls=_StressCommand,
+    context_settings={"ignore_unknown_options": True},
+)
 @click.option(
     "--strategy",
     default=STRATEGY_ALL,
     show_default=True,
-    help="Delay modes to search with, in order: 'all', or a comma-separated list "
-    "of 'lds' (random per-thread delays before shared-memory loads only), "
-    "'random' (random per-thread delays at a random tenth of CUTracer's built-in "
-    "points, all warps at once or one warpgroup at a time) and 'isolate' (stall "
-    "one (cluster rank, CTA-local warp) per attempt with a fixed delay before "
-    "each mbarrier wait while every other warp runs at full speed; finds a warp "
-    "the protocol does not wait for, such as a consumer that never releases its "
-    "ring slot). With "
-    "several modes, each writes its own report under <output-dir>/<mode>, modes "
-    "with the same instrumentation share one control arm, and the search stops "
-    "at the first mode that reproduces.",
+    help=_strategy_help(),
 )
 @click.option(
     "--mode-option",
@@ -221,15 +259,14 @@ def _mode_config(
     "--delay-ladder-ns",
     default=None,
     help="Comma-separated delay values (ns) to sweep, for a search with one mode "
-    "(else use --mode-option). Default: 1000,5000,10000,50000,100000 (random), "
-    "1000000 (isolate).",
+    "(else use --mode-option). Default: the mode's (see Mode defaults).",
 )
 @click.option(
     "--enable-prob",
     type=float,
     default=None,
-    help="Per-point enable probability. Default: the mode's (lds 1.0, random "
-    "0.1); isolate enables every point.",
+    help="Per-point enable probability. Default: the mode's (see Mode "
+    "defaults); modes that isolate targets turn every point of a target on.",
 )
 @click.option(
     "--warpgroup-ids",
@@ -253,15 +290,15 @@ def _mode_config(
     "--delay-patterns",
     default=None,
     help="Comma-separated SASS substrings to delay at, for a search with one mode "
-    "(else use --mode-option). Default: SYNCS.PHASECHK (mbarrier waits) for "
-    "isolate, CUTracer's built-in patterns for random.",
+    "(else use --mode-option). Default: the mode's (see Mode defaults); modes "
+    "that isolate targets take them from the points these match.",
 )
 @click.option(
     "--attempts-per-delay",
     type=click.IntRange(min=1),
     default=None,
     help="Attempts per delay (and per target), for a search with one mode (else "
-    "use --mode-option). Default: 3 (random), 1 (isolate).",
+    "use --mode-option). Default: the mode's (see Mode defaults).",
 )
 @click.option(
     "--baseline-runs",
@@ -330,14 +367,14 @@ def _mode_config(
     default=None,
     help="CUTracer's per-kernel timeout in every run (0 = off). With a timeout, "
     "the 15 s no-data watchdog is turned off, so a slow kernel is not mistaken "
-    "for a hung one. Default: 0 (random), 60 (isolate).",
+    "for a hung one. Default: the mode's (see Mode defaults).",
 )
 @click.option(
     "--hang-is-bug/--no-hang-is-bug",
     default=None,
     help="Count a run whose kernel CUTracer's watchdog ended (a hang) as a "
     "reproduction, whatever the oracle's exit code. Pair with --kernel-timeout-s. "
-    "Default: off (random), on (isolate).",
+    "Default: the mode's (see Mode defaults).",
 )
 @click.option(
     "--exit-quarantine-ns",
@@ -390,6 +427,7 @@ def stress_command(  # noqa: C901
     Examples:
       cutracer stress -k my_kernel -o /tmp/stress -- ./oracle.sh
       cutracer stress --strategy isolate -k my_kernel -o /tmp/iso -- ./oracle.sh
+      cutracer stress --strategy bar -k my_kernel -o /tmp/bar -- ./oracle.sh
     """
     if oracle and oracle[0].startswith("-"):
         raise click.UsageError(

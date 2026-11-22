@@ -1,7 +1,8 @@
 # Evals for debug-hanging-kernel
 
 Planted-hang CUDA programs for testing the [`debug-hanging-kernel`](../../skills/debug-hanging-kernel/SKILL.md) skill.
-Each program hung in 10 of 10 runs on B200 and H100 (on A100, the six that build for sm_80), and the comment at the top of each source file states the bug: it is the answer key.
+S1-S6 and V1 hung in 10 of 10 runs on B200 and H100 (on A100, the six that build for sm_80). S7 does not hang on its own (0 of 20 runs on GB200): it hangs only when its consumer warp reaches a named-barrier sync late, which `cutracer stress --strategy bar` forces (2 of 2 searches on GB200, against 2 of 2 clean for the fixed program). It tests the skill's branch for hangs that never show up, including the `--timeout` that branch needs: with a `--timeout` of 5 s, below CUTracer's 60 s kernel timeout, the search ends incomplete (the attempt timed out) instead of finding the hang.
+The comment at the top of each source file states the bug: it is the answer key.
 Each source also builds a fixed program with `-DFIXED`, which exits 0 and checks its own output.
 
 ## Cases
@@ -15,6 +16,7 @@ Each source also builds a fixed program with `-DFIXED`, which exits 0 and checks
 | S5 | A tile sum hangs on one dataset (sm_90 and newer only) | SASS and PTX, no line info |
 | S6 | A step loop hangs in its fourth step | line info, PTX |
 | V1 | A single-pass scan of 4M ints never finishes; 1M works | release: SASS only |
+| S7 | A streaming kernel hangs every few days in production, never on a dev box | line info, PTX |
 
 `symptoms.json` holds the exact symptom text for each case.
 S3 allocates about 800 MB of GPU memory.
@@ -28,7 +30,12 @@ FIXED=1 ./build.sh sm_100a out-b200-fixed
 ```
 
 The script strips the comments, so the binaries carry no answer key, and strips symbols.
-`reliability.sh` runs every case N times without CUTracer, buggy and fixed, and prints how many buggy runs hung and how many fixed runs passed.
+`reliability.sh` runs every case N times without CUTracer, buggy and fixed, and prints how many buggy runs hung and how many fixed runs passed; S7's buggy runs should all pass. Check S7 under delay instead (a normal run takes under a second):
+
+```bash
+cutracer stress --strategy bar -k stream_sums --not-interesting-exit-codes 1 --timeout 150 \
+    -o /tmp/s7 -- sh -c 'out-b200/S7; exit 1'    # a finding on barrier 1; out-b200-fixed/S7 is clean
+```
 
 ## Run a blind trial
 
@@ -47,7 +54,7 @@ Leave out runs that break the prompt's rules in a way that gives them informatio
 ## Results so far
 
 Blind runs with the OSS CUTracer build on B200, without cuda-gdb or compute-sanitizer, graded by one grader that did not know each run's condition.
-The runs used the previous revision of the skill; the current one adds fixes from those runs and was not rerun blind.
+The runs used the previous revision of the skill; the current one adds fixes from those runs and was not rerun blind. S7 has not been run blind.
 
 ```
 case             agent            with skill  without

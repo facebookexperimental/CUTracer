@@ -41,18 +41,25 @@ class StressMode:
     # CUTracer's exit quarantine in every run (ns, 0 = off): a CTA whose shared
     # memory changes after its last thread exited counts as a reproduction.
     exit_quarantine_ns: int = 0
+    # Whether `--strategy all` (the default plan) runs the mode.
+    in_default_plan: bool = True
+    # For the "Mode defaults" of `cutracer stress --help`: which points an
+    # attempt turns on, when "every point of the target" or the enable
+    # probability does not say it, and anything else the row should say.
+    points: str | None = None
+    notes: str = ""
 
     @property
     def isolates_targets(self) -> bool:
         return self.isolate_by is not None
 
 
-# The defaults below come from three known races reproduced on GB200
-# (2026-11-06): two softmax running-max races, where a warp reads the running
-# max from shared memory after a faster warp's next update (fixed by
-# D129633882 and D129803385), and a DistMoE consumer that never releases its
-# ring slot (T290953007). Instrumentation alone slows these kernels 40 to 200
-# times, so useful delays are tens of microseconds and up.
+# The defaults of lds, random and isolate come from three known races
+# reproduced on GB200 (2026-11-06): two softmax running-max races, where a warp
+# reads the running max from shared memory after a faster warp's next update,
+# and a DistMoE consumer that never releases its ring slot. Instrumentation
+# alone slows these kernels 40 to 200 times, so useful delays are tens of
+# microseconds and up.
 #
 # Delaying only shared-memory loads separates one reader from the writers:
 # both running-max races reproduce at 100 us (6 of 6 attempts).
@@ -107,17 +114,44 @@ ISOLATE = StressMode(
 )
 
 
-# TODO: Add modes as new races need them. The patterns above cover what the
-# three races needed: shared-memory loads, CUTracer's built-in points and
-# mbarrier waits. A race between instructions none of them delays (for example
-# TMEM accesses, named barriers or distributed shared memory) needs a new mode,
-# with its ladder and attempts calibrated on a race it reproduces; widening an
-# existing mode's patterns would change what that mode was calibrated for. The
-# essential points of a confirmed finding (`--confirm`) name the instructions a
-# race needed delayed.
+# A named-barrier token imbalance (an FP8-KV decode attention kernel): one warp
+# arrives at a barrier twice before another reaches its first sync, so that
+# sync completes on the wrong arrivals and a later one never completes. It
+# reproduces only with a fixed delay on every warp before one barrier's syncs
+# (GB200: 30 of 30 hangs before the fix at 1, 10 and 100 us alike, 0 of 30
+# after it). Delaying the barrier's arrive too slows the arriving warp just as
+# much and removes the hang (0 of 20), so arrives are not delayed; `BAR.ARV` is
+# still matched, to put the barriers some warps only arrive at first. The
+# delays also slow a correct launch by the delay times the delayed syncs it
+# runs in sequence, which one 10 us rung keeps far from the kernel timeout
+# (about 6,000,000 of them reach 60 s).
+BAR = StressMode(
+    name="bar",
+    summary="a fixed delay on every warp before the syncs of one named barrier "
+    "per attempt (every site of an immediate barrier id, or one site whose "
+    "barrier id is in a register); finds warps that arrive a phase ahead of a "
+    "late sync",
+    delay_ladder_ns=(10_000,),
+    attempts_per_delay=1,
+    kernel_timeout_s=60,
+    hang_is_bug=True,
+    delay_patterns="BAR.SYNC,BAR.ARV,BAR.RED",
+    isolate_by=ISOLATE_BY_BARRIER,
+    points="every sync and reduction of the target (arrives only order the targets)",
+)
+
+
+# TODO: Add modes as new races need them. Each mode above delays what the race
+# it was calibrated on needed. A race between instructions none of them delays
+# (for example distributed shared memory) needs a new mode, with its ladder and
+# attempts calibrated on a race it reproduces; widening an existing mode's
+# patterns would change what that mode was calibrated for. The essential points
+# of a confirmed finding (`--confirm`) name the instructions a race needed
+# delayed.
 def get_modes() -> dict[str, StressMode]:
-    """Every mode by name, in the order a multi-mode search runs them."""
-    return {mode.name: mode for mode in (LDS, RANDOM, ISOLATE)}
+    """Every mode by name, in the order a multi-mode search runs them (the
+    default plan runs those `in_default_plan`)."""
+    return {mode.name: mode for mode in (LDS, RANDOM, ISOLATE, BAR)}
 
 
 def get_mode(name: str) -> StressMode:

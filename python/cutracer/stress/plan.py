@@ -222,8 +222,8 @@ def _not_searched(run: ModeRun, baseline: _BaselineResult) -> Optional[tuple[str
             MODE_SKIPPED,
             "no instrumented launch has a delay point for this mode: its delay "
             "patterns match no instruction of the launched kernels (for example, "
-            "isolate on kernels without mbarrier waits, or lds on kernels "
-            "without shared-memory loads)",
+            "isolate on kernels without mbarrier waits, bar on kernels without "
+            "named barriers, or lds on kernels without shared-memory loads)",
         )
     completed = _baseline_from_runs(
         run.config, baseline.runs, logs=[], geometries=[]

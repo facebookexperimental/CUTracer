@@ -35,6 +35,28 @@ hang under these conditions. Run it a few more times, because a hang that
 depends on timing may need several runs; if it never hangs, go back to
 `investigate-kernel`. Report whether every run hangs or only some.
 
+Before going back for a hang that never shows up, delay the named barriers: a
+hang that needs a warp to reach one late may never happen on its own.
+
+```bash
+cutracer stress --strategy bar -k <kernel> --not-interesting-exit-codes 1 \
+    --timeout <seconds> --budget-s <seconds> -o <dir> -- \
+    sh -c '<command>; exit 1'
+```
+
+Each attempt delays every warp before the syncs of one named barrier, and a
+run that CUTracer's 60 s kernel timeout ends counts as the hang, so the oracle
+only has to exit 1 whenever the program finishes. Set `--timeout` to a normal
+run plus at least 120 s: an attempt that `--timeout` stops before the kernel
+timeout counts as timed out, never as the hang. A search costs three control
+runs plus one run per barrier, which it prints once it has found them, so set
+`--budget-s` to that many normal runs plus 60 s for each hang you expect, and
+keep any outer `timeout` above `--budget-s`. A finding
+names the barrier (`triggering_config.target.barrier` in the report). To
+capture the stuck state in step 2, add the printed `Replay:` command's
+`--delay-*` options to the step 2 command and `random_delay` to its `-i` and
+`-a` lists.
+
 If the program hangs only under CUTracer, CUTracer caused it: it waits for
 each kernel to finish before the program launches the next one, so a kernel
 that waits for a later kernel (for example a flag set by a kernel on another

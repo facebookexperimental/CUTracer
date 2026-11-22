@@ -27,4 +27,5 @@ build S4 S4_barcount.cu    $LI
 case $ARCH in sm_[5-8]*) echo "skipping S5: needs sm_90 or newer";; *) build S5 S5_txbytes.cu -arch=$ARCH;; esac
 build S6 S6_stalewriter.cu $LI
 build V1 V1_lookback.cu    $REL
+build S7 S7_latesync.cu    $LI
 ls -la "$OUT"
