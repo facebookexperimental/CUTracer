@@ -158,6 +158,25 @@ def _run_reduction(
     "oracle's exit code.",
 )
 @click.option(
+    "--nonblocking-launches",
+    is_flag=True,
+    default=False,
+    help="Replay with non-blocking launches (as for `cutracer trace`), as a "
+    "config found by `cutracer stress --strategy pdl` needs.",
+)
+@click.option(
+    "--cpu-callstack",
+    type=click.Choice(["auto", "auto_gil", "pytorch", "backtrace", "0", "1"]),
+    default=None,
+    help="CPU call stack mode of each replay (as for `cutracer trace`).",
+)
+@click.option(
+    "--kernel-events",
+    type=click.Choice(["0", "dedup", "full", "nostack"]),
+    default=None,
+    help="Kernel launch events of each replay (as for `cutracer trace`).",
+)
+@click.option(
     "--timeout",
     type=click.IntRange(min=1),
     default=300,
@@ -218,6 +237,9 @@ def reduce_command(
     kernel_timeout_s: int,
     hang_is_bug: bool,
     exit_quarantine_ns: int,
+    nonblocking_launches: bool,
+    cpu_callstack: str | None,
+    kernel_events: str | None,
     timeout: int,
     output: str,
     minimal_config: str,
@@ -250,8 +272,9 @@ def reduce_command(
     convention).
 
     A config found by ``cutracer stress --strategy isolate`` replays only with
-    the targeting it was recorded under (the last example); ``cutracer stress``
-    prints that command.
+    the targeting it was recorded under (the last example), and one found by
+    ``--strategy pdl`` only with its fixed delays and non-blocking launches;
+    ``cutracer stress`` prints that command.
 
     Examples:
 
@@ -299,6 +322,9 @@ def reduce_command(
             kernel_timeout_s=kernel_timeout_s,
             hang_is_bug=hang_is_bug,
             exit_quarantine_ns=exit_quarantine_ns,
+            nonblocking_launches=nonblocking_launches,
+            cpu_callstack=cpu_callstack,
+            kernel_events=kernel_events,
             output_dir=os.path.dirname(os.path.abspath(minimal_config)),
             timeout=timeout,
             capture_output=not verbose,

@@ -235,6 +235,7 @@ With non-blocking launches:
 - The timers start at a kernel's first trace record, not at its launch, so a kernel waiting in its stream is not timed out. They judge only while a kernel that has sent records is still open. The kernel timeout restarts whenever the trace switches between overlapping kernels and can fire late or not at all. A kernel that hangs before its first record, and a delay-only kernel (which sends none), are not timed out.
 - A launching thread that gets far ahead waits: for the oldest queued drain once 1024 are queued, and for all of them once 256 traces are open. If a queued kernel waits for a launch that thread has not issued yet, the program hangs there.
 - At context teardown CUTracer waits for every queued drain, that is, for every instrumented kernel still running.
+- `cutracer stress --strategy pdl` runs every attempt and control run this way, to search for a kernel launched with PDL that reads an earlier kernel's output too early (see "Searching for a Triggering Config" in [Analyses](Analyses.md)).
 
 ### Deadlock Check Policy
 

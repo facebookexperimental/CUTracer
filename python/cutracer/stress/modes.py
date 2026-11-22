@@ -48,6 +48,21 @@ class StressMode:
     # probability does not say it, and anything else the row should say.
     points: str | None = None
     notes: str = ""
+    # How an enabled point delays each thread: "random" draws a per-thread
+    # delay in [0, delay], "fixed" waits the whole delay in every thread.
+    # Modes that isolate targets ignore it: the target picks the delay mode.
+    delay_mode: str = "random"
+    # Every run of the mode, its control arm included, launches without
+    # blocking the launching thread (`--nonblocking-launches`) and without CPU
+    # call stacks, so kernels overlap as they do natively.
+    nonblocking_launches: bool = False
+    # The mode applies only to a program that launches a kernel with
+    # programmatic dependent launch (PDL) outside a CUDA graph.
+    needs_pdl: bool = False
+
+    def __post_init__(self) -> None:
+        if self.delay_mode not in ("random", "fixed"):
+            raise ValueError(f"unknown delay mode {self.delay_mode!r}")
 
     @property
     def isolates_targets(self) -> bool:
@@ -141,6 +156,57 @@ BAR = StressMode(
 )
 
 
+# The SASS instructions that write global memory on sm_90 and sm_100, as ptxas
+# 13.0 lowers every PTX global writer: STG (st.global at any width and
+# strength, and UTMASTG, the TMA store), ST.E (generic st), REDG (red.global,
+# multimem.red, and UTMAREDG, the TMA reduction), ATOMG (atom.global), ATOM.E
+# (generic atom and red), UBLKCP.G and UBLKRED.G (bulk copy and reduction from
+# shared to global memory), SUST and SURED (surface stores and reductions).
+# None of them matches STS, STL, STAS, ATOMS, REDUX, LDG, LDGSTS, SULD or
+# UBLKCP.S.G.
+GLOBAL_STORE_PATTERNS = "STG,ST.E,REDG,ATOMG,ATOM.E,UBLKCP.G,UBLKRED.G,SUST,SURED"
+
+# A kernel launched with PDL may start once every CTA of the previous kernel
+# has triggered (griddepcontrol.launch_dependents, SASS PREEXIT) or exited;
+# only griddepcontrol.wait (ACQBULK) orders its reads after that kernel's
+# stores. CUTracer's default blocking launches never let the two overlap, and
+# with non-blocking launches the producer's stores still land before the
+# consumer reads unless something holds them back. So every warp waits a fixed
+# delay before every global store: delaying loads would move the consumer's
+# read later, and random per-thread delays would leave some stores on time.
+# The delay must outlast the host work between the two launches, which
+# CUTracer adds to: on GB200, 10 and 100 us reproduced none of the four PDL
+# races of a PDL microbenchmark (0 of 24 attempts; the consumer started
+# 0.1-0.8 ms after the producer ended), while 300 us, 1 ms and 3 ms reproduced
+# each in 3 of 3 attempts, and its two correct variants stayed clean. Every
+# run skips CPU call stacks because a slower launch closes the window too.
+# PDL inside a CUDA graph does not overlap under CUTracer, so graph launches
+# alone do not make the mode apply. pdl runs second: a plan decides from the
+# control arms that ran before it whether any launch uses PDL, so a program
+# without PDL never pays for its control arm, and it comes before isolate,
+# whose search tries every warp.
+PDL = StressMode(
+    name="pdl",
+    summary="with non-blocking launches, a fixed delay on every warp before each "
+    "global-memory store; finds a kernel launched with programmatic dependent "
+    "launch (PDL) that reads an earlier kernel's output before it is written "
+    "(skipped when no launch uses PDL)",
+    delay_ladder_ns=(300_000, 1_000_000),
+    attempts_per_delay=2,
+    kernel_timeout_s=0,
+    hang_is_bug=False,
+    delay_patterns=GLOBAL_STORE_PATTERNS,
+    isolate_by=None,
+    delay_mode="fixed",
+    nonblocking_launches=True,
+    needs_pdl=True,
+    points="enable prob 1, the same fixed delay on every warp",
+    notes="every run, control arm included, lets launches overlap "
+    "(--nonblocking-launches, --cpu-callstack 0); skipped unless a launch uses "
+    "programmatic dependent launch",
+)
+
+
 # TODO: Add modes as new races need them. Each mode above delays what the race
 # it was calibrated on needed. A race between instructions none of them delays
 # (for example distributed shared memory) needs a new mode, with its ladder and
@@ -151,7 +217,7 @@ BAR = StressMode(
 def get_modes() -> dict[str, StressMode]:
     """Every mode by name, in the order a multi-mode search runs them (the
     default plan runs those `in_default_plan`)."""
-    return {mode.name: mode for mode in (LDS, RANDOM, ISOLATE, BAR)}
+    return {mode.name: mode for mode in (LDS, PDL, RANDOM, ISOLATE, BAR)}
 
 
 def get_mode(name: str) -> StressMode:

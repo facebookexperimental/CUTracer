@@ -26,8 +26,10 @@ from cutracer.reduce.reduce import (
     run_replay,
 )
 from cutracer.runner import RunTarget
+from cutracer.stress.modes import get_mode
 from cutracer.stress.stress import (
     _delay_patterns,
+    _launch_options,
     _remaining_s,
     _run_timeout,
     _target_fields,
@@ -80,12 +82,16 @@ def replay_config(
     cutracer_so: Optional[str],
     output_dir: Optional[str],
 ) -> ReplayConfig:
-    """The replay of the triggering config with the targeting, kernel timeout
-    and hang rule the search ran it under (the in-process form of the
-    `Reduce:` line `cutracer stress` prints)."""
+    """The replay of the triggering config with the targeting, kernel timeout,
+    hang rule and launch handling the search ran it under (the in-process form
+    of the `Reduce:` line `cutracer stress` prints)."""
     target = _triggering_target(triggering)
+    mode_delay = get_mode(config.strategy).delay_mode
     fields: Dict[str, Any] = (
-        {"delay_patterns": _delay_patterns(config)}
+        {
+            "delay_mode": None if mode_delay == "random" else mode_delay,
+            "delay_patterns": _delay_patterns(config),
+        }
         if target is None
         else _target_fields(config, target)
     )
@@ -107,6 +113,10 @@ def replay_config(
         # A search without an explicit list counts any non-zero exit as "not
         # reproduced"; a replay needs the list, and 1 is the oracle default.
         not_interesting_exit_codes=tuple(config.not_interesting_exit_codes or (1,)),
+        # The search's runs record kernel events, and a replay must do the
+        # same host work per launch (see `_records_launches`).
+        kernel_events="nostack" if _launch_options(config) else None,
+        **_launch_options(config),
     )
 
 

@@ -31,7 +31,17 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import click
 from cutracer.runner import (
@@ -47,6 +57,7 @@ from cutracer.stress.modes import (
     ISOLATE_BY_BARRIER,
     ISOLATE_BY_WARP,
     ISOLATE_KINDS,
+    PDL,
     RANDOM,
 )
 from cutracer.stress.retention import (
@@ -78,6 +89,7 @@ SYMPTOM_LATE_WRITE = "late_write"
 
 STRATEGY_RANDOM: str = RANDOM.name
 STRATEGY_ISOLATE: str = ISOLATE.name
+STRATEGY_PDL: str = PDL.name
 ISOLATE_DEFAULT_PATTERNS: str | None = ISOLATE.delay_patterns
 # CUTracer warp masks are 32 bits wide (CUDA allows 32 warps per CTA).
 _MAX_WARPS = 32
@@ -338,6 +350,9 @@ class StressConfig:
     # producer down together with its consumers, so they cannot show that a
     # consumer is missing from the release protocol; isolating that consumer
     # lets the producer lap it.
+    # STRATEGY_PDL: a fixed delay on every warp before each global store, with
+    # non-blocking launches in every run, for a kernel launched with PDL that
+    # reads before an earlier kernel's stores.
     strategy: str = STRATEGY_RANDOM
     # What each attempt of a mode that isolates targets stalls (one of
     # `cutracer.stress.modes.ISOLATE_KINDS`); None = the mode's own.
@@ -841,6 +856,46 @@ def _triggering_target(triggering: TriggeringConfig) -> Optional[DelayTarget]:
         return None
 
 
+def _launch_options(config: StressConfig) -> Dict[str, Any]:
+    """The InstrumentationConfig fields that set how every run of `config`'s
+    mode launches kernels, control runs and replays included."""
+    if not get_mode(config.strategy).nonblocking_launches:
+        return {}
+    return {"nonblocking_launches": True, "cpu_callstack": "0"}
+
+
+def _launch_args(config: StressConfig) -> List[str]:
+    """`_launch_options` as `cutracer trace` / `cutracer reduce` options, with
+    the kernel events every run of a non-blocking mode records, so that a
+    replay does the same host work per launch (see `_records_launches`)."""
+    if not get_mode(config.strategy).nonblocking_launches:
+        return []
+    return [
+        "--nonblocking-launches",
+        "--cpu-callstack",
+        "0",
+        "--kernel-events",
+        "nostack",
+    ]
+
+
+def _records_launches(
+    config: StressConfig,
+    *,
+    warpgroup: Optional[int],
+    target: Optional[DelayTarget],
+) -> bool:
+    """Whether an attempt records kernel launch events: to validate its
+    targeting, or, with non-blocking launches, to do the same host work per
+    launch as its control arm and its replays (whether a consumer launches
+    while a producer's stores are pending depends on it)."""
+    return (
+        warpgroup is not None
+        or target is not None
+        or get_mode(config.strategy).nonblocking_launches
+    )
+
+
 def _replay_args(
     config: StressConfig,
     *,
@@ -867,7 +922,7 @@ def _targeting_args(
     target: Optional[DelayTarget],
 ) -> List[str]:
     """Options that `cutracer trace` and `cutracer reduce` share to restore an
-    attempt's targeting and kernel timeout."""
+    attempt's targeting, kernel timeout and launch handling."""
     args: List[str] = []
     if config.kernel_filters:
         args += ["-k", config.kernel_filters]
@@ -880,15 +935,19 @@ def _targeting_args(
         if target.warp_mask is not None:
             args += ["--delay-warp-mask", target.warp_mask]
         patterns = fields["delay_patterns"]
-    elif warpgroup is not None:
-        args += ["--delay-warpgroup-id", str(warpgroup)]
+    else:
+        delay_mode = get_mode(config.strategy).delay_mode
+        if delay_mode != "random":
+            args += ["--delay-mode", delay_mode]
+        if warpgroup is not None:
+            args += ["--delay-warpgroup-id", str(warpgroup)]
     if patterns:
         args += ["--delay-patterns", patterns]
     if config.kernel_timeout_s > 0:
         args += ["--kernel-timeout-s", str(config.kernel_timeout_s)]
     if config.exit_quarantine_ns > 0:
         args += ["--exit-quarantine-ns", str(config.exit_quarantine_ns)]
-    return args
+    return args + _launch_args(config)
 
 
 def _late_writes(config: StressConfig, directory: str, before: set[str]) -> list[str]:
@@ -933,18 +992,20 @@ class _LaunchGeometry:
         )
 
 
-def _kernel_launch_events(output_dir: str) -> List[Dict[str, Any]]:
-    """Every readable `kernel_launch` event in the kernel-events files of a run."""
-    events: List[Dict[str, Any]] = []
+def _kernel_launch_event_files(output_dir: str) -> List[List[Dict[str, Any]]]:
+    """The readable `kernel_launch` events of a run, one list per kernel-events
+    file (one file per process, in launch order)."""
+    files: List[List[Dict[str, Any]]] = []
     try:
         names = sorted(os.listdir(output_dir))
     except OSError:
-        return events
+        return files
     for name in names:
         if not name.startswith("cutracer_kernel_events_") or not name.endswith(
             ".ndjson"
         ):
             continue
+        events: List[Dict[str, Any]] = []
         try:
             with open(os.path.join(output_dir, name)) as source:
                 for line in source:
@@ -956,7 +1017,15 @@ def _kernel_launch_events(output_dir: str) -> List[Dict[str, Any]]:
                         events.append(event)
         except (OSError, UnicodeError):
             continue
-    return events
+        files.append(events)
+    return files
+
+
+def _kernel_launch_events(output_dir: str) -> List[Dict[str, Any]]:
+    """Every readable `kernel_launch` event in the kernel-events files of a run."""
+    return [
+        event for events in _kernel_launch_event_files(output_dir) for event in events
+    ]
 
 
 def _block_warps(event: Mapping[str, Any]) -> Optional[int]:
@@ -1009,22 +1078,28 @@ def _instrumented_geometries(
     return list(by_checksum.values())
 
 
-def _launched_instrumented_kernels(output_dir: str, config_path: str) -> set[str]:
-    """Checksums of the launched kernels the run's delay dump lists, whether or
-    not the delay patterns matched any of their instructions."""
+def _listed_kernels(config_path: str) -> set[str]:
+    """Checksums of the kernels a run's delay dump lists: every kernel CUTracer
+    instrumented, whether or not the delay patterns matched any of its
+    instructions."""
     try:
         with open(config_path) as source:
             kernels = json.load(source).get("kernels", {})
-        listed = {
-            kernel.get("kernel_checksum")
+        return {
+            checksum
             for kernel in kernels.values()
             if isinstance(kernel, dict)
+            and isinstance(checksum := kernel.get("kernel_checksum"), str)
         }
     except (AttributeError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         logger.warning(
             "cannot read the control run's delay dump %s: %s", config_path, exc
         )
         return set()
+
+
+def _launched_instrumented_kernels(output_dir: str, listed: set[str]) -> set[str]:
+    """Checksums of the launched kernels among `listed` (`_listed_kernels`)."""
     return {
         checksum
         for event in _kernel_launch_events(output_dir)
@@ -1091,6 +1166,282 @@ def _merge_barrier_sites(
             seen.add((site.kernel_checksum, site.pc))
             merged.append(site)
     return merged
+
+
+# How many kernel names a reason quotes.
+_NAMED_KERNELS = 3
+
+
+def _first_names(*groups: Sequence[str]) -> Tuple[str, ...]:
+    """The first `_NAMED_KERNELS` distinct names of `groups`, in order."""
+    names = dict.fromkeys(name for group in groups for name in group)
+    return tuple(names)[:_NAMED_KERNELS]
+
+
+@dataclass(frozen=True)
+class _PdlEvidence:
+    """What the kernel launch events of completed control runs say about
+    programmatic dependent launch (PDL).
+
+    `launches` counts the launches they recorded and `attributed` those
+    recorded by a CUTracer that records launch attributes. `graph` counts the
+    CUDA graph node launches captured with PDL and `direct` the direct
+    launches that used it. Of the direct ones, `first` were the first launch
+    of an instrumented kernel and `unpaired` followed no direct launch on
+    their stream, so neither overlaps the kernel before it (`_pdl_kind`); the
+    rest are `testable`. `covered` counts the testable ones whose producers
+    are all instrumented, so that a delay can hold back every store they may
+    read early; `uninstrumented` names a few of the producers that are not.
+    """
+
+    launches: int = 0
+    attributed: int = 0
+    direct: int = 0
+    graph: int = 0
+    first: int = 0
+    unpaired: int = 0
+    testable: int = 0
+    covered: int = 0
+    uninstrumented: Tuple[str, ...] = ()
+
+    def merge(self, other: "_PdlEvidence") -> "_PdlEvidence":
+        return _PdlEvidence(
+            launches=self.launches + other.launches,
+            attributed=self.attributed + other.attributed,
+            direct=self.direct + other.direct,
+            graph=self.graph + other.graph,
+            first=self.first + other.first,
+            unpaired=self.unpaired + other.unpaired,
+            testable=self.testable + other.testable,
+            covered=self.covered + other.covered,
+            uninstrumented=_first_names(self.uninstrumented, other.uninstrumented),
+        )
+
+
+@dataclass(frozen=True)
+class _Producers:
+    """The kernels a launch with programmatic stream serialization may read
+    early from: the launch before it on its stream and, while each of those
+    used stream serialization itself, the launch before that. `instrumented`
+    says whether CUTracer instrumented all of them; `uninstrumented` names a
+    few that it did not."""
+
+    instrumented: bool
+    uninstrumented: Tuple[str, ...] = ()
+
+
+def _uses_pdl(attributes: Mapping[str, Any]) -> bool:
+    """Whether recorded launch attributes ask for PDL: programmatic stream
+    serialization (a consumer on the same stream) or a programmatic event (a
+    consumer on another stream waits on it)."""
+    return _serializes(attributes) or isinstance(
+        attributes.get("programmatic_event"), dict
+    )
+
+
+def _serializes(attributes: object) -> bool:
+    """Whether launch attributes ask for programmatic stream serialization."""
+    return (
+        isinstance(attributes, dict)
+        and attributes.get("programmatic_stream_serialization") is True
+    )
+
+
+def _producers_after(
+    event: Mapping[str, Any], listed: set[str], before: Optional[_Producers]
+) -> _Producers:
+    """The producers of a launch with stream serialization right after the
+    direct launch or graph node launch `event`: `event`, and `before` (the
+    producers of `event` itself) when `event` was a direct launch with stream
+    serialization."""
+    instrumented = event.get("kernel_checksum") in listed
+    names = () if instrumented else (str(event.get("kernel_name")),)
+    if before is None or not _serializes(event.get("launch_attributes")):
+        return _Producers(instrumented, names)
+    return _Producers(
+        instrumented and before.instrumented,
+        _first_names(names, before.uninstrumented),
+    )
+
+
+@dataclass(frozen=True)
+class _LaunchContext:
+    """A launch event with what came before it in its process: the launch
+    before it on its stream, that launch's `_Producers`, and whether it was
+    its kernel's first launch."""
+
+    event: Mapping[str, Any]
+    before: Optional[Mapping[str, Any]]
+    producers: Optional[_Producers]
+    first_launch: bool
+
+
+def _launch_contexts(
+    events: Sequence[Mapping[str, Any]], listed: set[str]
+) -> Iterator[_LaunchContext]:
+    """Each of one process's launch events, in launch order, in context.
+
+    Launches pair up by the stream handle CUTracer records, so the per-thread
+    default streams of different threads, or the NULL streams of different
+    contexts, look like one stream: a launch can then pair up with another
+    thread's or context's launch.
+    """
+    last: Dict[Any, Tuple[Mapping[str, Any], _Producers]] = {}
+    launched: set[object] = set()
+    for event in events:
+        stream = event.get("stream_id")
+        before, producers = last.get(stream, (None, None))
+        kernel = event.get("kernel_checksum")
+        yield _LaunchContext(event, before, producers, kernel not in launched)
+        launched.add(kernel)
+        last[stream] = (event, _producers_after(event, listed, producers))
+
+
+_PDL_FIRST = "first"
+_PDL_UNPAIRED = "unpaired"
+_PDL_COVERED = "covered"
+_PDL_UNCOVERED = "uncovered"
+
+
+def _pdl_kind(
+    context: _LaunchContext, listed: set[str]
+) -> Optional[Tuple[str, Optional[_Producers]]]:
+    """How a direct launch that uses PDL counts (`_PdlEvidence`), with the
+    producers it may read early from; None for any other launch.
+
+    A launch on another stream may wait on a programmatic event and read this
+    launch's output early. Stream serialization lets this launch read the
+    launches before it early, which overlaps under CUTracer only after a
+    direct launch, and not on the first launch of an instrumented kernel,
+    which waits for the running kernels while CUTracer instruments it.
+    """
+    event = context.event
+    attributes = event.get("launch_attributes")
+    if not isinstance(attributes, dict) or not _uses_pdl(attributes):
+        return None
+    if isinstance(attributes.get("programmatic_event"), dict):
+        producers = _producers_after(event, listed, context.producers)
+    elif context.before is None or "launch_attributes" not in context.before:
+        return _PDL_UNPAIRED, None
+    elif context.first_launch and event.get("kernel_checksum") in listed:
+        return _PDL_FIRST, None
+    else:
+        producers = context.producers
+    assert producers is not None
+    return (_PDL_COVERED if producers.instrumented else _PDL_UNCOVERED), producers
+
+
+def _process_pdl_evidence(
+    events: Sequence[Mapping[str, Any]], listed: set[str]
+) -> _PdlEvidence:
+    """`_pdl_evidence` for one process's launch events, in launch order."""
+    kinds = dict.fromkeys((_PDL_FIRST, _PDL_UNPAIRED, _PDL_COVERED, _PDL_UNCOVERED), 0)
+    attributed = graph = 0
+    uninstrumented: Tuple[str, ...] = ()
+    for context in _launch_contexts(events, listed):
+        if "nonblocking_launches" not in context.event:
+            continue
+        attributed += 1
+        captured = context.event.get("captured_launch_attributes")
+        if isinstance(captured, dict) and _uses_pdl(captured):
+            graph += 1
+        kind = _pdl_kind(context, listed)
+        if kind is None:
+            continue
+        kinds[kind[0]] += 1
+        if kind[1] is not None and not kind[1].instrumented:
+            uninstrumented = _first_names(uninstrumented, kind[1].uninstrumented)
+    testable = kinds[_PDL_COVERED] + kinds[_PDL_UNCOVERED]
+    return _PdlEvidence(
+        launches=len(events),
+        attributed=attributed,
+        direct=testable + kinds[_PDL_FIRST] + kinds[_PDL_UNPAIRED],
+        graph=graph,
+        first=kinds[_PDL_FIRST],
+        unpaired=kinds[_PDL_UNPAIRED],
+        testable=testable,
+        covered=kinds[_PDL_COVERED],
+        uninstrumented=uninstrumented,
+    )
+
+
+def _pdl_evidence(output_dir: str, listed: set[str]) -> _PdlEvidence:
+    """The PDL launches among a run's kernel launch events.
+
+    The events cover every launch, whatever the kernel filter. A direct launch
+    carries `launch_attributes`, a graph node launch carries
+    `captured_launch_attributes` when its captured launch is known, and every
+    event of a CUTracer that records them carries `nonblocking_launches`.
+    `listed` holds the kernels the run instrumented (`_listed_kernels`).
+    """
+    evidence = _PdlEvidence()
+    for events in _kernel_launch_event_files(output_dir):
+        evidence = evidence.merge(_process_pdl_evidence(events, listed))
+    return evidence
+
+
+def _pdl_skip_reason(evidence: _PdlEvidence) -> Optional[str]:
+    """Why a mode that needs PDL launches does not apply: no launch that uses
+    PDL can overlap the kernel before it. None when one can, or when the
+    events cannot tell (there are none, or their CUTracer records no launch
+    attributes)."""
+    if evidence.testable or not evidence.attributed:
+        return None
+    if not evidence.direct and not evidence.graph:
+        return "no launch in the control runs used programmatic dependent launch (PDL)"
+    causes = []
+    if evidence.graph:
+        causes.append("PDL inside a CUDA graph does not overlap under CUTracer")
+    if evidence.first:
+        causes.append(
+            "a kernel's first launch waits for the running kernels while "
+            "CUTracer instruments it"
+        )
+    if evidence.unpaired:
+        causes.append(
+            "a launch that follows a CUDA graph launch, or no launch, on its "
+            "stream has no direct launch to overlap"
+        )
+    return (
+        "no launch that used programmatic dependent launch (PDL) can overlap "
+        "the kernel before it: " + "; ".join(causes)
+    )
+
+
+def _pdl_hold_reason(evidence: _PdlEvidence) -> Optional[str]:
+    """Why a mode that needs PDL launches applies but cannot test them: the
+    kernel filter leaves a kernel every testable launch may read early from
+    uninstrumented, so no delay can hold back all of its producers' stores.
+    None otherwise."""
+    if not evidence.testable or evidence.covered:
+        return None
+    return (
+        "every launch that uses programmatic dependent launch (PDL) may read "
+        "early from a kernel the kernel filter leaves uninstrumented (for "
+        f"example {', '.join(evidence.uninstrumented)}), so no delay can hold "
+        "back that kernel's stores; widen -k to include it"
+    )
+
+
+_BLOCKING_FALLBACK_MARKER = "--nonblocking-launches has no effect"
+
+
+def _blocking_fallbacks(directory: str, *, before: set[str]) -> List[str]:
+    """Lines of the main logs in `directory` that are not in `before` in which
+    CUTracer reports draining launches on the launching thread despite
+    --nonblocking-launches: that process's launches did not overlap."""
+    lines: List[str] = []
+    for name in sorted(main_logs(directory) - before):
+        try:
+            with open(os.path.join(directory, name), errors="replace") as log:
+                lines.extend(
+                    line.rstrip("\n")
+                    for line in log
+                    if _BLOCKING_FALLBACK_MARKER in line
+                )
+        except OSError:
+            continue
+    return lines
 
 
 def _merge_geometries(
@@ -1566,7 +1917,7 @@ def _attempt_targeting(
     """The InstrumentationConfig fields that place an attempt's delays."""
     if target is None:
         return {
-            "delay_mode": "random",
+            "delay_mode": get_mode(config.strategy).delay_mode,
             "delay_enable_prob": config.enable_prob,
             "delay_warpgroup_id": warpgroup,
             "delay_patterns": _delay_patterns(config),
@@ -1670,9 +2021,12 @@ def _run_attempt_in_output_dir(  # noqa: C901
                 base_env=config.base_env,
                 use_bundled_cuda_tools=config.use_bundled_cuda_tools,
                 kernel_events=(
-                    "nostack" if warpgroup is not None or target is not None else None
+                    "nostack"
+                    if _records_launches(config, warpgroup=warpgroup, target=target)
+                    else None
                 ),
                 **_attempt_targeting(config, warpgroup=warpgroup, target=target),
+                **_launch_options(config),
             ),
             runner=runner or run_process_group,
         )
@@ -1700,6 +2054,11 @@ def _run_attempt_in_output_dir(  # noqa: C901
         _unlink(config_path + ".lock")
 
     watchdog = watchdog_terminations(instrumentation_output_dir, before=logs_before)
+    fallback = (
+        _blocking_fallbacks(instrumentation_output_dir, before=logs_before)
+        if get_mode(config.strategy).nonblocking_launches
+        else []
+    )
     hangs = 1 if watchdog else 0
     # A hang ended by CUTracer's watchdog is the symptom itself; the oracle's
     # exit code (or its absence after an outer timeout) then carries nothing.
@@ -1732,6 +2091,17 @@ def _run_attempt_in_output_dir(  # noqa: C901
             None,
             log + "\n--- native tool failure ---\n" + fatal[0],
             rejected_config_path=rejected,
+            hangs=hangs,
+        )
+    if fallback:
+        # The mode's delays hold stores back only while kernels overlap.
+        _unlink(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + f"\n--- error ---\nlaunches did not overlap: {fallback[0]}",
             hangs=hangs,
         )
     if returncode is None and not hung and not late_writes:
@@ -1865,7 +2235,7 @@ def _run_attempt(
 ) -> _AttemptResult:
     event_dir = (
         tempfile.mkdtemp(prefix=".stress_events_", dir=config.output_dir)
-        if warpgroup is not None or target is not None
+        if _records_launches(config, warpgroup=warpgroup, target=target)
         else None
     )
     try:
@@ -1993,13 +2363,17 @@ def _prepare_stress_log(
 @dataclass(frozen=True)
 class _BaselineRun:
     """One control run: the oracle's exit code (None when the run timed out),
-    whether CUTracer's watchdog ended a hung kernel in it, and whether its exit
-    quarantine saw a late write."""
+    whether CUTracer's watchdog ended a hung kernel in it, whether its exit
+    quarantine saw a late write, whether CUTracer could not overlap its
+    launches although the mode asked for it, and its PDL launches (recorded
+    with `_BaselineResult.geometries`)."""
 
     returncode: Optional[int]
     hung: bool
     late_write: bool = False
     infra_error: bool = False
+    blocking: bool = False
+    pdl: _PdlEvidence = field(default_factory=_PdlEvidence)
 
 
 @dataclass(frozen=True)
@@ -2030,6 +2404,41 @@ class _BaselineResult:
     # The named-barrier delay points of those launches (recorded with
     # `geometries`), from which named-barrier targets are discovered.
     barriers: List[BarrierSite] = field(default_factory=list)
+    # The PDL launches of the control runs that completed under the oracle
+    # contract: a run that stopped early may not have reached them.
+    pdl: _PdlEvidence = field(default_factory=_PdlEvidence)
+
+
+# How `_control_outcome` counts a control run.
+_CONTROL_REPRODUCED = "reproduced"
+_CONTROL_COMPLETED = "completed"
+_CONTROL_TIMED_OUT = "timed_out"
+_CONTROL_INFRA_ERROR = "infra_error"
+
+
+def _control_outcome(config: StressConfig, run: _BaselineRun) -> str:
+    """How `config`'s oracle contract and hang rule count one control run."""
+    if run.blocking:
+        # Its launches did not overlap, unlike those of the mode's attempts.
+        return _CONTROL_INFRA_ERROR
+    if run.infra_error:
+        # CUTracer's exit quarantine failed in the run.
+        return _CONTROL_INFRA_ERROR
+    if (run.hung and config.hang_is_bug) or run.late_write:
+        # The target hangs, or writes a finished CTA, without injected delay.
+        return _CONTROL_REPRODUCED
+    if run.returncode is None:
+        return _CONTROL_TIMED_OUT
+    if run.returncode == 0:
+        return _CONTROL_REPRODUCED
+    if (
+        not config.not_interesting_exit_codes
+        or run.returncode in config.not_interesting_exit_codes
+    ):
+        return _CONTROL_COMPLETED
+    # Same rule as the search arm: an exit code the oracle contract does not
+    # cover means the control run did not measure anything.
+    return _CONTROL_INFRA_ERROR
 
 
 def _baseline_from_runs(
@@ -2043,42 +2452,25 @@ def _baseline_from_runs(
     barriers: Sequence[BarrierSite] = (),
 ) -> _BaselineResult:
     """Count control runs under `config`'s oracle contract and hang rule."""
-    completed = reproduced = timed_out = infra_errors = hangs = 0
-    for run in runs:
-        hangs += 1 if run.hung else 0
-        if run.infra_error:
-            infra_errors += 1
-            continue
-        if (run.hung and config.hang_is_bug) or run.late_write:
-            # The target hangs, or writes a finished CTA, without injected delay.
-            completed += 1
-            reproduced += 1
-        elif run.returncode is None:
-            timed_out += 1
-        elif run.returncode == 0:
-            completed += 1
-            reproduced += 1
-        elif (
-            not config.not_interesting_exit_codes
-            or run.returncode in config.not_interesting_exit_codes
-        ):
-            completed += 1
-        else:
-            # Same rule as the search arm: an exit code the oracle contract does
-            # not cover means the control run did not measure anything.
-            infra_errors += 1
+    outcomes = [_control_outcome(config, run) for run in runs]
+    pdl = _PdlEvidence()
+    for run, outcome in zip(runs, outcomes):
+        if outcome in (_CONTROL_REPRODUCED, _CONTROL_COMPLETED):
+            pdl = pdl.merge(run.pdl)
+    reproduced = outcomes.count(_CONTROL_REPRODUCED)
     return _BaselineResult(
         requested=config.baseline_runs if requested is None else requested,
-        completed=completed,
+        completed=reproduced + outcomes.count(_CONTROL_COMPLETED),
         reproductions=reproduced,
-        timed_out=timed_out,
-        infra_errors=infra_errors,
+        timed_out=outcomes.count(_CONTROL_TIMED_OUT),
+        infra_errors=outcomes.count(_CONTROL_INFRA_ERROR),
         logs=logs,
-        hangs=hangs,
+        hangs=sum(1 for run in runs if run.hung),
         geometries=geometries,
         runs=list(runs),
         instrumented_kernels=set(instrumented_kernels or ()),
         barriers=list(barriers),
+        pdl=pdl,
     )
 
 
@@ -2113,8 +2505,10 @@ def _run_baseline(
     worth keeping, and not writing one keeps the baseline out of the search's
     config namespace. An isolate search runs each control run in a scratch
     directory with a dump and kernel events, to learn which warps and cluster
-    ranks the instrumented launches have; `capture_geometry` does the same for
-    a control arm that several modes share.
+    ranks the instrumented launches have, and so does a mode that needs PDL
+    launches or overlaps launches, to learn whether any launch uses PDL and to
+    do the same host work per launch as its attempts; `capture_geometry` does
+    the same for a control arm that several modes share.
 
     No run starts with less than `MIN_RUN_BUDGET_S` left before `deadline`;
     the runs that do not start leave the control arm incomplete.
@@ -2129,8 +2523,9 @@ def _run_baseline(
         # here -- including reading `delay_ladder_ns[0]`.
         return _BaselineResult(0, 0, 0, 0, 0, logs)
     delay_ns = config.delay_ladder_ns[0]
+    mode = get_mode(config.strategy)
     capture = (
-        get_mode(config.strategy).isolates_targets
+        mode.isolates_targets or mode.needs_pdl or mode.nonblocking_launches
         if capture_geometry is None
         else capture_geometry
     )
@@ -2172,6 +2567,7 @@ def _run_baseline(
                     timeout=_run_timeout(config, remaining),
                     base_env=config.base_env,
                     use_bundled_cuda_tools=config.use_bundled_cuda_tools,
+                    **_launch_options(config),
                 ),
                 runner=runner or run_process_group,
             )
@@ -2187,11 +2583,21 @@ def _run_baseline(
             error += "\n" + fatal[0]
         watchdog = watchdog_terminations(run_dir, before=logs_before)
         late_writes = _late_writes(config, run_dir, logs_before)
+        fallback = (
+            _blocking_fallbacks(run_dir, before=logs_before)
+            if mode.nonblocking_launches
+            else []
+        )
+        if fallback:
+            error += f": launches did not overlap: {fallback[0]}"
+        pdl = _PdlEvidence()
         if dump_path is not None:
             geometries = _merge_geometries(
                 geometries, _instrumented_geometries(run_dir, dump_path)
             )
-            instrumented |= _launched_instrumented_kernels(run_dir, dump_path)
+            listed = _listed_kernels(dump_path)
+            instrumented |= _launched_instrumented_kernels(run_dir, listed)
+            pdl = _pdl_evidence(run_dir, listed)
             barriers = _merge_barrier_sites(
                 barriers, _barrier_sites(run_dir, dump_path)
             )
@@ -2214,6 +2620,8 @@ def _run_baseline(
                 bool(watchdog),
                 late_write=bool(late_writes),
                 infra_error=bool(fatal),
+                blocking=bool(fallback),
+                pdl=pdl,
             )
         )
     return _baseline_from_runs(
@@ -2383,6 +2791,10 @@ def run_stress(  # noqa: C901
     search's oracle contract instead of running the control arm again. No
     attempt starts with less than `MIN_RUN_BUDGET_S` left before `deadline`
     (a `time.monotonic()` value); the result then says `budget_exhausted`.
+
+    A mode that needs PDL launches raises ValueError when its own control arm
+    shows that no launch uses PDL, or that none can be tested under the kernel
+    filter; a plan holds such a mode back before it gets here.
     """
     os.makedirs(config.output_dir, exist_ok=True)
     resume = config.resume_result
@@ -2392,6 +2804,9 @@ def run_stress(  # noqa: C901
     timed_out = 0 if resume is None else resume.timed_out
     hangs = 0 if resume is None else resume.hangs
     unattributed = 0 if resume is None else resume.unattributed_reproductions
+    checks_pdl = (
+        baseline is None and resume is None and get_mode(config.strategy).needs_pdl
+    )
     if baseline is not None:
         if resume is not None:
             raise ValueError("a shared control arm cannot resume a search")
@@ -2545,6 +2960,16 @@ def run_stress(  # noqa: C901
         log_path, log_size_bytes = _prepare_stress_log(config.output_dir, resume)
     if config.schedule_callback is not None:
         config.schedule_callback(config.strategy, len(targets), planned_trials)
+    pdl_reason = (
+        _pdl_skip_reason(baseline.pdl) or _pdl_hold_reason(baseline.pdl)
+        if checks_pdl
+        else None
+    )
+    if pdl_reason is not None:
+        raise ValueError(
+            f"a {config.strategy} search cannot run: {pdl_reason} (the control "
+            "runs are in stress.log)"
+        )
     if triggering is not None and config.stop_on_first:
         stop = True
     budget_exhausted = False

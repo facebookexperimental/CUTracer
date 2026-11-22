@@ -71,6 +71,12 @@ class ReplayConfig:
     # a CTA's shared memory changed after its last thread exited is interesting,
     # whatever the oracle's exit code.
     exit_quarantine_ns: int = 0
+    # How the candidate's launches ran: `cutracer stress --strategy pdl` lets
+    # them overlap, captures no CPU call stacks and records kernel events, and
+    # a replay must too.
+    nonblocking_launches: bool = False
+    cpu_callstack: Optional[str] = None
+    kernel_events: Optional[str] = None
     output_dir: Optional[str] = None
     timeout: int = 300
     cwd: Optional[str] = None
@@ -427,9 +433,10 @@ def _run_replay_once(  # noqa: C901
                 delay_warp_mask=config.delay_warp_mask,
                 delay_patterns=config.delay_patterns,
                 delay_load_path=config_path,
-                kernel_events=(
-                    "nostack" if config.expected_kernel_name is not None else None
-                ),
+                kernel_events=config.kernel_events
+                or ("nostack" if config.expected_kernel_name is not None else None),
+                nonblocking_launches=config.nonblocking_launches,
+                cpu_callstack=config.cpu_callstack,
                 kernel_timeout_s=config.kernel_timeout_s,
                 no_data_timeout_s=(
                     0

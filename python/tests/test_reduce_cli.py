@@ -326,6 +326,53 @@ class ReduceCliTest(unittest.TestCase):
         self.assertNotEqual(untargeted.exit_code, 0)
         self.assertIn("Initial config does not trigger", untargeted.output)
 
+    def test_reduce_replays_with_the_recorded_launch_handling(self):
+        """A pdl finding replays only with its fixed delays and overlapping launches."""
+        oracle = Path(self.temp_dir) / "oracle_launches.sh"
+        oracle.write_text(
+            "#!/bin/bash\n"
+            '[ "$CUTRACER_DELAY_MODE" = fixed ] && '
+            '[ "$CUTRACER_NONBLOCKING_LAUNCHES" = 1 ] && '
+            '[ "$CUTRACER_CPU_CALLSTACK" = 0 ] && '
+            '[ "$CUTRACER_KERNEL_EVENTS" = nostack ] && exit 0\n'
+            "exit 1\n"
+        )
+        oracle.chmod(0o755)
+
+        def invoke(*extra):
+            return self.runner.invoke(
+                main,
+                [
+                    "reduce",
+                    *self.runtime_args,
+                    "--config",
+                    str(self.config_file),
+                    "--test",
+                    str(oracle),
+                    "--output",
+                    str(Path(self.temp_dir) / "report.json"),
+                    "--minimal-config",
+                    str(Path(self.temp_dir) / "minimal.json"),
+                    *extra,
+                ],
+            )
+
+        overlapped = invoke(
+            "--delay-mode",
+            "fixed",
+            "--nonblocking-launches",
+            "--cpu-callstack",
+            "0",
+            "--kernel-events",
+            "nostack",
+        )
+        blocking = invoke("--delay-mode", "fixed")
+
+        self.assertEqual(overlapped.exit_code, 0, overlapped.output)
+        self.assertIn("REDUCTION COMPLETE", overlapped.output)
+        self.assertNotEqual(blocking.exit_code, 0)
+        self.assertIn("Initial config does not trigger", blocking.output)
+
     def test_reduce_counts_a_watchdog_hang_with_hang_is_bug(self):
         oracle = Path(self.temp_dir) / "oracle_hang.sh"
         oracle.write_text(

@@ -428,6 +428,7 @@ def stress_command(  # noqa: C901
       cutracer stress -k my_kernel -o /tmp/stress -- ./oracle.sh
       cutracer stress --strategy isolate -k my_kernel -o /tmp/iso -- ./oracle.sh
       cutracer stress --strategy bar -k my_kernel -o /tmp/bar -- ./oracle.sh
+      cutracer stress --strategy pdl -o /tmp/pdl -- ./oracle.sh
     """
     if oracle and oracle[0].startswith("-"):
         raise click.UsageError(
@@ -518,6 +519,8 @@ def stress_command(  # noqa: C901
     else:
         _run_plan(
             configs,
+            # Under `all` the user named no mode.
+            named_modes=[] if strategy.strip() == STRATEGY_ALL else modes,
             sanitizer_so=sanitizer_so,
             confirm=confirm,
             budget_s=budget_s,
@@ -701,6 +704,7 @@ def _save_plan_report(
 def _run_plan(
     configs: list[StressConfig],
     *,
+    named_modes: list[str],
     sanitizer_so: str,
     confirm: bool,
     budget_s: int | None,
@@ -725,6 +729,7 @@ def _run_plan(
             budget_s=budget_s,
             stop_on_first=stop_on_first,
             cutracer_so=sanitizer_so,
+            named_modes=named_modes,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -781,7 +786,8 @@ def _echo_reproduction(
     elif triggering.target is not None:
         placement = f"target={triggering.target}"
     else:
-        placement = f"warpgroup={triggering.warpgroup_id}"
+        group = triggering.warpgroup_id
+        placement = f"warpgroup={'all' if group is None else group}"
     click.echo(
         f"Reproduced{symptom}: delay_ns={triggering.delay_ns} {placement} "
         f"rate={result.reproduction_rate:.2f} -> {dump_out}"
