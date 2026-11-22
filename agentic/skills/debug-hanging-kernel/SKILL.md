@@ -63,6 +63,8 @@ that waits for a later kernel (for example a flag set by a kernel on another
 stream) waits forever. Lazy module loading can do the same without CUTracer;
 `CUDA_MODULE_LOADING=EAGER` rules it out.
 
+To trace such a program, add `--nonblocking-launches` to the `trace` command: CUTracer then returns to the program right after each launch, so kernels can overlap as they do without CUTracer. The option cannot be combined with `-a deadlock_detection`, so leave that out in step 2. There is then no warp report or warp status file: take each warp's last instructions from the trace (step 3). Stop a hung run with `timeout -s INT`, since the kernel timeout can fire late or not at all when kernels overlap.
+
 Run every command that starts the program under `timeout -s INT` and with
 `CUDA_VISIBLE_DEVICES`, including a first `--help` probe: an unknown binary
 may ignore its arguments and launch the hanging kernel. Afterwards, list GPU
