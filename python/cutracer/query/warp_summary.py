@@ -7,7 +7,8 @@ This module provides utilities for analyzing warp execution status
 from trace records grouped by warp ID. It identifies:
 - Completed warps: executed EXIT instruction (normal termination)
 - In-progress warps: never executed EXIT (may be hung or interrupted)
-- Missing warps: never appeared in trace (scheduling issues)
+- Missing warps: never appeared in trace (scheduling issues). Without the
+  launch's grid, only gaps below the highest observed warp id are visible.
 
 "Executed EXIT" is a property of the whole record sequence, not of its last
 element: see :func:`warp_completed`.
@@ -29,6 +30,12 @@ class WarpSummary:
     completed_warp_ids: list[int] = field(default_factory=list)
     inprogress_warp_ids: list[int] = field(default_factory=list)
     missing_warp_ids: list[int] = field(default_factory=list)
+    # Warps the grid launched; None when the trace does not say.
+    launched_warps: Optional[int] = None
+    # Capture filters that hide warps that ran; the grid is then not compared.
+    capture_scope: list[str] = field(default_factory=list)
+    # Never-executed count from the online detector's warp status file.
+    runtime_never_executed_warps: Optional[int] = None
 
 
 def is_exit_sass(sass: Optional[str]) -> bool:
@@ -151,7 +158,10 @@ def format_ranges(ranges: list[tuple[int, int]]) -> str:
     return ", ".join(parts)
 
 
-def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpSummary]:
+def compute_warp_summary(
+    groups: dict[Any, list[TraceRecord]],
+    launched_warps: Optional[int] = None,
+) -> Optional[WarpSummary]:
     """
     Compute warp summary statistics from grouped records.
 
@@ -167,6 +177,9 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
 
     Args:
         groups: Dict mapping warp ID to list of records
+        launched_warps: Warps the grid launched (grid CTAs times warps per
+            CTA). Missing warps then include those above the highest observed
+            id; without it only gaps below that id are visible.
 
     Returns:
         WarpSummary object, or None if groups is empty or contains no
@@ -201,9 +214,10 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
     min_warp = min(warp_ids)
     max_warp = max(warp_ids)
 
-    observed_set = set(warp_ids)
-    all_expected = set(range(0, max_warp + 1))
-    missing_ids = sorted(all_expected - observed_set)
+    expected_count = max_warp + 1
+    if launched_warps is not None:
+        expected_count = max(launched_warps, expected_count)
+    missing_ids = _missing_ids(sorted(set(warp_ids)), expected_count)
 
     return WarpSummary(
         total_observed=len(warp_ids),
@@ -212,7 +226,26 @@ def compute_warp_summary(groups: dict[Any, list[TraceRecord]]) -> Optional[WarpS
         completed_warp_ids=sorted(completed_ids),
         inprogress_warp_ids=sorted(inprogress_ids),
         missing_warp_ids=missing_ids,
+        launched_warps=launched_warps,
     )
+
+
+def _missing_ids(observed: list[int], expected_count: int) -> list[int]:
+    """Ids below ``expected_count`` absent from the sorted ``observed`` ids."""
+    missing: list[int] = []
+    previous = -1
+    for warp_id in observed:
+        missing.extend(range(previous + 1, warp_id))
+        previous = warp_id
+    missing.extend(range(previous + 1, expected_count))
+    return missing
+
+
+def _expected_count(summary: WarpSummary) -> int:
+    expected = summary.max_warp_id + 1
+    if summary.launched_warps is not None:
+        expected = max(summary.launched_warps, expected)
+    return expected
 
 
 def format_warp_summary_text(summary: WarpSummary) -> str:
@@ -232,7 +265,7 @@ def format_warp_summary_text(summary: WarpSummary) -> str:
 
     completed_pct = (completed / total * 100) if total > 0 else 0
     inprogress_pct = (inprogress / total * 100) if total > 0 else 0
-    expected_count = summary.max_warp_id + 1
+    expected_count = _expected_count(summary)
     missing_pct = (missing / expected_count * 100) if expected_count > 0 else 0
 
     completed_ranges = merge_to_ranges(summary.completed_warp_ids)
@@ -246,6 +279,15 @@ def format_warp_summary_text(summary: WarpSummary) -> str:
         "─" * 50,
         f"  Total warps observed:   {total}",
         f"  Warp ID range:          {summary.min_warp_id} - {summary.max_warp_id}",
+    ]
+    if summary.launched_warps is not None:
+        lines.append(f"  Launched warps:         {summary.launched_warps}")
+    elif summary.capture_scope:
+        lines.append(
+            "  Launched warps:         not compared (capture filter: "
+            f"{', '.join(summary.capture_scope)})"
+        )
+    lines += [
         "",
         f"  Completed (EXIT):       {completed:>6}  ({completed_pct:.1f}%)",
         f"    IDs: {format_ranges(completed_ranges)}",
@@ -256,6 +298,11 @@ def format_warp_summary_text(summary: WarpSummary) -> str:
         f"  Missing (never seen):   {missing:>6}  ({missing_pct:.1f}%)",
         f"    IDs: {format_ranges(missing_ranges)}",
     ]
+    if summary.runtime_never_executed_warps is not None:
+        lines.append(
+            "  Never executed (runtime warp status): "
+            f"{summary.runtime_never_executed_warps}"
+        )
     return "\n".join(lines)
 
 
@@ -273,7 +320,7 @@ def warp_summary_to_dict(summary: WarpSummary) -> dict:
     completed = len(summary.completed_warp_ids)
     inprogress = len(summary.inprogress_warp_ids)
     missing = len(summary.missing_warp_ids)
-    expected_count = summary.max_warp_id + 1
+    expected_count = _expected_count(summary)
 
     return {
         "total_observed": total,
@@ -295,4 +342,7 @@ def warp_summary_to_dict(summary: WarpSummary) -> dict:
             ),
             "ranges": merge_to_ranges(summary.missing_warp_ids),
         },
+        "launched_warps": summary.launched_warps,
+        "capture_scope": summary.capture_scope,
+        "runtime_never_executed_warps": summary.runtime_never_executed_warps,
     }

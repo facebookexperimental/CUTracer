@@ -87,6 +87,76 @@ class AnalyzeWarpSummaryTest(unittest.TestCase):
         self.assertEqual(output["completed"]["count"], 1)
         self.assertEqual(output["in_progress"]["count"], 1)
 
+    def test_warp_summary_counts_missing_warps_against_the_grid(self):
+        """Warps above the highest observed id are missing when the header
+        gives the grid, and the online detector's never-executed count from
+        the warp status file next to the trace is reported beside them."""
+        trace_file = Path(self.temp_dir) / "kernel_x_iter0_k.ndjson"
+        records = [
+            {"type": "kernel_metadata", "grid": [4, 1, 1], "block": [64, 1, 1]},
+            {"warp": 0, "pc": 100, "sass": "EXIT;"},
+            {"warp": 1, "pc": 100, "sass": "BAR.SYNC 0x0 ;"},
+        ]
+        trace_file.write_text("".join(json.dumps(r) + "\n" for r in records))
+        status = {
+            "kernel_launch_id": 1,
+            "warp_statistics": {
+                "summary": {"total_warps": 8, "never_executed_warps": 6},
+                "warp_id_ranges": {"never_executed": ["2-7"]},
+            },
+            "active_warps": [],
+        }
+        (
+            Path(self.temp_dir) / "kernel_x_iter0_k_warp_status_summary.ndjson"
+        ).write_text(json.dumps(status) + "\n")
+
+        result = self.runner.invoke(
+            main,
+            ["analyze", "warp-summary", str(trace_file), "--format", "json"],
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        output = json.loads(result.output)
+        self.assertEqual(output["launched_warps"], 8)
+        self.assertEqual(output["missing"]["count"], 6)
+        self.assertEqual(output["missing"]["ranges"], [[2, 7]])
+        self.assertEqual(output["runtime_never_executed_warps"], 6)
+
+    def test_warp_summary_does_not_compare_the_grid_under_a_warp_mask(self):
+        trace_file = Path(self.temp_dir) / "masked.ndjson"
+        records = [
+            {
+                "type": "kernel_metadata",
+                "grid": [4, 1, 1],
+                "block": [64, 1, 1],
+                "trace_warp_mask": 1,
+            },
+            {"warp": 0, "pc": 100, "sass": "EXIT;"},
+            {"warp": 2, "pc": 100, "sass": "EXIT;"},
+        ]
+        trace_file.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+        result = self.runner.invoke(
+            main,
+            ["analyze", "warp-summary", str(trace_file), "--format", "json"],
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        output = json.loads(result.output)
+        self.assertIsNone(output["launched_warps"])
+        self.assertEqual(output["capture_scope"], ["warp_mask"])
+        self.assertEqual(output["missing"]["count"], 1)
+
+    def test_warp_summary_header_only_trace_names_the_launch(self):
+        trace_file = Path(self.temp_dir) / "header_only.ndjson"
+        header = {"type": "kernel_metadata", "grid": [4, 1, 1], "block": [64, 1, 1]}
+        trace_file.write_text(json.dumps(header) + "\n")
+
+        result = self.runner.invoke(main, ["analyze", "warp-summary", str(trace_file)])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("the header launched 8 warps", result.output)
+
     def test_warp_summary_json_format(self):
         """Test warp-summary with JSON output."""
         result = self.runner.invoke(

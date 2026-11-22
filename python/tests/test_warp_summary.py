@@ -336,6 +336,34 @@ class TestFormatWarpSummaryText(unittest.TestCase):
         self.assertIn("In-progress:", result)
         self.assertIn("Missing (never seen):", result)
 
+    def test_format_capture_filter_instead_of_the_grid(self):
+        """A filtered capture says why the grid is not compared."""
+        summary = WarpSummary(
+            total_observed=1,
+            min_warp_id=0,
+            max_warp_id=0,
+            completed_warp_ids=[0],
+            capture_scope=["warp_mask"],
+        )
+        result = format_warp_summary_text(summary)
+        self.assertIn("not compared (capture filter: warp_mask)", result)
+
+    def test_format_launched_and_runtime_counts(self):
+        """The grid's warp count and the runtime never-executed count print."""
+        summary = WarpSummary(
+            total_observed=2,
+            min_warp_id=0,
+            max_warp_id=1,
+            completed_warp_ids=[0, 1],
+            missing_warp_ids=[2, 3],
+            launched_warps=4,
+            runtime_never_executed_warps=2,
+        )
+        result = format_warp_summary_text(summary)
+        self.assertRegex(result, r"Launched warps:\s+4\n")
+        self.assertRegex(result, r"Missing \(never seen\):\s+2\s+\(50\.0%\)")
+        self.assertRegex(result, r"Never executed \(runtime warp status\):\s+2\b")
+
     def test_format_percentages(self):
         """Test percentage calculation."""
         summary = WarpSummary(

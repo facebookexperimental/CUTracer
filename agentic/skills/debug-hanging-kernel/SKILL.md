@@ -108,10 +108,7 @@ Under each warp the report prints its `Last:` instruction, or the loop body
 for a `LOOPING` warp. `Last:` is often wrong; take each warp's last
 instructions from the trace (step 3).
 
-The same data is in `<dir>/*_warp_status_summary.ndjson`.
-`cutracer analyze warp-summary <trace>.ndjson` recomputes completed and
-in-progress warps from the trace alone. It cannot see warps numbered above
-the highest one in the trace, so take never-executed counts from the report.
+The same data is in `<dir>/*_warp_status_summary.ndjson`. `cutracer analyze warp-summary <trace>.ndjson` recomputes completed, in-progress and never-seen warps from the trace and prints the report's never-executed count for the same launch. It counts never-seen warps against the grid in the trace header, except under a warp mask, instruction window, PC filter or category filter, which hide warps that ran.
 
 | Status | Meaning |
 |---|---|
