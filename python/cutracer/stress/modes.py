@@ -143,9 +143,9 @@ ISOLATE = StressMode(
 BAR = StressMode(
     name="bar",
     summary="a fixed delay on every warp before the syncs of one named barrier "
-    "per attempt (every site of an immediate barrier id, or one site whose "
-    "barrier id is in a register); finds warps that arrive a phase ahead of a "
-    "late sync",
+    "per attempt (every site of an immediate barrier id, or one site of each "
+    "kernel whose barrier id is in a register); finds warps that arrive a phase "
+    "ahead of a late sync",
     delay_ladder_ns=(10_000,),
     attempts_per_delay=1,
     kernel_timeout_s=60,

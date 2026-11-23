@@ -179,11 +179,14 @@ class NamedBarrier:
     """The points one named-barrier target delays.
 
     An immediate barrier id (``barrier_id``) covers every instruction that
-    names it, in every instrumented kernel. A barrier whose id is in a
-    register is a single site (``barrier_id`` None): two sites that read the
-    same register need not name the same barrier. ``patterns`` are SASS
-    substrings that select exactly ``sites``; without them, an attempt
-    replays a delay config that turns on only ``sites``.
+    names it, in every instrumented kernel. Barriers whose id is in a register
+    (``barrier_id`` None) are one site of each of their kernels: two sites
+    that read the same register need not name the same barrier, but a delay
+    in one kernel cannot change the order in which the warps of another
+    kernel's CTA reach its named barriers, so one attempt can delay a site of
+    each kernel. ``patterns`` are SASS substrings that select exactly
+    ``sites``; without them, an attempt replays a delay config that turns on
+    only ``sites``.
     """
 
     barrier_id: Optional[int]
@@ -198,8 +201,13 @@ class NamedBarrier:
             raise ValueError("a named-barrier site is not a named-barrier instruction")
         operands = {operation[2] for operation in operations if operation}
         if self.barrier_id is None:
-            if len(self.sites) != 1 or _IMMEDIATE.match(operands.pop()):
-                raise ValueError("a register-id named barrier is one register site")
+            kernels = {site.kernel_name for site in self.sites}
+            if len(kernels) != len(self.sites) or any(
+                _IMMEDIATE.match(operand) for operand in operands
+            ):
+                raise ValueError(
+                    "a register-id named barrier is one register site of each kernel"
+                )
             if self.patterns:
                 raise ValueError("a register-id named barrier has no patterns")
         elif any(
@@ -216,10 +224,14 @@ class NamedBarrier:
     def label(self) -> str:
         if self.barrier_id is not None:
             return f"named barrier {self.barrier_id:#x}"
-        site = self.sites[0]
-        operation = _barrier_operation(site.sass)
-        operand = "?" if operation is None else operation[2]
-        return f"named barrier {operand} at pc {site.pc:#x}"
+        sites = []
+        for site in self.sites:
+            operation = _barrier_operation(site.sass)
+            operand = "?" if operation is None else operation[2]
+            sites.append(f"{operand} at pc {site.pc:#x}")
+        if len(sites) == 1:
+            return f"named barrier {sites[0]}"
+        return f"named barriers {', '.join(sites)} of {len(sites)} kernels"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1561,8 +1573,9 @@ def _barrier_targets(
     target delays its barrier's syncs and reductions, and its arrives with
     `barrier_arrives`. Barriers that some warps only arrive at come first: a
     late sync there lets the arriving warps run a phase ahead. Register-id
-    sites follow, then the barriers every participant syncs on, whose arrival
-    order a delay on every warp keeps.
+    sites follow, the i-th site of each kernel (by pc) in the i-th of them,
+    then the barriers every participant syncs on, whose arrival order a delay
+    on every warp keeps.
     """
     delayed = {"SYNC", "RED", "ARV"} if config.barrier_arrives else {"SYNC", "RED"}
     by_id: Dict[int, List[BarrierSite]] = {}
@@ -1592,9 +1605,19 @@ def _barrier_targets(
         )
         for barrier_id, group in sorted(by_id.items())
     ]
+    by_kernel: Dict[str, List[BarrierSite]] = {}
+    for site in by_site:
+        by_kernel.setdefault(site.kernel_name, []).append(site)
+    depth = max((len(group) for group in by_kernel.values()), default=0)
     ordered = [
         *(barrier for barrier in immediate if barrier.barrier_id in arrived),
-        *(NamedBarrier(None, (site,)) for site in by_site),
+        *(
+            NamedBarrier(
+                None,
+                tuple(group[i] for group in by_kernel.values() if i < len(group)),
+            )
+            for i in range(depth)
+        ),
         *(barrier for barrier in immediate if barrier.barrier_id not in arrived),
     ]
     return [DelayTarget(barrier=barrier) for barrier in ordered]
@@ -2049,32 +2072,62 @@ def _write_barrier_config(
         json.dump({"version": "1.0", "delay_ns": delay_ns, "kernels": kernels}, output)
 
 
-def _unnamed_binaries(
+@dataclass(frozen=True)
+class _SiteLaunches:
+    """Which sites of a replayed register-id target an attempt delayed."""
+
+    # Sites whose kernel launched a binary the delay config names them in.
+    delayed: Tuple[BarrierSite, ...]
+    # Sites whose kernel launched only other binaries, and those binaries
+    # (kernel name, checksum).
+    missed: Tuple[BarrierSite, ...]
+    unnamed: Tuple[Tuple[str, str], ...]
+    # Sites whose kernel did not launch.
+    unlaunched: Tuple[BarrierSite, ...]
+
+
+def _site_launches(
     barrier: NamedBarrier, binaries: KernelBinaries, output_dir: str
-) -> Tuple[Tuple[str, str], ...]:
-    """The binaries (kernel name, checksum) an attempt that replayed
-    `barrier`'s config launched of a site's kernel when it launched none of
-    the binaries the config names for that site: no point of it was delayed."""
+) -> _SiteLaunches:
     launched: Dict[str, set[str]] = {}
     for event in _kernel_launch_events(output_dir):
         name, checksum = event.get("kernel_name"), event.get("kernel_checksum")
         if isinstance(name, str) and isinstance(checksum, str):
             launched.setdefault(name, set()).add(checksum)
+    delayed: List[BarrierSite] = []
+    missed: List[BarrierSite] = []
+    unlaunched: List[BarrierSite] = []
     unnamed: set[Tuple[str, str]] = set()
     for site in barrier.sites:
         ran = launched.get(site.kernel_name, set())
-        named = set(_site_binaries(site, binaries))
-        if ran and not ran & named:
+        if ran & set(_site_binaries(site, binaries)):
+            delayed.append(site)
+        elif ran:
+            missed.append(site)
             unnamed.update((site.kernel_name, checksum) for checksum in ran)
-    return tuple(sorted(unnamed))
-
-
-def _unnamed_reason(target: DelayTarget, unnamed: Sequence[Tuple[str, str]]) -> str:
-    binaries = ", ".join(f"{name} {checksum}" for name, checksum in unnamed)
-    return (
-        f"the kernel of {target.label()} launched binaries its delay config does "
-        f"not name ({binaries}), so none of its points were delayed"
+        else:
+            unlaunched.append(site)
+    return _SiteLaunches(
+        tuple(delayed), tuple(missed), tuple(sorted(unnamed)), tuple(unlaunched)
     )
+
+
+def _missed_reason(target: DelayTarget, launches: _SiteLaunches) -> str:
+    sites = ", ".join(
+        f"pc {site.pc:#x} of {site.kernel_name}"
+        for site in (*launches.missed, *launches.unlaunched)
+    )
+    causes = []
+    if launches.unnamed:
+        binaries = ", ".join(
+            f"{name} {checksum}" for name, checksum in launches.unnamed
+        )
+        causes.append(
+            f"its kernel launched binaries its delay config does not name ({binaries})"
+        )
+    if launches.unlaunched:
+        causes.append("its kernel did not launch")
+    return f"{target.label()} delayed no point at {sites}: {' or '.join(causes)}"
 
 
 def _attempt_config_name(
@@ -2089,6 +2142,8 @@ def _attempt_config_name(
         else:
             site = barrier.sites[0]
             key = f"{site.kernel_checksum[:16]}-pc-{site.pc:#x}"
+            if len(barrier.sites) > 1:
+                key += f"-and-{len(barrier.sites) - 1}"
         return f"delay-{delay_ns}-barrier-{key}-attempt-{attempt}.json"
     rank = "all" if target.cluster_rank is None else target.cluster_rank
     return f"delay-{delay_ns}-rank-{rank}-warp-{target.warp}-attempt-{attempt}.json"
@@ -2238,52 +2293,58 @@ def _run_attempt_in_output_dir(  # noqa: C901
         return _AttemptResult(0, 0, 0, None, log, timed_out=1, hangs=hangs)
 
     is_interesting = hung or bool(late_writes) or returncode == 0
-    unnamed = (
-        _unnamed_binaries(target.barrier, binaries or {}, instrumentation_output_dir)
+    launches = (
+        _site_launches(target.barrier, binaries or {}, instrumentation_output_dir)
         if replays
         and target is not None
         and target.barrier is not None
         and target.barrier.barrier_id is None
-        else ()
+        else None
     )
-    if unnamed:
+    if launches is not None and (
+        launches.missed
+        # A target of one site whose kernel did not launch fails the launch
+        # validation below; a site of a target of several needs this check.
+        or (launches.unlaunched and launches.delayed)
+    ):
         assert target is not None
-        reason = _unnamed_reason(target, unnamed)
-        if is_interesting:
+        reason = _missed_reason(target, launches)
+        if is_interesting and not launches.delayed:
             # Like a config with no enabled point: the failure is real, but
-            # the target's sites were not delayed.
+            # none of the target's sites was delayed.
             _unlink(config_path)
             return _AttemptResult(
                 1,
                 0,
                 0,
                 None,
-                log + f"\n--- error ---\noracle reported the bug but {reason}: "
+                log + f"\n--- error ---\noracle reported the bug, but {reason}; "
                 "the target reproduces without attributable injected delay",
                 unattributed=1,
                 hangs=hangs,
             )
-        if retry_binaries:
-            _unlink(config_path)
+        if not is_interesting:
+            if retry_binaries and launches.unnamed:
+                _unlink(config_path)
+                return _AttemptResult(
+                    0,
+                    0,
+                    0,
+                    None,
+                    log + f"\n--- retry ---\n{reason}",
+                    hangs=hangs,
+                    unnamed_binaries=launches.unnamed,
+                )
+            rejected = _preserve_rejected_config(config_path)
             return _AttemptResult(
                 0,
                 0,
-                0,
+                1,
                 None,
-                log + f"\n--- retry ---\n{reason}",
+                log + f"\n--- error ---\n{reason}",
+                rejected_config_path=rejected,
                 hangs=hangs,
-                unnamed_binaries=unnamed,
             )
-        rejected = _preserve_rejected_config(config_path)
-        return _AttemptResult(
-            0,
-            0,
-            1,
-            None,
-            log + f"\n--- error ---\n{reason}",
-            rejected_config_path=rejected,
-            hangs=hangs,
-        )
     is_clean = not is_interesting and (
         not config.not_interesting_exit_codes
         or returncode in config.not_interesting_exit_codes
