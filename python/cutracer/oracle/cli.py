@@ -177,6 +177,12 @@ def oracle_pytest_command(args: tuple[str, ...]) -> None:
     default=False,
     help="check: count any change of a tensor stable in every plain run.",
 )
+@click.option(
+    "--no-pin-autotune",
+    is_flag=True,
+    default=False,
+    help="record: do not pin Triton autotuning to a first plain run's choices.",
+)
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
 def oracle_cmd_command(
     fail_codes: str | None,
@@ -192,6 +198,7 @@ def oracle_cmd_command(
     numerics_runs: str | None,
     numerics_wrap: tuple[str, ...],
     numerics_strict: bool,
+    no_pin_autotune: bool,
     command: tuple[str, ...],
 ) -> None:
     """Run any command as a stress/reduce oracle.
@@ -222,7 +229,11 @@ def oracle_cmd_command(
     ]
     argv += [
         flag
-        for flag, on in (("--plain", plain), ("--numerics-strict", numerics_strict))
+        for flag, on in (
+            ("--plain", plain),
+            ("--numerics-strict", numerics_strict),
+            ("--no-pin-autotune", no_pin_autotune),
+        )
         if on
     ]
     argv += [f"--numerics-wrap={entry}" for entry in numerics_wrap]

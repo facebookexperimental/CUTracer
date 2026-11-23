@@ -682,6 +682,43 @@ class NumericsCheckTest(_OracleTestCase):
             self.check({"numerics-main.json": _summary()}, golden=golden), INCOMPLETE
         )
 
+    def test_autotuner_misses_discredit_only_a_large_change_they_precede(
+        self,
+    ) -> None:
+        def misses(first_miss_k: int) -> dict[str, Any]:
+            return {
+                "pinning": "on",
+                "misses": 2,
+                "first_miss_k": first_miss_k,
+                "miss_head": ["k: not in the record"],
+            }
+
+        early = {"numerics-main.json": _summary("large", autotune=misses(0))}
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.check(early), INCOMPLETE)
+        self.assertIn(
+            "2 autotuner call(s) were not in the golden's record", stderr.getvalue()
+        )
+        # A miss after the change may be the race's own doing.
+        late = {"numerics-main.json": _summary("large", autotune=misses(3))}
+        self.assertEqual(self.check(late), REPRODUCED)
+        small = {"numerics-main.json": _summary("small", autotune=misses(0))}
+        self.assertEqual(self.check(small), PASSED)
+        # A wrong result is wrong in any config.
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.check(small, _report("failed")), REPRODUCED)
+        self.assertIn("2 autotuner call(s) were not pinned", stderr.getvalue())
+
+    def test_autotuning_that_was_not_pinned_discredits_a_large_change(self) -> None:
+        unpinned = {
+            "pinning": "missed: triton.runtime.autotuner was imported",
+            "misses": 0,
+        }
+        large = {"numerics-main.json": _summary("large", autotune=unpinned)}
+        self.assertEqual(self.check(large), INCOMPLETE)
+
     def test_a_large_change_with_another_torch_measured_nothing(self) -> None:
         summary = _summary("large", environment=["torch 2 differs from 1"])
         self.assertEqual(self.check({"numerics-main.json": summary}), INCOMPLETE)
@@ -736,13 +773,22 @@ class NumericsRecordTest(_OracleTestCase):
         kw.setdefault("injected", False)
         return self.fx.run(script, numerics=numerics, **kw)
 
-    def script(self, *checks: dict[str, Any], calls: int = 2) -> dict[str, Any]:
+    def script(
+        self, *checks: dict[str, Any], calls: int = 2, record_misses: int = 0
+    ) -> dict[str, Any]:
         golden_calls = {"schema": 1, "calls": [_call({"name": "a0", "kind": "tensor"})]}
+        autotune = {"verdict": "autotune-recorded", "calls": 0, "errors": []}
+        recorded = _summary("recorded", calls=calls)
+        recorded["numerics"]["autotune"] = {"pinning": "on", "misses": record_misses}
         return {
             "report": _report(),
             "numerics": {
+                # Run 0 records the autotuner's choices.
+                "autotune": {
+                    "out": {"numerics-main.json": {"schema": 1, "numerics": autotune}}
+                },
                 "record": {
-                    "out": {"numerics-main.json": _summary("recorded", calls=calls)},
+                    "out": {"numerics-main.json": recorded},
                     "golden": {"calls-main.json": golden_calls},
                 },
                 "check": list(checks),
@@ -765,6 +811,13 @@ class NumericsRecordTest(_OracleTestCase):
                 self.script(self.plain_run("same"), self.plain_run("small"))
             )
         self.assertEqual(code, 0, stderr.getvalue())
+        verdicts = [
+            json.loads(path.read_text())["numerics"]["verdict"]
+            for path in (self.root / "evidence").glob(
+                "attempt-*/numerics/numerics-main.json"
+            )
+        ]
+        self.assertEqual(verdicts.count("autotune-recorded"), 1)
         golden = self.root / "golden"
         manifest = json.loads((golden / "manifest.json").read_text())
         self.assertEqual(
@@ -772,6 +825,7 @@ class NumericsRecordTest(_OracleTestCase):
             ("pytest", NODE, 2),
         )
         self.assertEqual(manifest["settings"]["CUTRACER_NUMERICS_PIN_HYPOTHESIS"], "1")
+        self.assertEqual(manifest["settings"]["CUTRACER_NUMERICS_PIN_AUTOTUNE"], "1")
         self.assertEqual(manifest["settings"]["PYTHONHASHSEED"], "0")
         leaf = json.loads((golden / "calls-main.json").read_text())["calls"][0][
             "leaves"
@@ -910,6 +964,36 @@ class NumericsRecordTest(_OracleTestCase):
             (record["max_rel_l2"], record.get("nonfinite_rel_l2")), (0.0, True)
         )
 
+    def test_autotuner_misses_while_recording_leave_no_golden(self) -> None:
+        missed = self.plain_run("same")
+        missed["out"]["numerics-main.json"]["numerics"]["autotune"] = {
+            "pinning": "on",
+            "misses": 1,
+            "miss_head": ["k: not in the golden's record"],
+        }
+        cases = {
+            "run 1": self.script(self.plain_run(), self.plain_run(), record_misses=1),
+            "a plain run": self.script(missed, self.plain_run()),
+        }
+        for name, script in cases.items():
+            with self.subTest(name=name), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.record(script), INCOMPLETE)
+                self.assertFalse((self.root / "golden").exists())
+                for counter in self.root.glob("seen.json.*"):
+                    counter.unlink()
+
+    def test_without_autotune_pinning_there_is_no_autotuning_run(self) -> None:
+        numerics = self.oracle.NumericsOptions(
+            mode="record", golden=self.root / "golden", runs=2, pin_autotune=False
+        )
+        script = self.script(self.plain_run())
+        del script["numerics"]["autotune"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.fx.run(script, injected=False, numerics=numerics)
+        self.assertEqual(code, 0)
+        manifest = json.loads((self.root / "golden" / "manifest.json").read_text())
+        self.assertEqual(manifest["settings"]["CUTRACER_NUMERICS_PIN_AUTOTUNE"], "0")
+
     def test_a_golden_directory_must_be_new_or_empty(self) -> None:
         (self.root / "golden").mkdir()
         (self.root / "golden" / "old").write_text("x")
@@ -931,6 +1015,8 @@ class NumericsRecordTest(_OracleTestCase):
             ["--numerics", "check", "--golden", "g", "--numerics-wrap", "nocolon"],
             ["--numerics", "record", "--golden", "g", "--signature-file", "s"],
             ["--numerics", "record", "--golden", "g", "--expected-signature", "x"],
+            ["--numerics", "check", "--golden", "g", "--no-pin-autotune"],
+            ["--no-pin-autotune"],
         ):
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:

@@ -105,6 +105,7 @@ class NumericsOptions:
     wrap: Sequence[str] = ()
     strict: bool = False
     capture: Optional[Path] = None
+    pin_autotune: bool = True
 
 
 @dataclass
@@ -531,6 +532,7 @@ def _record_settings(numerics: NumericsOptions, env: Dict[str, str]) -> Dict[str
     settings.setdefault("PYTHONHASHSEED", "0")
     if numerics.wrap:
         settings["CUTRACER_NUMERICS_WRAP"] = ",".join(numerics.wrap)
+    settings["CUTRACER_NUMERICS_PIN_AUTOTUNE"] = "1" if numerics.pin_autotune else "0"
     return settings
 
 
@@ -548,7 +550,7 @@ def _numerics_run(
     capture = numerics.capture or NUMERICS_CAPTURE
     if not capture.is_file():
         return None, f"the numerics capture {capture} does not exist"
-    if mode == "record":
+    if mode in ("record", "autotune"):
         settings = _record_settings(numerics, env)
         return _NumericsRun(mode, golden, settings, False, capture), None
     manifest = _read_json(golden / MANIFEST)
@@ -753,9 +755,18 @@ def judge_numerics(  # noqa: C901
             return INCOMPLETE, _note_reason(note), "notes"
     for proc in sorted(results):
         found = _large_change(results[proc], strict)
-        if found is not None:
-            rule, change = found
-            return REPRODUCED, _describe_change(proc, change, rule), rule
+        if found is None:
+            continue
+        rule, change = found
+        k = results[proc].get("first_large_k") if rule == "large" else change.get("k")
+        doubt = _autotune_doubt(results[proc], k)
+        if doubt is not None:
+            return (
+                INCOMPLETE,
+                f"{_describe_change(proc, change, rule)}, but {doubt}",
+                "autotune",
+            )
+        return REPRODUCED, _describe_change(proc, change, rule), rule
     if notes:
         return INCOMPLETE, _note_reason(notes[0]), "notes"
     missing = [proc for proc in golden_processes if proc not in results]
@@ -812,6 +823,48 @@ def judge_numerics(  # noqa: C901
     return None, f"numerics {verdict} over {calls} calls", "comparable"
 
 
+def _autotune_unpinned(summary: Dict[str, Any]) -> Optional[str]:
+    """Why a process's Triton autotuning was not pinned when it should have
+    been; None when it was, or when no autotuner was imported."""
+    state = str((summary.get("autotune") or {}).get("pinning", "off"))
+    if state.startswith(("missed", "unavailable")):
+        return f"Triton autotuning was not pinned ({state})"
+    return None
+
+
+def _autotune_doubt(summary: Dict[str, Any], k: Any) -> Optional[str]:
+    """Why a change at call `k` may come from another autotuner config: a
+    miss at or before that call, or autotuning that was not pinned. A miss
+    after it may be the race's own effect (a corrupted size)."""
+    unpinned = _autotune_unpinned(summary)
+    if unpinned is not None:
+        return unpinned
+    autotune = summary.get("autotune") or {}
+    first_miss = autotune.get("first_miss_k")
+    if not autotune.get("misses") or first_miss is None:
+        return None
+    if isinstance(k, int) and first_miss > k:
+        return None
+    head = (autotune.get("miss_head") or ["?"])[0]
+    return (
+        f"{autotune['misses']} autotuner call(s) were not in the golden's record "
+        f"by then and may have picked another config ({head})"
+    )
+
+
+def _autotune_misses(results: Dict[str, Dict[str, Any]]) -> int:
+    return sum(
+        int((s.get("autotune") or {}).get("misses") or 0) for s in results.values()
+    )
+
+
+def _first_miss(results: Dict[str, Dict[str, Any]]) -> str:
+    for summary in results.values():
+        for miss in (summary.get("autotune") or {}).get("miss_head") or []:
+            return str(miss)
+    return "?"
+
+
 def _numerics_evidence(
     run: _NumericsRun,
     results: Dict[str, Dict[str, Any]],
@@ -826,6 +879,7 @@ def _numerics_evidence(
         "first_large_k",
         "first_structure_k",
         "changed_stable_leaves",
+        "autotune",
     )
     lists = ("environment", "structure", "errors", "changed")
     return {
@@ -861,7 +915,12 @@ def _apply_numerics(
     results, notes = _numerics_results(attempt / "numerics")
     if code == REPRODUCED:
         outcome["numerics"] = _numerics_evidence(run, results, notes, "test")
-        return code, reason
+        # Evidence only: a wrong result is wrong in any config.
+        caveats = [u for u in map(_autotune_unpinned, results.values()) if u]
+        misses = _autotune_misses(results)
+        if misses:
+            caveats.append(f"{misses} autotuner call(s) were not pinned")
+        return code, "; ".join([reason, *caveats])
     numerics_code, numerics_reason, rule = judge_numerics(
         results, notes, _golden_processes(run.golden), run.strict, cmd
     )
@@ -888,6 +947,15 @@ def _record_problem(
             return f"the capture failed in {proc}: {summary['errors'][0]}"
         if summary.get("verdict") != "recorded":
             return f"{proc} did not record ({summary.get('verdict')})"
+    for proc, summary in sorted(results.items()):
+        unpinned = _autotune_unpinned(summary)
+        if unpinned is not None:
+            return f"{proc}: {unpinned}"
+    if _autotune_misses(results):
+        return (
+            f"{_autotune_misses(results)} autotuner call(s) were not in the "
+            f"record of the autotuning run ({_first_miss(results)})"
+        )
     if not sum(int(s.get("calls") or 0) for s in results.values()):
         return (
             "the test compared no tensors; name the functions whose results to "
@@ -926,6 +994,29 @@ def _plain_stats(outs: Sequence[Path]) -> Dict[tuple, Dict[str, Any]]:
                     record["nonfinite_rel_l2"] = True
                 record["max_ulp"] = max(record["max_ulp"], int(cmp.get("max_ulp") or 0))
     return stats
+
+
+def _autotune_problem(
+    results: Dict[str, Dict[str, Any]], notes: Sequence[str], code: int, reason: str
+) -> Optional[str]:
+    """Why the run that records the autotuner's choices is unusable."""
+    if code != PASSED:
+        return f"the test did not pass while recording autotuning ({reason})"
+    if notes:
+        return _note_reason(notes[0])
+    for proc, summary in sorted(results.items()):
+        if summary.get("errors"):
+            return f"the capture failed in {proc}: {summary['errors'][0]}"
+        if summary.get("verdict") != "autotune-recorded":
+            return f"{proc} did not record autotuning ({summary.get('verdict')})"
+        unpinned = _autotune_unpinned(summary)
+        if unpinned is not None:
+            return f"{proc}: {unpinned.replace('pinned', 'recorded')}"
+    if not results:
+        return (
+            f"no process recorded anything (the test never imported {NUMERICS_MODULE}?)"
+        )
+    return None
 
 
 def _explained_by_plain_runs(out: Path, stats: Dict[tuple, Dict[str, Any]]) -> bool:
@@ -1004,6 +1095,18 @@ def record_golden(  # noqa: C901
     attempts = output_dir or Path(tempfile.mkdtemp(prefix="cutracer-numerics-"))
     recorded = False
     try:
+        if numerics.pin_autotune:
+            # Run 0 benchmarks for real and records what the autotuner picks;
+            # every later run replays it.
+            code, outcome, attempt = run_once(
+                "autotune", staging, attempts, "numerics record run 0 (autotuning): "
+            )
+            results, notes = _numerics_results(attempt / "numerics")
+            problem = _autotune_problem(
+                results, notes, code, str(outcome.get("reason"))
+            )
+            if problem is not None:
+                return done(INCOMPLETE, problem)
         code, outcome, attempt = run_once(
             "record", staging, attempts, f"numerics record run 1/{total} (golden): "
         )
@@ -1049,6 +1152,14 @@ def record_golden(  # noqa: C901
                     f"plain run {number} could not be compared with run 1: "
                     f"{outcome.get('reason')}",
                 )
+            results, _ = _numerics_results(attempt / "numerics")
+            unpinned = [_autotune_unpinned(s) for s in results.values()]
+            if _autotune_misses(results) or any(unpinned):
+                why = next(filter(None, unpinned), None) or (
+                    f"{_autotune_misses(results)} autotuner call(s) were not in "
+                    f"the record ({_first_miss(results)})"
+                )
+                return done(INCOMPLETE, f"plain run {number}: {why}")
         stats = _fold_plain_runs(
             staging, [attempt / "numerics" for _, attempt in checks]
         )
@@ -1614,6 +1725,13 @@ def _add_numerics_arguments(parser: argparse.ArgumentParser) -> None:
         help="check: also count any change of a tensor that was bitwise "
         "identical in every plain run of the golden (deterministic kernels).",
     )
+    group.add_argument(
+        "--no-pin-autotune",
+        action="store_true",
+        help="record: do not pin Triton autotuning. By default a first plain run "
+        "records the config each autotuner picks, and every later run (the "
+        "golden's and every check) is given that config without benchmarking.",
+    )
     group.add_argument("--numerics-capture", type=Path, help=argparse.SUPPRESS)
 
 
@@ -1630,6 +1748,7 @@ def _numerics_options(
                 ("--numerics-runs", args.numerics_runs),
                 ("--numerics-wrap", args.numerics_wrap),
                 ("--numerics-strict", args.numerics_strict),
+                ("--no-pin-autotune", args.no_pin_autotune),
             )
             if value
         ]
@@ -1647,6 +1766,8 @@ def _numerics_options(
         or getattr(args, "expected_signature", None) is not None
     ):
         parser.error("--numerics record pins no signature: it is not an oracle")
+    if args.numerics == "check" and args.no_pin_autotune:
+        parser.error("--no-pin-autotune is for --numerics record")
     return NumericsOptions(
         mode=args.numerics,
         golden=args.golden.resolve(),
@@ -1654,6 +1775,7 @@ def _numerics_options(
         wrap=tuple(args.numerics_wrap),
         strict=args.numerics_strict,
         capture=args.numerics_capture,
+        pin_autotune=not args.no_pin_autotune,
     )
 
 

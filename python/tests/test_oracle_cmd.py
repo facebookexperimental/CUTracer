@@ -246,8 +246,12 @@ class NumericsCmdTest(unittest.TestCase):
             "out": {"numerics-main.json": _summary("recorded", errors=[])},
             "golden": {"calls-main.json": {"schema": 1, "calls": []}},
         }
+        autotune = {"verdict": "autotune-recorded", "calls": 0, "errors": []}
         script = {
             "numerics": {
+                "autotune": {
+                    "out": {"numerics-main.json": {"schema": 1, "numerics": autotune}}
+                },
                 "record": recorded,
                 "check": [{"out": {"numerics-main.json": _summary("same")}}],
             }

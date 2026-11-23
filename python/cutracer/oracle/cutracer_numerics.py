@@ -19,7 +19,8 @@ imports only the standard library.
 
 Environment (``cutracer oracle`` sets it):
 
-  CUTRACER_NUMERICS_MODE    ``record`` or ``check``; anything else: inert
+  CUTRACER_NUMERICS_MODE    ``record`` or ``check``; ``autotune`` records only the
+                            Triton autotuner's choices; anything else: inert
   CUTRACER_NUMERICS_GOLDEN  golden directory (record writes it, check reads it)
   CUTRACER_NUMERICS_OUT     this run's output directory (``numerics-<proc>.json``,
                             ``calls-<proc>.json``); required to check
@@ -40,6 +41,7 @@ Environment (``cutracer oracle`` sets it):
                             the result to the host, which waits for the device.
   CUTRACER_NUMERICS_PIN_HYPOTHESIS  ``1``: Hypothesis draws the same examples in
                             every run, with no deadline and no shrinking
+  CUTRACER_NUMERICS_PIN_AUTOTUNE  ``0``: do not pin Triton autotuning (below)
   CUTRACER_NUMERICS_LARGE_REL_L2, _LARGE_ROW_REL_L2, _LARGE_ELEM_REL
                             thresholds of ``classify`` (0.02, 0.05, 0.25)
 
@@ -67,6 +69,18 @@ sha256 of its bytes, which every process of the golden shares): its bytes in
 are when a sample does not shrink by a tenth. Its dtype and shape are in the
 calls file. A check reads a golden tensor only when the run's bytes differ,
 and verifies it against its sha256.
+
+Triton autotuning: an ``autotune`` run records the config that each
+``triton.runtime.autotuner.Autotuner`` picks for each tuning key into
+``GOLDEN/autotune-<proc>.jsonl``. ``record`` and ``check`` runs then give the
+autotuner that config without benchmarking it (a config the autotuner makes
+up while tuning is picked through fake timings), so the golden and every
+checked run execute the same kernels. A tuning key that is not in the
+record benchmarks as usual and counts as a miss, with the number of calls
+recorded by then. An autotuner is told apart by its function, key names,
+configs and its place among autotuners that share them. Subclasses that
+override ``run``, other autotuners (Inductor's), and a reloaded autotuner
+module are not pinned.
 
 A check classifies each changed tensor (``classify``):
 
@@ -103,7 +117,7 @@ import traceback
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 SCHEMA = 1
 
@@ -121,7 +135,9 @@ ENV_PIN_HYPOTHESIS = "CUTRACER_NUMERICS_PIN_HYPOTHESIS"
 # is `main`, and a descendant needs a label of its own.
 ENV_ROOT_PID = "CUTRACER_NUMERICS_ROOT_PID"
 
-MODES = ("record", "check")
+# `autotune` records only the Triton autotuner's choices (a plain run before
+# the golden's, which then replays them).
+MODES = ("record", "check", "autotune")
 SAME = "same"
 SMALL = "small"
 LARGE = "large"
@@ -1118,7 +1134,7 @@ class _Recorder:
                     "record into an empty directory"
                 )
                 self.errors.append(self.refused)
-        else:
+        elif mode == "check":
             self._load_golden()
 
     @property
@@ -1515,6 +1531,12 @@ class _Recorder:
         self.out.mkdir(parents=True, exist_ok=True)
         if self.mode == "check":
             numerics = self.summary(env)
+        elif self.mode == "autotune":
+            numerics = {
+                "verdict": "autotune-recorded",
+                "calls": 0,
+                "errors": self.errors[:16],
+            }
         else:
             numerics = {
                 "verdict": "refused" if self.refused else "recorded",
@@ -1524,6 +1546,7 @@ class _Recorder:
                 "reused": self.reused,
                 "errors": self.errors[:16],
             }
+        numerics["autotune"] = _autotune_summary()
         result = {
             "schema": SCHEMA,
             "proc": self.proc,
@@ -1829,6 +1852,413 @@ def _public_entries(module: Any, module_name: str, custom_ops: bool) -> List[str
     return names
 
 
+# Triton autotuning ----------------------------------------------------------------
+
+ENV_PIN_AUTOTUNE = "CUTRACER_NUMERICS_PIN_AUTOTUNE"
+_AUTOTUNER_MODULE = "triton.runtime.autotuner"
+# Cached on each autotuner: its identity in this process.
+_IDENTITY = "_cutracer_numerics_identity"
+# Marks import hooks of any copy of this module, so none consults another.
+_HOOK_MARK = "_cutracer_numerics_import_hook"
+# Per thread: the recorded config that `_bench` picks for the autotuner
+# being tuned now, when that config is not in its config list.
+_fallback = threading.local()
+_import_guard = threading.local()
+
+
+class _AutotunePins:
+    """Triton autotuner choices: recorded from a plain run (`autotune` mode),
+    then forced in every run that records or checks numerics, so the golden
+    and the checked runs execute the same kernels."""
+
+    def __init__(self, mode: str, golden: Path, proc: str) -> None:
+        self.mode = mode  # "record" or "pin"
+        self.path = golden / f"autotune-{proc}.jsonl"
+        self.pid = os.getpid()
+        self.lock = threading.Lock()
+        # (autotuner, key) -> config; None when the record is ambiguous.
+        self.table: Dict[Tuple[str, str], Optional[str]] = {}
+        self.identities: Dict[str, int] = {}
+        # (autotuner instance, key) pairs this process has seen.
+        self.seen: Set[Tuple[int, str]] = set()
+        self.state = "triton not imported"
+        # Whether `_bench` is hooked, which a config the autotuner makes up
+        # while tuning needs.
+        self.bench_hooked = False
+        self.recorded = 0
+        self.pinned = 0
+        self.n_misses = 0
+        # The number of calls the capture had recorded at the first miss.
+        self.first_miss_k: Optional[int] = None
+        self.misses: List[str] = []
+        self.notes: List[str] = []
+        if mode == "record":
+            golden.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.open("x").close()
+            except FileExistsError:
+                self.state = f"unavailable: another process records {self.path.name}"
+            return
+        try:
+            for line in filter(None, self.path.read_text().splitlines()):
+                entry = json.loads(line)
+                slot = (entry["autotuner"], entry["key"])
+                same = self.table.get(slot, entry["config"]) == entry["config"]
+                self.table[slot] = entry["config"] if same else None
+        except FileNotFoundError:
+            self.state = "golden has no record"
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.state = f"unavailable: {error!r}"[:300]
+
+    @property
+    def waiting(self) -> bool:
+        return self.state == "triton not imported"
+
+    def miss(self, text: str) -> None:
+        with self.lock:
+            self.n_misses += 1
+            if self.first_miss_k is None:
+                self.first_miss_k = len(getattr(_RECORDER, "calls", ()))
+            if len(self.misses) < 16:
+                self.misses.append(text[:300])
+
+    def note(self, text: str) -> None:
+        with self.lock:
+            if len(self.notes) < 16:
+                self.notes.append(text[:300])
+
+    def first_sight(self, tuner: Any, key: Any) -> bool:
+        """Whether this is the first time the capture sees `key` of `tuner`
+        (an autotuner can have chosen it before the capture was installed)."""
+        slot = (id(tuner), repr(key))
+        with self.lock:
+            if slot in self.seen:
+                return False
+            self.seen.add(slot)
+            return True
+
+    def identity(self, tuner: Any) -> str:
+        """The autotuned function, its key names and configs, and the
+        autotuner's place among those that share them, in first-use order
+        (one function can be tuned by several autotuners).
+
+        First-use order is stable across runs only for sequential use:
+        autotuners of one function first used from several threads can swap
+        ordinals, which shows as misses (a record then fails). Record mode
+        names an autotuner after its `run` and pin mode before it, which is
+        the same order while no tuning happens inside another's `run`. The
+        name is cached on the instance, also across `uninstall()`."""
+        cached = vars(tuner).get(_IDENTITY)
+        if cached is not None:
+            return cached
+        fn = getattr(tuner, "base_fn", None) or getattr(tuner, "fn", None)
+        while fn is not None and not inspect.isfunction(fn) and hasattr(fn, "fn"):
+            fn = fn.fn
+        name = f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__qualname__', '?')}"
+        configs = "|".join(sorted(_config_identity(c) for c in tuner.configs))
+        digest = hashlib.sha256(configs.encode()).hexdigest()[:12]
+        base = f"{name}[{','.join(map(str, tuner.keys))}]#{digest}"
+        with self.lock:
+            ordinal = self.identities.get(base, 0)
+            self.identities[base] = ordinal + 1
+        identity = f"{base}#{ordinal}"
+        vars(tuner)[_IDENTITY] = identity
+        return identity
+
+    def record(self, tuner: Any, key: Any) -> None:
+        if os.getpid() != self.pid or self.state != "on":
+            return
+        entry = {
+            "autotuner": self.identity(tuner),
+            "key": repr(key),
+            "config": _config_identity(tuner.cache[key]),
+        }
+        with self.lock, self.path.open("a") as sink:
+            sink.write(json.dumps(entry) + "\n")
+            self.recorded += 1
+
+    def summary(self) -> Dict[str, Any]:
+        state = self.state
+        if self.waiting and _AUTOTUNER_MODULE in sys.modules:
+            state = f"missed: {_AUTOTUNER_MODULE} was imported but not patched"
+        return {
+            "pinning": state,
+            "recorded": self.recorded,
+            "pinned": self.pinned,
+            "misses": self.n_misses,
+            "first_miss_k": self.first_miss_k,
+            "miss_head": self.misses[:8],
+            "notes": self.notes[:8],
+        }
+
+
+def _config_identity(config: Any) -> str:
+    return json.dumps(config.all_kwargs(), sort_keys=True, default=repr)
+
+
+def _tuning_key(tuner: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+    """The key Triton's `Autotuner.run` keeps a choice under: the values of
+    its key arguments, then the dtype of every argument that has one."""
+    names = tuner.arg_names
+    given = {**dict(zip(names, args)), **kwargs}
+    picked = {name: value for name, value in given.items() if name in names}
+    key = [picked[name] for name in tuner.keys if name in picked]
+    key += [str(value.dtype) for value in picked.values() if hasattr(value, "dtype")]
+    return tuple(key)
+
+
+def _pin(
+    pins: _AutotunePins, tuner: Any, key: Any, args: Any, kwargs: Any
+) -> Optional[str]:
+    """Make `tuner` choose the recorded config for `key` without
+    benchmarking; that config's identity, or None after a miss."""
+    recorded = _recorded(pins, tuner, key)
+    if recorded is None:
+        return None
+    identity = pins.identity(tuner)
+    matches = [c for c in tuner.configs if _config_identity(c) == recorded]
+    if len(matches) > 1:
+        pins.miss(f"{identity} {key!r}: {len(matches)} configs match the record")
+        return None
+    if matches:
+        tuner.cache[key] = matches[0]
+        # What Triton does after benchmarking, before the launch.
+        nargs = dict(zip(tuner.arg_names, args))
+        tuner.pre_hook({**nargs, **kwargs, **matches[0].all_kwargs()}, reset_only=True)
+    elif pins.bench_hooked:
+        # A config the autotuner makes up while tuning (NPOT variants, a
+        # `prune_configs` override): `_bench` picks it.
+        _fallback_pins()[id(tuner)] = recorded
+    else:
+        pins.miss(
+            f"{identity} {key!r}: the recorded config is not one the autotuner "
+            "declares, and this Triton's Autotuner has no _bench to pick it"
+        )
+        return None
+    with pins.lock:
+        pins.pinned += 1
+    return recorded
+
+
+def _recorded(pins: _AutotunePins, tuner: Any, key: Any) -> Optional[str]:
+    """The recorded config for `key`, or None after a miss."""
+    identity = pins.identity(tuner)
+    slot = (identity, repr(key))
+    recorded = pins.table.get(slot)
+    if recorded is None:
+        why = (
+            "recorded with different configs"
+            if slot in pins.table
+            else "not in the golden's record"
+        )
+        pins.miss(f"{identity} {key!r}: {why}")
+    return recorded
+
+
+def _fallback_pins() -> Dict[int, str]:
+    if not hasattr(_fallback, "pins"):
+        _fallback.pins = {}
+    return _fallback.pins
+
+
+def _recording_run(original: Any) -> Any:
+    @functools.wraps(original)
+    def run(self: Any, *args: Any, **kwargs: Any) -> Any:
+        pins = _AUTOTUNE
+        cache = getattr(self, "cache", None)
+        if pins is None or not isinstance(cache, dict):
+            return original(self, *args, **kwargs)
+        before = set(cache)
+        try:
+            key = (
+                _tuning_key(self, args, kwargs)
+                if len(getattr(self, "configs", ())) > 1
+                else None
+            )
+        except Exception:  # noqa: B902
+            key = None
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            chosen = [k for k in list(cache) if k not in before]
+            for new in chosen:
+                pins.first_sight(self, new)
+            # A choice made before the capture was installed.
+            if key is not None and key in before and pins.first_sight(self, key):
+                chosen.append(key)
+            for new in chosen:
+                try:
+                    pins.record(self, new)
+                except Exception as error:  # noqa: B902
+                    pins.note(f"cannot record an autotuner choice: {error!r}")
+
+    return run
+
+
+def _pinned_run(original: Any) -> Any:
+    @functools.wraps(original)
+    def run(self: Any, *args: Any, **kwargs: Any) -> Any:
+        pins = _AUTOTUNE
+        if pins is None or pins.state != "on" or len(getattr(self, "configs", ())) < 2:
+            return original(self, *args, **kwargs)
+        key, expected = None, None
+        try:
+            key = _tuning_key(self, args, kwargs)
+            first = pins.first_sight(self, key)
+            if key not in self.cache:
+                expected = _pin(pins, self, key, args, kwargs)
+            elif first:
+                # Chosen before the capture was installed: checked before the
+                # launch, which can record a tensor.
+                recorded = _recorded(pins, self, key)
+                chosen = self.cache[key]
+                if recorded is not None and _config_identity(chosen) != recorded:
+                    pins.miss(f"{pins.identity(self)} {key!r}: chose {chosen}")
+        except Exception as error:  # noqa: B902
+            pins.miss(f"{getattr(self, 'fn', '?')}: cannot pin: {error!r}")
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _fallback_pins().pop(id(self), None)
+            if expected is not None:
+                chosen = self.cache.get(key)
+                if chosen is None or _config_identity(chosen) != expected:
+                    pins.miss(f"{pins.identity(self)} {key!r}: chose {chosen}")
+
+    return run
+
+
+def _pinned_bench(original: Any) -> Any:
+    @functools.wraps(original)
+    def _bench(self: Any, *args: Any, config: Any, **meta: Any) -> Any:
+        recorded = _fallback_pins().get(id(self))
+        if recorded is None:
+            return original(self, *args, config=config, **meta)
+        self._last_compiled_kernel = None
+        fastest = _config_identity(config) == recorded
+        return [0.0, 0.0, 0.0] if fastest else [float("inf")] * 3
+
+    return _bench
+
+
+def _pinned_disk_cache(original: Any) -> Any:
+    @functools.wraps(original)
+    def check_disk_cache(
+        self: Any, tuning_key: Any, configs: Any, bench_fn: Any
+    ) -> bool:
+        # A pinned run neither reads timings measured elsewhere nor writes
+        # its own (made up, or slowed down by CUTracer).
+        bench_fn()
+        return False
+
+    return check_disk_cache
+
+
+def _patch_autotuner(module: Any) -> None:
+    pins = _AUTOTUNE
+    if pins is None or not pins.waiting:
+        return
+    cls = getattr(module, "Autotuner", None)
+    if cls is None or not callable(getattr(cls, "run", None)):
+        pins.state = "unavailable: this Triton's Autotuner has no run"
+        return
+    if pins.mode == "record":
+        _hook(cls, "run", _recording_run)
+    else:
+        _hook(cls, "run", _pinned_run)
+        if callable(getattr(cls, "_bench", None)):
+            _hook(cls, "_bench", _pinned_bench)
+            pins.bench_hooked = True
+        if callable(getattr(cls, "check_disk_cache", None)):
+            _hook(cls, "check_disk_cache", _pinned_disk_cache)
+    pins.state = "on"
+
+
+class _PatchingLoader:
+    """Runs a module's loader, then patches the autotuner it defined."""
+
+    def __init__(self, loader: Any) -> None:
+        self.loader = loader
+
+    def create_module(self, spec: Any) -> Any:
+        create = getattr(self.loader, "create_module", None)
+        return create(spec) if create is not None else None
+
+    def exec_module(self, module: Any) -> None:
+        self.loader.exec_module(module)
+        _remove_import_hook()
+        try:
+            _patch_autotuner(module)
+        except Exception as error:  # noqa: B902
+            if _AUTOTUNE is not None:
+                _AUTOTUNE.state = f"unavailable: {error!r}"[:300]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loader, name)
+
+
+class _AutotunerImportHook:
+    """Patches Triton's autotuner as soon as it is imported: the capture is
+    imported before the test, and must not import Triton itself. Hooks of
+    other copies of this module are skipped (no recursion); such a copy then
+    reports `missed`, which fails a record rather than passing silently."""
+
+    _cutracer_numerics_import_hook = True
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname != _AUTOTUNER_MODULE or getattr(_import_guard, "active", False):
+            return None
+        _import_guard.active = True
+        try:
+            for finder in list(sys.meta_path):
+                if getattr(finder, _HOOK_MARK, False) or not hasattr(
+                    finder, "find_spec"
+                ):
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is None:
+                    continue
+                if spec.loader is not None and hasattr(spec.loader, "exec_module"):
+                    spec.loader = _PatchingLoader(spec.loader)
+                    return spec
+                return None
+        except Exception:  # noqa: B902
+            return None
+        finally:
+            _import_guard.active = False
+        return None
+
+
+_AUTOTUNE: Optional[_AutotunePins] = None
+_IMPORT_HOOK: Optional[_AutotunerImportHook] = None
+
+
+def _remove_import_hook() -> None:
+    global _IMPORT_HOOK
+    if _IMPORT_HOOK is not None and _IMPORT_HOOK in sys.meta_path:
+        sys.meta_path.remove(_IMPORT_HOOK)
+    _IMPORT_HOOK = None
+
+
+def _arm_autotune(mode: str, golden: Path, proc: str) -> None:
+    """Record (`autotune` mode) or pin the autotuner's choices, now if Triton
+    is imported, else right after it is."""
+    global _AUTOTUNE, _IMPORT_HOOK
+    _AUTOTUNE = _AutotunePins("record" if mode == "autotune" else "pin", golden, proc)
+    if not _AUTOTUNE.waiting:
+        return
+    module = sys.modules.get(_AUTOTUNER_MODULE)
+    if module is not None:
+        _patch_autotuner(module)
+        return
+    _IMPORT_HOOK = _AutotunerImportHook()
+    sys.meta_path.insert(0, _IMPORT_HOOK)
+
+
+def _autotune_summary() -> Dict[str, Any]:
+    return _AUTOTUNE.summary() if _AUTOTUNE is not None else {"pinning": "off"}
+
+
 def _pin_hypothesis() -> None:
     """Same examples in every run, no deadline (CUTracer slows kernels), and
     no shrinking (it adds calls after a failure)."""
@@ -1895,8 +2325,16 @@ def install() -> Any:
         _Unlabeled(out) if proc is None else _Recorder(mode, Path(golden), out, proc)
     )
     _RECORDER = recorder
-    _hook_comparisons(recorder)
-    _wrap_entries(recorder)
+    if mode != "autotune":
+        _hook_comparisons(recorder)
+        _wrap_entries(recorder)
+    if proc is not None and (
+        mode == "autotune" or os.environ.get(ENV_PIN_AUTOTUNE) != "0"
+    ):
+        try:
+            _arm_autotune(mode, Path(golden), proc)
+        except Exception as error:  # noqa: B902
+            recorder.capture_error(f"cannot pin Triton autotuning: {error!r}")
     if os.environ.get(ENV_PIN_HYPOTHESIS) == "1":
         _pin_hypothesis()
     if not _fork_hook_registered and hasattr(os, "register_at_fork"):
@@ -1908,7 +2346,7 @@ def install() -> Any:
 
 def uninstall() -> None:
     """Restore every hooked function and stop recording (without writing)."""
-    global _RECORDER, _refused
+    global _RECORDER, _refused, _AUTOTUNE
     while _HOOKS:
         owner, attr, original, wrapper, owned = _HOOKS.pop()
         if vars(owner).get(attr) is not wrapper:
@@ -1919,8 +2357,10 @@ def uninstall() -> None:
             delattr(owner, attr)
     _unregister_script_builtins()
     _restore_hypothesis()
+    _remove_import_hook()
     atexit.unregister(finish)
     _RECORDER = None
+    _AUTOTUNE = None
     _refused = False
 
 
@@ -1966,6 +2406,9 @@ def pytest_configure(config: Any) -> None:
 def pytest_runtest_setup(item: Any) -> None:
     if _RECORDER is not None:
         seed_everything()
+    # In case Triton was imported in a way the import hook did not see.
+    if _AUTOTUNE is not None and _AUTOTUNE.waiting and _AUTOTUNER_MODULE in sys.modules:
+        _patch_autotuner(sys.modules[_AUTOTUNER_MODULE])
 
 
 def pytest_sessionfinish(session: Any, exitstatus: Any) -> None:

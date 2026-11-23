@@ -24,14 +24,16 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Optional
+from typing import Any, Callable, cast, Optional
 from unittest import mock
 
 import hypothesis
 import numpy
 import pytest
 import torch
+import triton  # @manual=//triton:triton
 from cutracer.oracle.cli import numerics_capture_path, pytest_oracle
+from triton.runtime.autotuner import Autotuner  # @manual=//triton:triton
 
 _NAMES = itertools.count()
 _SCRUBBED = ("PYTEST_CURRENT_TEST", "RANK", "LOCAL_RANK")
@@ -1034,3 +1036,461 @@ class OracleWorkerTest(_CaptureTestCase):
         code, (large,) = run("check", NUMERICS_TEST_PERTURB="1")
         self.assertEqual((code, large["numerics"]["rule"]), (0, "large"))
         self.assertIn("test_numerics_plugin.py::test_values", large["reason"])
+
+
+def _autotuned(x: Any, n: int, BLOCK: int) -> None:
+    pass
+
+
+class _FakeJit:
+    """Stands in for a JITFunction under Triton's real autotuner: records the
+    BLOCK of every launch instead of running a kernel."""
+
+    def __init__(self) -> None:
+        self.fn = _autotuned
+        self.launches: list[int] = []
+
+    def run(self, *args: Any, **kwargs: Any) -> None:
+        self.launches.append(kwargs["BLOCK"])
+
+
+class AutotunePinningTest(_CaptureTestCase):
+    """Triton's own `Autotuner` on CPU: a fake kernel, and a fake benchmark
+    that times each BLOCK as `times` says."""
+
+    def tuner(
+        self,
+        times: dict[int, float],
+        cls: Any = Autotuner,
+        arg_names: Optional[list[str]] = None,
+        **options: Any,
+    ) -> tuple[Any, _FakeJit, list[int]]:
+        jit = _FakeJit()
+        benchmarked: list[int] = []
+
+        def do_bench(
+            kernel_call: Callable[[], Any], quantiles: Any = None
+        ) -> list[float]:
+            kernel_call()
+            benchmarked.append(jit.launches[-1])
+            return [times[jit.launches[-1]]] * 3
+
+        configs = [triton.Config({"BLOCK": 16}), triton.Config({"BLOCK": 32})]
+        reset = options.pop("reset_to_zero", None)
+        tuner = cls(
+            jit,
+            arg_names or ["x", "n"],
+            configs,
+            ["n"],
+            reset,
+            None,
+            do_bench=do_bench,
+            **options,
+        )
+        return tuner, jit, benchmarked
+
+    def pinned(self, body: Callable[[], None], **env: str) -> dict:
+        """Run `body` in a check that pins against the recorded choices; the
+        result's autotune summary."""
+        self.run_mode("check", body, out=self.out, env=env or None)
+        return self.autotune_summary(self.out)
+
+    def autotune_summary(self, out: Path) -> dict:
+        return self.summary(out)["autotune"]
+
+    def record_choices(self) -> None:
+        def body() -> None:
+            tuner, _, benchmarked = self.tuner({16: 2.0, 32: 1.0})
+            tuner.run(torch.zeros(4), 7)
+            self.assertEqual(benchmarked, [16, 32])
+
+        self.run_mode("autotune", body, out=self.tmp / "autotune")
+
+    def test_an_autotune_run_records_each_choice_under_triton_s_key(self) -> None:
+        self.record_choices()
+        (line,) = (self.golden / "autotune-main.jsonl").read_text().splitlines()
+        entry = json.loads(line)
+        self.assertEqual(entry["key"], repr((7, "torch.float32")))
+        self.assertEqual(json.loads(entry["config"])["BLOCK"], 32)
+        self.assertIn("_autotuned[n]#", entry["autotuner"])
+        summary = self.summary(self.tmp / "autotune")
+        self.assertEqual(summary["verdict"], "autotune-recorded")
+        self.assertEqual(summary["autotune"]["recorded"], 1)
+
+    def test_the_key_mirror_matches_triton_s_cache_key(self) -> None:
+        capture = self.load()
+        tuner, _, _ = self.tuner({16: 1.0, 32: 2.0})
+        x = torch.zeros(4, dtype=torch.float16)
+        tuner.run(x, n=5)
+        self.assertEqual(
+            list(tuner.cache), [capture._tuning_key(tuner, (x,), {"n": 5})]
+        )
+
+    def test_a_pinned_run_takes_the_recorded_config_without_benchmarking(self) -> None:
+        self.record_choices()
+        seen: dict[str, Any] = {}
+
+        def body() -> None:
+            # This benchmark would pick BLOCK 16.
+            tuner, jit, benchmarked = self.tuner({16: 1.0, 32: 2.0})
+            tuner.run(torch.zeros(4), 7)
+            seen.update(launches=list(jit.launches), benchmarked=list(benchmarked))
+            tuner.run(torch.zeros(4), 9)
+            seen.update(after_miss=list(benchmarked))
+
+        self.run_mode("check", body, out=self.out)
+        self.assertEqual((seen["launches"], seen["benchmarked"]), ([32], []))
+        self.assertEqual(seen["after_miss"], [16, 32])
+        autotune = self.autotune_summary(self.out)
+        self.assertEqual(
+            (autotune["pinning"], autotune["pinned"], autotune["misses"]), ("on", 1, 1)
+        )
+        self.assertIn("not in the golden's record", autotune["miss_head"][0])
+
+    def test_a_choice_made_before_the_capture_is_checked_against_the_record(
+        self,
+    ) -> None:
+        self.record_choices()
+        for times, misses in (({16: 2.0, 32: 1.0}, 0), ({16: 1.0, 32: 2.0}, 1)):
+            # Tuned before the capture was installed.
+            tuner, _, _ = self.tuner(times)
+            tuner.run(torch.zeros(4), 7)
+            out = self.tmp / f"check-{misses}"
+            # Looked up when it runs, so it reaches the patched `run`.
+            self.run_mode("check", lambda t=tuner: t.run(torch.zeros(4), 7), out=out)
+            autotune = self.autotune_summary(out)
+            with self.subTest(chosen=min(times, key=times.__getitem__)):
+                self.assertEqual((autotune["pinned"], autotune["misses"]), (0, misses))
+                if misses:
+                    self.assertIn("chose", autotune["miss_head"][0])
+
+    def test_a_choice_made_before_the_capture_misses_before_its_launch(self) -> None:
+        self.record_choices()
+        tuner, jit, _ = self.tuner({16: 1.0, 32: 2.0})
+        tuner.run(torch.zeros(4), 7)
+
+        def launch(*args: Any, **kwargs: Any) -> None:
+            # A launch that records a comparison, as a pre-hook can.
+            torch.testing.assert_close(torch.zeros(2), torch.zeros(2))
+
+        jit.run = launch
+        out = self.tmp / "check"
+        self.run_mode("check", lambda: tuner.run(torch.zeros(4), 7), out=out)
+        autotune = self.autotune_summary(out)
+        self.assertEqual((autotune["misses"], autotune["first_miss_k"]), (1, 0))
+
+    def test_a_choice_made_before_the_capture_is_recorded(self) -> None:
+        tuner, _, _ = self.tuner({16: 2.0, 32: 1.0})
+        tuner.run(torch.zeros(4), 7)
+        self.run_mode(
+            "autotune", lambda: tuner.run(torch.zeros(4), 7), out=self.tmp / "autotune"
+        )
+        (line,) = (self.golden / "autotune-main.jsonl").read_text().splitlines()
+        self.assertEqual(json.loads(json.loads(line)["config"])["BLOCK"], 32)
+
+    def test_a_pinned_run_neither_reads_nor_writes_the_disk_cache(self) -> None:
+        self.record_choices()
+        capture = self.load(
+            CUTRACER_NUMERICS_MODE="check",
+            CUTRACER_NUMERICS_GOLDEN=str(self.golden),
+            CUTRACER_NUMERICS_OUT=str(self.out),
+        )
+        tuner, _, _ = self.tuner({16: 1.0, 32: 2.0})
+        ran: list[bool] = []
+        self.assertFalse(
+            tuner.check_disk_cache((1,), tuner.configs, lambda: ran.append(True))
+        )
+        self.assertEqual(ran, [True])
+        capture.uninstall()
+
+    def test_without_a_record_or_with_pinning_off_nothing_is_pinned(self) -> None:
+        original = Autotuner.run
+        self.run_mode("check", lambda: None, out=self.out)
+        self.assertEqual(
+            self.autotune_summary(self.out)["pinning"], "golden has no record"
+        )
+        self.assertIs(Autotuner.run, original)
+        self.record_choices()
+        self.run_mode(
+            "check",
+            lambda: self.assertIs(Autotuner.run, original),
+            out=self.tmp / "off",
+            env={"CUTRACER_NUMERICS_PIN_AUTOTUNE": "0"},
+        )
+        self.assertEqual(self.autotune_summary(self.tmp / "off")["pinning"], "off")
+
+    def test_uninstall_restores_the_autotuner(self) -> None:
+        before = (Autotuner.run, Autotuner._bench, Autotuner.check_disk_cache)
+        self.record_choices()
+        capture = self.load(
+            CUTRACER_NUMERICS_MODE="check",
+            CUTRACER_NUMERICS_GOLDEN=str(self.golden),
+            CUTRACER_NUMERICS_OUT=str(self.out),
+        )
+        self.assertIsNot(Autotuner.run, before[0])
+        capture.uninstall()
+        self.assertEqual(
+            (Autotuner.run, Autotuner._bench, Autotuner.check_disk_cache), before
+        )
+
+    def test_an_autotuner_imported_after_the_capture_is_patched(self) -> None:
+        name = f"cutracer_fake_autotuner_{next(_NAMES)}"
+        (self.tmp / f"{name}.py").write_text(
+            "class Autotuner:\n"
+            "    def run(self, *args, **kwargs):\n        return 'run'\n"
+            "    def _bench(self, *args, config, **meta):\n        return [1.0]\n"
+            "    def check_disk_cache(self, key, configs, bench_fn):\n        return True\n"
+        )
+        sys.path.insert(0, str(self.tmp))
+        self.addCleanup(sys.path.remove, str(self.tmp))
+        self.addCleanup(sys.modules.pop, name, None)
+        self.record_choices()
+        capture = self.load()
+        with mock.patch.object(capture, "_AUTOTUNER_MODULE", name):
+            os.environ.update(
+                CUTRACER_NUMERICS_MODE="check",
+                CUTRACER_NUMERICS_GOLDEN=str(self.golden),
+                CUTRACER_NUMERICS_OUT=str(self.out),
+            )
+            capture.install()
+            self.assertEqual(capture._AUTOTUNE.state, "triton not imported")
+            module = __import__(name)
+            self.assertEqual(capture._AUTOTUNE.state, "on")
+            self.assertTrue(
+                hasattr(module.Autotuner.run, "_cutracer_numerics_original")
+            )
+            capture.uninstall()
+            self.assertFalse(
+                hasattr(module.Autotuner.run, "_cutracer_numerics_original")
+            )
+            self.assertNotIn(capture._IMPORT_HOOK, sys.meta_path)
+
+    def test_a_config_the_autotuner_makes_up_is_pinned_while_benchmarking(
+        self,
+    ) -> None:
+        class Widening(Autotuner):
+            def prune_configs(self, kwargs: Any) -> Any:
+                return [*self.configs, triton.Config({"BLOCK": 64})]
+
+        def record() -> None:
+            tuner, jit, _ = self.tuner({16: 2.0, 32: 2.0, 64: 1.0}, Widening)
+            tuner.run(torch.zeros(4), 7)
+            self.assertEqual(jit.launches[-1], 64)
+
+        self.run_mode("autotune", record, out=self.tmp / "autotune")
+        seen: dict[str, Any] = {}
+
+        def body() -> None:
+            tuner, jit, benchmarked = self.tuner({16: 1.0, 32: 2.0, 64: 3.0}, Widening)
+            tuner.run(torch.zeros(4), 7)
+            seen.update(launch=jit.launches[-1], benchmarked=benchmarked)
+
+        autotune = self.pinned(body)
+        self.assertEqual((seen["launch"], seen["benchmarked"]), (64, []))
+        self.assertEqual((autotune["pinned"], autotune["misses"]), (1, 0))
+
+    def test_an_autotuner_without_bench_still_pins_the_configs_it_declares(
+        self,
+    ) -> None:
+        self.record_choices()
+        seen: dict[str, Any] = {}
+
+        def body() -> None:
+            tuner, jit, benchmarked = self.tuner({16: 1.0, 32: 2.0})
+            tuner.run(torch.zeros(4), 7)
+            seen.update(launch=jit.launches[-1], benchmarked=benchmarked)
+
+        with mock.patch.object(Autotuner, "_bench", None):
+            autotune = self.pinned(body)
+        self.assertEqual((seen["launch"], seen["benchmarked"]), (32, []))
+        self.assertEqual(
+            (autotune["pinning"], autotune["pinned"], autotune["misses"]), ("on", 1, 0)
+        )
+
+    def test_a_made_up_config_is_a_miss_when_bench_is_not_hooked(self) -> None:
+        class Widening(Autotuner):
+            def prune_configs(self, kwargs: Any) -> Any:
+                return [*self.configs, triton.Config({"BLOCK": 64})]
+
+        self.run_mode(
+            "autotune",
+            lambda: self.tuner({16: 2.0, 32: 2.0, 64: 1.0}, Widening)[0].run(
+                torch.zeros(4), 7
+            ),
+            out=self.tmp / "autotune",
+        )
+        capture = self.load()
+        pins = capture._AutotunePins("pin", self.golden, "main")
+        tuner, _, _ = self.tuner({16: 1.0, 32: 2.0}, Widening)
+        args = (torch.zeros(4), 7)
+        key = capture._tuning_key(tuner, args, {})
+        self.assertIsNone(capture._pin(pins, tuner, key, args, {}))
+        self.assertEqual((pins.pinned, pins.n_misses), (0, 1))
+        self.assertIn("no _bench", pins.misses[0])
+
+    def test_a_different_choice_than_the_record_is_a_miss(self) -> None:
+        class Widening(Autotuner):
+            def prune_configs(self, kwargs: Any) -> Any:
+                return [*self.configs, triton.Config({"BLOCK": 64})]
+
+        def record() -> None:
+            tuner, _, _ = self.tuner({16: 2.0, 32: 2.0, 64: 1.0}, Widening)
+            tuner.run(torch.zeros(4), 7)
+
+        self.run_mode("autotune", record, out=self.tmp / "autotune")
+        # This run never offers the recorded BLOCK 64.
+        autotune = self.pinned(
+            lambda: self.tuner({16: 1.0, 32: 2.0})[0].run(torch.zeros(4), 7)
+        )
+        self.assertEqual(autotune["misses"], 1)
+        self.assertIn("chose", autotune["miss_head"][0])
+
+    def test_an_ambiguous_record_is_a_miss(self) -> None:
+        self.record_choices()
+        record = self.golden / "autotune-main.jsonl"
+        (line,) = record.read_text().splitlines()
+        other = json.loads(line)
+        other["config"] = other["config"].replace('"BLOCK": 32', '"BLOCK": 16')
+        record.write_text(line + "\n" + json.dumps(other) + "\n")
+        autotune = self.pinned(
+            lambda: self.tuner({16: 1.0, 32: 2.0})[0].run(torch.zeros(4), 7)
+        )
+        self.assertIn("recorded with different configs", autotune["miss_head"][0])
+
+    def test_pinning_resets_as_triton_does_after_benchmarking(self) -> None:
+        def record() -> None:
+            tuner, _, _ = self.tuner({16: 2.0, 32: 1.0}, reset_to_zero=["x"])
+            tuner.run(torch.ones(4), 7)
+
+        self.run_mode("autotune", record, out=self.tmp / "autotune")
+        x = torch.ones(4)
+        self.pinned(
+            lambda: self.tuner({16: 1.0, 32: 2.0}, reset_to_zero=["x"])[0].run(x, 7)
+        )
+        self.assertEqual(x.tolist(), [0.0] * 4)
+
+    def test_heuristics_over_an_autotuner_are_pinned(self) -> None:
+        def run(times: dict[int, float]) -> list[int]:
+            tuner, jit, _ = self.tuner(times)
+            heuristic = triton.runtime.autotuner.Heuristics(
+                tuner, ["x", "n"], {"EXTRA": lambda args: args["n"] + 1}
+            )
+            heuristic.run(torch.zeros(4), 7)
+            return jit.launches
+
+        self.run_mode(
+            "autotune", lambda: run({16: 2.0, 32: 1.0}), out=self.tmp / "autotune"
+        )
+        launches: list[int] = []
+        autotune = self.pinned(lambda: launches.extend(run({16: 1.0, 32: 2.0})))
+        self.assertEqual((launches, autotune["misses"]), ([32], 0))
+
+    def test_a_pinned_run_with_disk_caching_writes_no_cache_file(self) -> None:
+        self.record_choices()
+        cache = self.tmp / "triton_cache"
+
+        def body() -> None:
+            with mock.patch.dict(os.environ, {"TRITON_CACHE_DIR": str(cache)}):
+                tuner, _, benchmarked = self.tuner(
+                    {16: 1.0, 32: 2.0}, cache_results=True
+                )
+                tuner.run(torch.zeros(4), 9)
+                self.assertEqual(benchmarked, [16, 32])
+
+        autotune = self.pinned(body)
+        self.assertEqual(autotune["misses"], 1)
+        self.assertEqual(list(cache.rglob("*.json")) if cache.exists() else [], [])
+
+    def test_autotuners_that_share_a_function_are_told_apart(self) -> None:
+        def run(first: dict[int, float], second: dict[int, float]) -> list[int]:
+            a, jit_a, _ = self.tuner(first)
+            b, jit_b, _ = self.tuner(second)
+            a.run(torch.zeros(4), 7)
+            b.run(torch.zeros(4), 7)
+            return jit_a.launches[-1:] + jit_b.launches[-1:]
+
+        self.run_mode(
+            "autotune",
+            lambda: self.assertEqual(
+                run({16: 1.0, 32: 2.0}, {16: 2.0, 32: 1.0}), [16, 32]
+            ),
+            out=self.tmp / "autotune",
+        )
+        launches: list[int] = []
+        autotune = self.pinned(
+            lambda: launches.extend(run({16: 3.0, 32: 3.0}, {16: 3.0, 32: 3.0}))
+        )
+        self.assertEqual((launches, autotune["misses"]), ([16, 32], 0))
+
+    def test_the_key_mirror_with_keyword_and_several_dtype_arguments(self) -> None:
+        capture = self.load()
+        tuner, _, _ = self.tuner({16: 1.0, 32: 2.0}, arg_names=["x", "y", "n"])
+        x = torch.zeros(4, dtype=torch.float16)
+        y = torch.zeros(4, dtype=torch.int32)
+        tuner.run(x, n=5, y=y)
+        self.assertEqual(
+            list(tuner.cache), [capture._tuning_key(tuner, (x,), {"n": 5, "y": y})]
+        )
+
+    def test_an_autotuner_imported_without_the_hook_is_reported(self) -> None:
+        name = f"cutracer_fake_autotuner_{next(_NAMES)}"
+        self.record_choices()
+        capture = self.load()
+        with mock.patch.object(capture, "_AUTOTUNER_MODULE", name):
+            os.environ.update(
+                CUTRACER_NUMERICS_MODE="check",
+                CUTRACER_NUMERICS_GOLDEN=str(self.golden),
+                CUTRACER_NUMERICS_OUT=str(self.out),
+            )
+            capture.install()
+            with mock.patch.dict(sys.modules, {name: ModuleType(name)}):
+                capture.finish()
+            capture.uninstall()
+        self.assertTrue(self.autotune_summary(self.out)["pinning"].startswith("missed"))
+
+    def test_a_second_recorder_of_one_label_does_not_truncate_the_record(self) -> None:
+        self.record_choices()
+        record = (self.golden / "autotune-main.jsonl").read_text()
+        self.run_mode("autotune", lambda: None, out=self.tmp / "again")
+        self.assertIn(
+            "unavailable", self.autotune_summary(self.tmp / "again")["pinning"]
+        )
+        self.assertEqual((self.golden / "autotune-main.jsonl").read_text(), record)
+
+    def test_a_loader_without_create_module_still_imports(self) -> None:
+        name = f"cutracer_fake_autotuner_{next(_NAMES)}"
+
+        class OnlyExec:
+            def exec_module(self, module: Any) -> None:
+                exec(
+                    "class Autotuner:\n"
+                    "    def run(self, *a, **k):\n        return 'run'\n"
+                    "    def _bench(self, *a, config, **m):\n        return [1.0]\n",
+                    vars(module),
+                )
+
+        class Finder:
+            def find_spec(
+                self, fullname: str, path: Any = None, target: Any = None
+            ) -> Any:
+                if fullname != name:
+                    return None
+                return importlib.util.spec_from_loader(fullname, cast(Any, OnlyExec()))
+
+        finder = Finder()
+        sys.meta_path.append(finder)
+        self.addCleanup(sys.meta_path.remove, finder)
+        self.addCleanup(sys.modules.pop, name, None)
+        self.record_choices()
+        capture = self.load()
+        with mock.patch.object(capture, "_AUTOTUNER_MODULE", name):
+            os.environ.update(
+                CUTRACER_NUMERICS_MODE="check",
+                CUTRACER_NUMERICS_GOLDEN=str(self.golden),
+                CUTRACER_NUMERICS_OUT=str(self.out),
+            )
+            capture.install()
+            module = __import__(name)
+            self.assertEqual(module.Autotuner().run(), "run")
+            self.assertEqual(capture._AUTOTUNE.state, "on")
+            capture.uninstall()
