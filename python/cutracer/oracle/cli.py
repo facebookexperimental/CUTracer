@@ -53,6 +53,16 @@ def numerics_capture_path() -> Iterator[Path]:
         yield path
 
 
+@contextlib.contextmanager
+def loaded_oracle() -> Iterator[ModuleType]:
+    """`pytest_oracle()`, pointed at the numerics capture resource (an
+    exported oracle finds the capture beside itself instead)."""
+    with pytest_oracle() as oracle, numerics_capture_path() as capture:
+        # A module attribute the script reads when no --numerics-capture is given.
+        setattr(oracle, "NUMERICS_CAPTURE", capture)  # noqa: B010
+        yield oracle
+
+
 @click.group(name="oracle")
 def oracle_command() -> None:
     """Turn a test into a stress/reduce oracle.
@@ -75,7 +85,7 @@ def oracle_pytest_command(args: tuple[str, ...]) -> None:
     for anything else.
     """
     try:
-        with pytest_oracle() as oracle:
+        with loaded_oracle() as oracle:
             code = oracle.main(list(args), prog="cutracer oracle pytest")
     except Exception as error:  # noqa: B902
         # Python's own exit code for an uncaught exception is 1, which a
@@ -136,6 +146,37 @@ def oracle_pytest_command(args: tuple[str, ...]) -> None:
     default=False,
     help="Run without CUTracer (a preflight).",
 )
+@click.option(
+    "--numerics",
+    type=click.Choice(["record", "check"]),
+    default=None,
+    help="check: a large change of a tensor the command compares counts as a "
+    "reproduction; record: write the golden from plain runs.",
+)
+@click.option(
+    "--golden",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The numerics golden directory.",
+)
+@click.option(
+    "--numerics-runs",
+    default=None,
+    metavar="N",
+    help="record: plain runs in all, the first recording (default: 3).",
+)
+@click.option(
+    "--numerics-wrap",
+    multiple=True,
+    metavar="MODULE:FUNCTION",
+    help="Also compare this function's tensor results; repeatable.",
+)
+@click.option(
+    "--numerics-strict",
+    is_flag=True,
+    default=False,
+    help="check: count any change of a tensor stable in every plain run.",
+)
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
 def oracle_cmd_command(
     fail_codes: str | None,
@@ -146,6 +187,11 @@ def oracle_cmd_command(
     signature_file: Path | None,
     timeout: str | None,
     plain: bool,
+    numerics: str | None,
+    golden: Path | None,
+    numerics_runs: str | None,
+    numerics_wrap: tuple[str, ...],
+    numerics_strict: bool,
     command: tuple[str, ...],
 ) -> None:
     """Run any command as a stress/reduce oracle.
@@ -156,26 +202,33 @@ def oracle_cmd_command(
     """
     # Only forward what the user gave: the standalone script owns the
     # defaults and all validation, so they live in exactly one place.
-    argv: list[str] = []
-    if fail_codes is not None:
-        argv += ["--fail-codes", fail_codes]
-    if pass_codes is not None:
-        argv += ["--pass-codes", pass_codes]
-    if fail_pattern is not None:
-        argv += ["--fail-pattern", fail_pattern]
-    if kernels is not None:
-        argv += ["--kernels", kernels]
-    if output_dir is not None:
-        argv += ["--output-dir", str(output_dir)]
-    if signature_file is not None:
-        argv += ["--signature-file", str(signature_file)]
-    if timeout is not None:
-        argv += ["--timeout", timeout]
-    if plain:
-        argv.append("--plain")
+    valued = (
+        ("--fail-codes", fail_codes),
+        ("--pass-codes", pass_codes),
+        ("--fail-pattern", fail_pattern),
+        ("--kernels", kernels),
+        ("--output-dir", output_dir),
+        ("--signature-file", signature_file),
+        ("--timeout", timeout),
+        ("--numerics", numerics),
+        ("--golden", golden),
+        ("--numerics-runs", numerics_runs),
+    )
+    argv = [
+        part
+        for flag, value in valued
+        if value is not None
+        for part in (flag, str(value))
+    ]
+    argv += [
+        flag
+        for flag, on in (("--plain", plain), ("--numerics-strict", numerics_strict))
+        if on
+    ]
+    argv += [f"--numerics-wrap={entry}" for entry in numerics_wrap]
     argv += ["--", *command]
     try:
-        with pytest_oracle() as oracle:
+        with loaded_oracle() as oracle:
             code = oracle.main_cmd(argv, prog="cutracer oracle cmd")
     except Exception as error:  # noqa: B902
         # Python's own exit code for an uncaught exception is 1, which a
@@ -195,12 +248,21 @@ def oracle_export_command(path: Path) -> None:
     instead of starting CUTracer for every run: `PYTHON PATH --rootdir ...
     --nodeid ...` for one pytest node, or `PYTHON PATH cmd --fail-codes ...
     -- <command>` for any command. `--python` defaults to the interpreter
-    that runs it.
+    that runs it. The numerics capture (`--numerics`) is written beside it,
+    as cutracer_numerics.py.
     """
-    text = resources.files("cutracer.oracle").joinpath(_PYTEST_ORACLE).read_text()
+    if path.name == _NUMERICS_CAPTURE:
+        raise click.BadParameter(
+            f"{_NUMERICS_CAPTURE} is the capture's own name", param_hint="PATH"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(text)
-    tmp.chmod(0o755)
-    os.replace(tmp, path)
+    files = resources.files("cutracer.oracle")
+    for name, target, mode in (
+        (_NUMERICS_CAPTURE, path.with_name(_NUMERICS_CAPTURE), 0o644),
+        (_PYTEST_ORACLE, path, 0o755),
+    ):
+        tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(files.joinpath(name).read_text())
+        tmp.chmod(mode)
+        os.replace(tmp, target)
     click.echo(str(path))

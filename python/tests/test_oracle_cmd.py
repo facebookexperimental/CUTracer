@@ -26,7 +26,7 @@ from typing import Any
 from unittest import mock
 
 from click.testing import CliRunner
-from cutracer.oracle.cli import oracle_command, pytest_oracle
+from cutracer.oracle.cli import loaded_oracle, oracle_command, pytest_oracle
 
 REPRODUCED, PASSED, INCOMPLETE = 0, 1, 2
 
@@ -48,10 +48,28 @@ _FAKE_CMD = textwrap.dedent(
                                  "kernel_checksum": "beef"}) + "\\n")
     if script.get("sleep"):
         time.sleep(script["sleep"])
+    # The capture's files, per numerics mode (a list: one entry per run).
+    mode = os.environ.get("CUTRACER_NUMERICS_MODE", "")
+    numerics = script.get("numerics", {}).get(mode) or {}
+    if isinstance(numerics, list):
+        counter = os.environ["FAKE_SEEN"] + "." + mode
+        done = int(open(counter).read()) if os.path.exists(counter) else 0
+        open(counter, "w").write(str(done + 1))
+        numerics = numerics[done]
+    for key, folder in (("out", "CUTRACER_NUMERICS_OUT"),
+                        ("golden", "CUTRACER_NUMERICS_GOLDEN")):
+        for name, value in numerics.get(key, {}).items():
+            os.makedirs(os.environ[folder], exist_ok=True)
+            with open(os.path.join(os.environ[folder], name), "w") as fh:
+                json.dump(value, fh)
+    shown = {k: v for k, v in os.environ.items()
+             if k.startswith("CUTRACER_NUMERICS_")
+             or k in ("PYTHONHASHSEED", "PYTHONPATH", "PYTEST_PLUGINS")}
     with open(os.environ["FAKE_SEEN"], "w") as fh:
         json.dump({"argv": sys.argv[1:], "dump": dump,
                    "load": os.environ.get("CUTRACER_DELAY_LOAD_PATH"),
-                   "events": os.environ.get("CUTRACER_KERNEL_EVENTS")}, fh)
+                   "events": os.environ.get("CUTRACER_KERNEL_EVENTS"),
+                   "env": shown}, fh)
     sys.stdout.write(script.get("output", ""))
     sys.stdout.flush()
     sys.exit(script.get("exit", 0))
@@ -136,6 +154,111 @@ class _OracleTestCase(unittest.TestCase):
         self.oracle = stack.enter_context(pytest_oracle())
         self.root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
         self.fx = _Fixture(self.root, self.oracle)
+
+
+def _summary(verdict: str = "same", **kw: Any) -> dict[str, Any]:
+    """A capture result file (`numerics-main.json`)."""
+    numerics: dict[str, Any] = {
+        "verdict": verdict,
+        "calls": 2,
+        "golden_calls": 2,
+        "environment": [],
+        "structure": [],
+        "first_structure_k": None,
+        "first_large_k": None,
+        "missing_calls": 0,
+        "first_large": None,
+        "changed": [],
+        "changed_stable_leaves": 0,
+        "stable_changed_head": [],
+        "errors": [],
+    }
+    if verdict == "large":
+        change = {"verdict": "large", "call": "c", "leaf": "a0", "rel_l2": 0.3}
+        numerics.update(first_large_k=0, first_large=change, changed=[change])
+    numerics.update(kw)
+    return {"schema": 1, "proc": "main", "numerics": numerics}
+
+
+class NumericsCmdTest(unittest.TestCase):
+    def setUp(self) -> None:
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.oracle = stack.enter_context(loaded_oracle())
+        self.root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.fx = _Fixture(self.root, self.oracle)
+        self.command = [sys.executable, str(self.fx.cmd)]
+        self.golden = self.root / "golden"
+
+    def write_golden(self) -> None:
+        self.golden.mkdir()
+        (self.golden / "calls-main.json").write_text(json.dumps({"calls": []}))
+        manifest = {
+            "oracle": "cmd",
+            "command": self.command,
+            "cwd": os.getcwd(),
+            "settings": {"PYTHONHASHSEED": "0"},
+            "plain_runs": 2,
+        }
+        (self.golden / "manifest.json").write_text(json.dumps(manifest))
+
+    def check(self, out: dict[str, Any], exit: int = 0, **kw: Any) -> int:
+        numerics = self.oracle.NumericsOptions(mode="check", golden=self.golden)
+        script = {"exit": exit, "numerics": {"check": {"out": out}}}
+        return self.fx.run(script, injected=False, plain=True, numerics=numerics, **kw)
+
+    def test_the_command_finds_the_capture_through_pythonpath(self) -> None:
+        self.write_golden()
+        code = self.check(
+            {"numerics-main.json": _summary()},
+            env={"PYTEST_PLUGINS": "other", "PYTHONPATH": "/old"},
+        )
+        self.assertEqual(code, PASSED)
+        env = json.loads(self.fx.seen.read_text())["env"]
+        lib = env["CUTRACER_NUMERICS_LIB"]
+        self.assertTrue(Path(lib, "cutracer_numerics.py").is_file())
+        self.assertEqual(env["PYTHONPATH"], f"{lib}{os.pathsep}/old")
+        self.assertEqual(env["PYTEST_PLUGINS"], "other,cutracer_numerics")
+        self.assertEqual(env["CUTRACER_NUMERICS_ROOT"], os.getcwd())
+        self.assertEqual(env["PYTHONHASHSEED"], "0")
+
+    def test_a_large_change_of_a_passing_command_reproduces(self) -> None:
+        self.write_golden()
+        sig = self.root / "sig"
+        code = self.check({"numerics-main.json": _summary("large")}, signature_file=sig)
+        self.assertEqual(code, REPRODUCED)
+        self.assertEqual(
+            sig.read_text().strip(), self.oracle.numerics_signature(self.command)
+        )
+        # A fail code is the same failure.
+        self.assertEqual(self.check({}, exit=1, signature_file=sig), REPRODUCED)
+
+    def test_a_command_that_never_imports_the_capture_measured_nothing(self) -> None:
+        self.write_golden()
+        self.assertEqual(self.check({}), INCOMPLETE)
+        self.assertIn("never imported cutracer_numerics", self.fx.outcome()["reason"])
+
+    def test_record_runs_the_command_and_writes_the_golden(self) -> None:
+        numerics = self.oracle.NumericsOptions(
+            mode="record", golden=self.golden, runs=2
+        )
+        recorded = {
+            "out": {"numerics-main.json": _summary("recorded", errors=[])},
+            "golden": {"calls-main.json": {"schema": 1, "calls": []}},
+        }
+        script = {
+            "numerics": {
+                "record": recorded,
+                "check": [{"out": {"numerics-main.json": _summary("same")}}],
+            }
+        }
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.fx.run(script, injected=False, numerics=numerics)
+        self.assertEqual(code, 0)
+        manifest = json.loads((self.golden / "manifest.json").read_text())
+        self.assertEqual(
+            (manifest["oracle"], manifest["command"]), ("cmd", self.command)
+        )
 
 
 class RunCmdOracleTest(_OracleTestCase):
@@ -472,6 +595,26 @@ class OracleCmdCliTest(unittest.TestCase):
                 "python",
                 "test.py",
                 "--foo",
+            ],
+            prog="cutracer oracle cmd",
+        )
+        self.assertEqual(Path(fake.NUMERICS_CAPTURE).name, "cutracer_numerics.py")
+        fake.main_cmd.reset_mock()
+        numerics = ["cmd", "--numerics", "check", "--golden", "g"]
+        numerics += ["--numerics-wrap", "m:f", "--numerics-strict", "--", "true"]
+        with mock.patch("cutracer.oracle.cli.pytest_oracle", loaded):
+            invoked = CliRunner().invoke(oracle_command, numerics)
+        self.assertEqual(invoked.exit_code, REPRODUCED, invoked.output)
+        fake.main_cmd.assert_called_once_with(
+            [
+                "--numerics",
+                "check",
+                "--golden",
+                "g",
+                "--numerics-strict",
+                "--numerics-wrap=m:f",
+                "--",
+                "true",
             ],
             prog="cutracer oracle cmd",
         )

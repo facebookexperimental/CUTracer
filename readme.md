@@ -115,7 +115,7 @@ A data race depends on timing, so a buggy kernel can pass by luck. `random_delay
 cutracer stress -k my_kernel --confirm -o /tmp/stress -- ./oracle.sh
 ```
 
-`/tmp/stress/stress_report.json` gives the verdict: `finding` when the injected delay made the difference, `suspect` when the failure cannot be credited to the delay (for example, it also happens without one), `clean` when every planned attempt ran and none reproduced, and `incomplete` otherwise. `--confirm` checks a finding by shrinking it to the delay points that matter and replaying the result, and `cutracer stress` prints the `cutracer reduce` command for the saved config. `cutracer oracle pytest` turns one pytest node into an oracle without a wrapper script.
+`/tmp/stress/stress_report.json` gives the verdict: `finding` when the injected delay made the difference, `suspect` when the failure cannot be credited to the delay (for example, it also happens without one), `clean` when every planned attempt ran and none reproduced, and `incomplete` otherwise. `--confirm` checks a finding by shrinking it to the delay points that matter and replaying the result, and `cutracer stress` prints the `cutracer reduce` command for the saved config. `cutracer oracle pytest` turns one pytest node into an oracle without a wrapper script, and `--numerics` makes it compare every tensor the test compares with a golden from plain runs, which catches a race whose error stays within the test's tolerance.
 
 To record, replay and shrink a delay config by hand:
 

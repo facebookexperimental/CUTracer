@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Optional
@@ -30,7 +31,7 @@ import hypothesis
 import numpy
 import pytest
 import torch
-from cutracer.oracle.cli import numerics_capture_path
+from cutracer.oracle.cli import numerics_capture_path, pytest_oracle
 
 _NAMES = itertools.count()
 _SCRUBBED = ("PYTEST_CURRENT_TEST", "RANK", "LOCAL_RANK")
@@ -960,3 +961,76 @@ class PytestPluginTest(_CaptureTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(seed_file.read_text(), "0")
         self.assertEqual(self.summary(self.tmp / "record")["calls"], 1)
+
+
+class OracleWorkerTest(_CaptureTestCase):
+    """The oracle's pytest worker loads the capture by path under real pytest
+    and torch; the oracle then judges the files the capture wrote, so the two
+    scripts agree on the format."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.oracle = stack.enter_context(pytest_oracle())
+        (self.tmp / "test_numerics_plugin.py").write_text(_PLUGIN_TEST)
+
+    def in_process_child(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        log_path: Path,
+        timeout_s: Optional[float],
+        what: str = "the node",
+    ) -> tuple[int, list[str]]:
+        """`_run_child` that runs the worker command in this process."""
+        log_path.write_text("")
+        args = self.oracle.build_parser().parse_args(command[2:])
+        with mock.patch.dict(os.environ, env, clear=True):
+            try:
+                return self.oracle.run_worker(args), []
+            finally:
+                capture = sys.modules.pop("cutracer_numerics", None)
+                if capture is not None:
+                    capture.uninstall()
+                sys.modules.pop("test_numerics_plugin", None)
+
+    def test_record_and_check_through_the_oracle(self) -> None:
+        options = self.oracle.OracleOptions(
+            python=sys.executable,
+            rootdir=self.tmp,
+            nodeid="test_numerics_plugin.py::test_values",
+            plain=True,
+        )
+
+        def run(mode: str, **env: str) -> tuple[int, list[dict[str, Any]]]:
+            """The oracle's exit code, and the outcome of each of its runs."""
+            numerics = self.oracle.NumericsOptions(mode=mode, golden=self.golden)
+            evidence = Path(tempfile.mkdtemp(dir=self.tmp))
+            with mock.patch.dict(
+                os.environ, {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", **env}
+            ):
+                with mock.patch.object(
+                    self.oracle, "_run_child", self.in_process_child
+                ):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        code = self.oracle.run_oracle(
+                            replace(options, numerics=numerics, output_dir=evidence)
+                        )
+            outcomes = evidence.glob("attempt-*/outcome.json")
+            return code, [json.loads(path.read_text()) for path in outcomes]
+
+        self.assertEqual(run("record")[0], 0)
+        manifest = json.loads((self.golden / "manifest.json").read_text())
+        self.assertEqual(manifest["plain_runs"], 2)
+        calls = json.loads((self.golden / "calls-main.json").read_text())["calls"]
+        plain = {leaf["name"]: leaf.get("plain") for leaf in calls[0]["leaves"]}
+        self.assertEqual(
+            plain["a0"], {"runs": 2, "changed": 0, "max_rel_l2": 0.0, "max_ulp": 0}
+        )
+        code, (same,) = run("check")
+        self.assertEqual((code, same["numerics"]["rule"]), (1, "comparable"))
+        self.assertIn("numerics same over 1 calls", same["reason"])
+        code, (large,) = run("check", NUMERICS_TEST_PERTURB="1")
+        self.assertEqual((code, large["numerics"]["rule"]), (0, "large"))
+        self.assertIn("test_numerics_plugin.py::test_values", large["reason"])

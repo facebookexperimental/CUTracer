@@ -1411,8 +1411,10 @@ class _Recorder:
         structure: List[str] = self._threaded_sites()
         first_structure: Optional[int] = 0 if structure else None
         first_large: Optional[int] = None
+        first_large_change: Optional[Dict[str, Any]] = None
         changed: List[Dict[str, Any]] = []
         stable_changed = 0
+        stable_head: List[Dict[str, Any]] = []
         for entry in self.calls:
             if "structure" in entry:
                 structure.append(f"{_describe(entry)}: {entry['structure']}")
@@ -1437,13 +1439,16 @@ class _Recorder:
                 counts[v] += 1
                 if _SEVERITY[v] > _SEVERITY[verdict]:
                     verdict = v
-                if v == LARGE and first_large is None:
-                    first_large = entry["k"]
                 if v == SAME:
                     continue
+                record = _change_record(entry, leaf, cmp)
+                if v == LARGE and first_large is None:
+                    first_large, first_large_change = entry["k"], record
                 if v == SMALL and cmp.get("plain_stable"):
                     stable_changed += 1
-                changed.append(_change_record(entry, leaf, cmp))
+                    if len(stable_head) < 8:
+                        stable_head.append(record)
+                changed.append(record)
         changed.sort(
             key=lambda c: (-_SEVERITY[c["verdict"]], -(c.get("rel_l2") or 0.0))
         )
@@ -1457,10 +1462,12 @@ class _Recorder:
             "structure": structure[:32],
             "first_structure_k": first_structure,
             "first_large_k": first_large,
+            "first_large": first_large_change,
             "missing_calls": len(missing),
             "missing_head": [_describe_key(k) for k in missing[:8]],
             "changed": changed[:32],
             "changed_stable_leaves": stable_changed,
+            "stable_changed_head": stable_head,
             "errors": self.errors[:16],
         }
 

@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -26,7 +27,7 @@ from typing import Any
 from unittest import mock
 
 from click.testing import CliRunner
-from cutracer.oracle.cli import oracle_command, pytest_oracle
+from cutracer.oracle.cli import loaded_oracle, oracle_command
 
 # The worker mode imports pytest at run time; RealPytestWorkerTest runs it here.
 # @dep=fbsource//third-party/pypi/pytest:pytest
@@ -54,13 +55,32 @@ _FAKE_WORKER = textwrap.dedent(
         os.kill(os.getpid(), script["signal"])
     if script.get("sleep"):
         time.sleep(script["sleep"])
+    # The capture's files, per numerics mode (a list: one entry per run).
+    mode = os.environ.get("CUTRACER_NUMERICS_MODE", "")
+    numerics = script.get("numerics", {}).get(mode) or {}
+    if isinstance(numerics, list):
+        counter = os.environ["FAKE_SEEN"] + "." + mode
+        done = int(open(counter).read()) if os.path.exists(counter) else 0
+        open(counter, "w").write(str(done + 1))
+        numerics = numerics[done]
+    for key, folder in (("out", "CUTRACER_NUMERICS_OUT"),
+                        ("golden", "CUTRACER_NUMERICS_GOLDEN")):
+        for name, value in numerics.get(key, {}).items():
+            os.makedirs(os.environ[folder], exist_ok=True)
+            with open(os.path.join(os.environ[folder], name), "w") as fh:
+                json.dump(value, fh)
+    result = numerics.get("report", script["report"])
+    shown = {k: v for k, v in os.environ.items()
+             if k.startswith("CUTRACER_NUMERICS_")
+             or k in ("PYTHONHASHSEED", "PYTHONPATH", "PYTEST_PLUGINS")}
     with open(os.environ["FAKE_SEEN"], "w") as fh:
         json.dump({"argv": sys.argv[1:], "dump": dump,
                    "load": os.environ.get("CUTRACER_DELAY_LOAD_PATH"),
-                   "events": os.environ.get("CUTRACER_KERNEL_EVENTS")}, fh)
+                   "events": os.environ.get("CUTRACER_KERNEL_EVENTS"),
+                   "env": shown}, fh)
     with open(report, "w") as fh:
-        json.dump(script["report"], fh)
-    sys.exit(script["report"]["pytest_exit"])
+        json.dump(result, fh)
+    sys.exit(result["pytest_exit"])
     """
 )
 
@@ -159,9 +179,54 @@ class _OracleTestCase(unittest.TestCase):
     def setUp(self) -> None:
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        self.oracle = stack.enter_context(pytest_oracle())
+        self.oracle = stack.enter_context(loaded_oracle())
         self.root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
         self.fx = _Fixture(self.root, self.oracle)
+
+
+def _summary(verdict: str = "same", proc: str = "main", **kw: Any) -> dict[str, Any]:
+    """A capture result file (`numerics-<proc>.json`)."""
+    numerics: dict[str, Any] = {
+        "verdict": verdict,
+        "calls": 2,
+        "golden_calls": 2,
+        "environment": [],
+        "structure": [],
+        "first_structure_k": None,
+        "first_large_k": None,
+        "missing_calls": 0,
+        "missing_head": [],
+        "first_large": None,
+        "changed": [],
+        "changed_stable_leaves": 0,
+        "stable_changed_head": [],
+        "errors": [],
+    }
+    if verdict == "large":
+        change = {"verdict": "large", "call": "t.py:3 #0", "leaf": "a0", "rel_l2": 0.3}
+        numerics.update(first_large_k=0, first_large=change, changed=[change])
+    if verdict == "recorded":
+        numerics = {"verdict": "recorded", "calls": 2, "errors": []}
+    numerics.update(kw)
+    return {"schema": 1, "proc": proc, "numerics": numerics}
+
+
+def _leaf_calls(verdict: str) -> dict[str, Any]:
+    """A capture calls file whose one tensor compared as `verdict`."""
+    cmp = {"verdict": verdict, "rel_l2": 0.001 if verdict != "same" else 0.0}
+    leaf = {"name": "a0", "kind": "tensor", "cmp": cmp}
+    return {"calls": [_call(leaf)]}
+
+
+def _call(*leaves: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "k": 0,
+        "nodeid": NODE,
+        "fn": "torch.testing.assert_close",
+        "site": "tests/test_x.py:3",
+        "ordinal": 0,
+        "leaves": list(leaves),
+    }
 
 
 class RunOracleTest(_OracleTestCase):
@@ -404,6 +469,475 @@ class ClassifyTest(_OracleTestCase):
         self.assertNotEqual(signature(NODE, site), signature(NODE + "x", site))
 
 
+class NumericsCheckTest(_OracleTestCase):
+    def golden(self, plain_runs: int = 2, **manifest: Any) -> Path:
+        golden = self.root / "golden"
+        golden.mkdir(exist_ok=True)
+        (golden / "calls-main.json").write_text(json.dumps({"calls": []}))
+        values = {
+            "oracle": "pytest",
+            "nodeid": NODE,
+            "rootdir": str(self.root),
+            "settings": {
+                "CUTRACER_NUMERICS_PIN_HYPOTHESIS": "1",
+                "CUTRACER_NUMERICS_WRAP": "pkg.ops:*",
+                "PYTHONHASHSEED": "0",
+            },
+            "plain_runs": plain_runs,
+            **manifest,
+        }
+        (golden / "manifest.json").write_text(json.dumps(values))
+        return golden
+
+    def check(
+        self,
+        out: dict[str, Any],
+        report: dict[str, Any] | None = None,
+        strict: bool = False,
+        **kw: Any,
+    ) -> int:
+        numerics = self.oracle.NumericsOptions(
+            mode="check", golden=kw.pop("golden", None) or self.golden(), strict=strict
+        )
+        script = {
+            "report": report or _report(),
+            "numerics": {"check": {"out": out}},
+        }
+        kw.setdefault("output_dir", None)
+        return self.fx.run(script, injected=False, plain=True, numerics=numerics, **kw)
+
+    def test_the_worker_loads_the_capture_with_the_golden_settings(self) -> None:
+        golden = self.golden()
+        code = self.check(
+            {"numerics-main.json": _summary()},
+            golden=golden,
+            env={"CUTRACER_NUMERICS_FOO": "1", "CUTRACER_NUMERICS_WRAP": "other:x"},
+            output_dir=self.root / "evidence",
+        )
+        self.assertEqual(code, PASSED)
+        seen = json.loads(self.fx.seen.read_text())
+        module = Path(seen["argv"][seen["argv"].index("--numerics-module") + 1])
+        self.assertEqual(module.name, "cutracer_numerics.py")
+        self.assertEqual(module.parent.name, "numerics_lib")
+        env = seen["env"]
+        self.assertEqual(env["CUTRACER_NUMERICS_MODE"], "check")
+        self.assertEqual(env["CUTRACER_NUMERICS_GOLDEN"], str(golden.resolve()))
+        self.assertEqual(env["CUTRACER_NUMERICS_ROOT"], str(self.root))
+        self.assertEqual(env["CUTRACER_NUMERICS_WRAP"], "pkg.ops:*")
+        self.assertEqual(env["PYTHONHASHSEED"], "0")
+        self.assertNotIn("CUTRACER_NUMERICS_FOO", env)
+        self.assertNotIn("PYTEST_PLUGINS", env)
+        outcome = self.fx.outcome()
+        self.assertEqual(outcome["numerics"]["rule"], "comparable")
+        self.assertIn("numerics same over 2 calls", outcome["reason"])
+
+    def test_without_numerics_inherited_capture_settings_are_dropped(self) -> None:
+        script = {"report": _report()}
+        env = {"CUTRACER_NUMERICS_MODE": "check", "CUTRACER_NUMERICS_GOLDEN": "/x"}
+        self.assertEqual(
+            self.fx.run(script, injected=False, plain=True, env=env), PASSED
+        )
+        seen = json.loads(self.fx.seen.read_text())
+        self.assertNotIn("--numerics-module", seen["argv"])
+        self.assertEqual(
+            [k for k in seen["env"] if k.startswith("CUTRACER_NUMERICS_")], []
+        )
+
+    def test_a_large_change_of_a_passing_test_reproduces(self) -> None:
+        sig = self.root / "sig"
+        code = self.check({"numerics-main.json": _summary("large")}, signature_file=sig)
+        self.assertEqual(code, REPRODUCED)
+        self.assertEqual(
+            sig.read_text().strip(), self.oracle.numerics_signature([NODE])
+        )
+        # A later reproduction by an assertion has the same signature.
+        failed = self.check(
+            {"numerics-main.json": _summary()}, _report("failed"), signature_file=sig
+        )
+        self.assertEqual(failed, REPRODUCED)
+        sig.write_text("another failure\n")
+        self.assertEqual(
+            self.check({"numerics-main.json": _summary("large")}, signature_file=sig),
+            INCOMPLETE,
+        )
+
+    def test_a_large_change_after_calls_stop_lining_up_measured_nothing(self) -> None:
+        late = _summary(
+            "large", first_large_k=3, first_structure_k=1, structure=["x: extra call"]
+        )
+        self.assertEqual(self.check({"numerics-main.json": late}), INCOMPLETE)
+        early = _summary(
+            "large", first_large_k=0, first_structure_k=2, structure=["x: extra call"]
+        )
+        self.assertEqual(self.check({"numerics-main.json": early}), REPRODUCED)
+
+    def test_a_small_change_of_a_passing_test_passes(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = self.check({"numerics-main.json": _summary("small")})
+        self.assertEqual(code, PASSED)
+        self.assertIn("the node passed; numerics small over 2 calls", stderr.getvalue())
+
+    def test_strict_counts_a_change_of_a_leaf_stable_in_plain_runs(self) -> None:
+        change = {"verdict": "small", "call": "c", "leaf": "a0", "plain_stable": True}
+        summary = _summary(
+            "small",
+            changed_stable_leaves=1,
+            changed=[change],
+            stable_changed_head=[change],
+        )
+        out = {"numerics-main.json": summary}
+        self.assertEqual(self.check(out), PASSED)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.check(out, strict=True), REPRODUCED)
+        self.assertIn(
+            "bitwise identical in every plain run in main: c a0", stderr.getvalue()
+        )
+        golden = self.golden(plain_runs=0)
+        self.assertEqual(self.check(out, strict=True, golden=golden), INCOMPLETE)
+
+    def test_a_correctness_failure_reproduces_whatever_its_numerics(self) -> None:
+        broken = _summary(errors=["boom"], missing_calls=1)
+        self.assertEqual(
+            self.check({"numerics-main.json": broken}, _report("failed")), REPRODUCED
+        )
+        self.assertEqual(self.check({}, _report("failed")), REPRODUCED)
+
+    def test_runs_that_cannot_be_compared_measured_nothing(self) -> None:
+        cases: dict[str, dict[str, Any]] = {
+            "no result": {},
+            "an unknown process": {
+                "numerics-main.json": _summary(),
+                "numerics-rank-1.json": _summary(proc="rank-1"),
+            },
+            "an unlabeled process": {
+                "numerics-main.json": _summary(),
+                "unlabeled-7.json": {"pid": 7},
+            },
+            "a second writer": {
+                "numerics-main.json": _summary(),
+                "conflict-main-7.json": {},
+            },
+            "a write failure": {"error-main-7.json": {}},
+            "capture errors": {"numerics-main.json": _summary(errors=["boom"])},
+            "calls that do not line up": {
+                "numerics-main.json": _summary(
+                    structure=["x: extra call"], first_structure_k=1
+                )
+            },
+            "missing calls": {
+                "numerics-main.json": _summary(missing_calls=1, missing_head=["c"])
+            },
+            "an unmeasured change": {"numerics-main.json": _summary("unmeasured")},
+            "another torch": {
+                "numerics-main.json": _summary(environment=["torch 2 differs from 1"])
+            },
+        }
+        for name, out in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.check(out), INCOMPLETE)
+
+    def test_a_second_writer_discredits_a_large_change_but_an_unlabeled_one_does_not(
+        self,
+    ) -> None:
+        large = _summary("large")
+        conflict = {"numerics-main.json": large, "conflict-main-7.json": {}}
+        self.assertEqual(self.check(conflict), INCOMPLETE)
+        unlabeled = {"numerics-main.json": large, "unlabeled-7.json": {}}
+        self.assertEqual(self.check(unlabeled), REPRODUCED)
+
+    def test_a_result_this_oracle_cannot_read_measured_nothing(self) -> None:
+        missing_key = _summary("large")
+        del missing_key["numerics"]["first_large_k"]
+        other_schema = dict(_summary("large"), schema=2)
+        no_verdict = _summary("large")
+        no_verdict["numerics"]["verdict"] = "weird"
+        for name, result in (
+            ("a missing key", missing_key),
+            ("another schema", other_schema),
+            ("an unknown verdict", no_verdict),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self.check({"numerics-main.json": result}), INCOMPLETE)
+
+    def test_the_reason_names_the_large_change_that_decided(self) -> None:
+        first = {"verdict": "large", "call": "first", "leaf": "a0", "rel_l2": 0.1}
+        worst = {"verdict": "large", "call": "worst", "leaf": "b0", "rel_l2": 0.9}
+        summary = _summary("large", first_large=first, changed=[worst, first])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.check({"numerics-main.json": summary}), REPRODUCED)
+        self.assertIn("large numerics change in main: first a0", stderr.getvalue())
+
+    def test_an_expected_signature_applies_to_numerics_reproductions(self) -> None:
+        out = {"numerics-main.json": _summary("large")}
+        self.assertEqual(self.check(out, expected_signature="other"), INCOMPLETE)
+        own = self.oracle.numerics_signature([NODE])
+        self.assertEqual(self.check(out, expected_signature=own), REPRODUCED)
+
+    def test_a_golden_whose_plain_runs_reproduced_is_refused(self) -> None:
+        golden = self.golden(unstable="plain run 2: large numerics change")
+        self.assertEqual(
+            self.check({"numerics-main.json": _summary()}, golden=golden), INCOMPLETE
+        )
+
+    def test_a_large_change_with_another_torch_measured_nothing(self) -> None:
+        summary = _summary("large", environment=["torch 2 differs from 1"])
+        self.assertEqual(self.check({"numerics-main.json": summary}), INCOMPLETE)
+
+    def test_missing_calls_after_a_failure_are_an_early_end(self) -> None:
+        summary = _summary(missing_calls=1, calls=1)
+        self.assertEqual(
+            self.check({"numerics-main.json": summary}, _report("failed")), REPRODUCED
+        )
+
+    def test_a_skipped_test_measured_nothing_despite_a_large_change(self) -> None:
+        skipped = _report("skipped", pytest_exit=0)
+        self.assertEqual(
+            self.check({"numerics-main.json": _summary("large")}, skipped), INCOMPLETE
+        )
+
+    def test_coverage_is_still_required_of_an_injected_run(self) -> None:
+        numerics = self.oracle.NumericsOptions(mode="check", golden=self.golden())
+        script = {
+            "report": _report(),
+            "config": _config(),
+            "numerics": {"check": {"out": {"numerics-main.json": _summary("large")}}},
+        }
+        self.assertEqual(
+            self.fx.run(script, numerics=numerics, output_dir=None), INCOMPLETE
+        )
+
+    def test_a_check_needs_the_golden_of_the_same_test(self) -> None:
+        out = {"numerics-main.json": _summary()}
+        no_manifest = self.root / "bare"
+        no_manifest.mkdir()
+        self.assertEqual(self.check(out, golden=no_manifest), INCOMPLETE)
+        other = self.golden(nodeid="tests/test_x.py::test_z")
+        self.assertEqual(self.check(out, golden=other), INCOMPLETE)
+        numerics = self.oracle.NumericsOptions(
+            mode="check", golden=self.golden(nodeid=NODE), wrap=("other:x",)
+        )
+        script = {"report": _report(), "numerics": {"check": {"out": out}}}
+        self.assertEqual(
+            self.fx.run(
+                script, injected=False, plain=True, numerics=numerics, output_dir=None
+            ),
+            INCOMPLETE,
+        )
+
+
+class NumericsRecordTest(_OracleTestCase):
+    def record(self, script: dict[str, Any], runs: int = 3, **kw: Any) -> int:
+        numerics = self.oracle.NumericsOptions(
+            mode="record", golden=self.root / "golden", runs=runs
+        )
+        kw.setdefault("injected", False)
+        return self.fx.run(script, numerics=numerics, **kw)
+
+    def script(self, *checks: dict[str, Any], calls: int = 2) -> dict[str, Any]:
+        golden_calls = {"schema": 1, "calls": [_call({"name": "a0", "kind": "tensor"})]}
+        return {
+            "report": _report(),
+            "numerics": {
+                "record": {
+                    "out": {"numerics-main.json": _summary("recorded", calls=calls)},
+                    "golden": {"calls-main.json": golden_calls},
+                },
+                "check": list(checks),
+            },
+        }
+
+    def plain_run(self, verdict: str = "small", **kw: Any) -> dict[str, Any]:
+        summary = _summary(verdict, **kw)
+        return {
+            "out": {
+                "numerics-main.json": summary,
+                "calls-main.json": _leaf_calls(verdict),
+            }
+        }
+
+    def test_three_plain_runs_record_a_golden_and_its_stability(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = self.record(
+                self.script(self.plain_run("same"), self.plain_run("small"))
+            )
+        self.assertEqual(code, 0, stderr.getvalue())
+        golden = self.root / "golden"
+        manifest = json.loads((golden / "manifest.json").read_text())
+        self.assertEqual(
+            (manifest["oracle"], manifest["nodeid"], manifest["plain_runs"]),
+            ("pytest", NODE, 2),
+        )
+        self.assertEqual(manifest["settings"]["CUTRACER_NUMERICS_PIN_HYPOTHESIS"], "1")
+        self.assertEqual(manifest["settings"]["PYTHONHASHSEED"], "0")
+        leaf = json.loads((golden / "calls-main.json").read_text())["calls"][0][
+            "leaves"
+        ][0]
+        self.assertEqual(
+            leaf["plain"], {"runs": 2, "changed": 1, "max_rel_l2": 0.001, "max_ulp": 0}
+        )
+        stability = json.loads((golden / "stability.json").read_text())
+        self.assertEqual(
+            [r.get("verdict") for r in stability["runs"]], [None, "same", "small"]
+        )
+        on_disk = [p for p in golden.rglob("*") if p.is_file()]
+        self.assertEqual(
+            stability["golden_bytes"],
+            sum(p.stat().st_size for p in on_disk if p.name != "stability.json"),
+        )
+        self.assertEqual(list(self.root.glob("golden.partial-*")), [])
+        self.assertRegex(
+            stderr.getvalue(), r"calls, \d+(\.\d)? [KM]iB; plain runs: same, small"
+        )
+
+    def test_a_large_change_between_plain_runs_exits_3(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.record(
+                self.script(self.plain_run("large"), self.plain_run("small"))
+            )
+        self.assertEqual(code, 3)
+        stability = json.loads((self.root / "golden" / "stability.json").read_text())
+        self.assertEqual(stability["exit"], 3)
+
+    def test_a_failed_record_leaves_no_golden(self) -> None:
+        cases = {
+            "nothing compared": self.script(self.plain_run(), calls=0),
+            "a plain run that does not line up": self.script(
+                self.plain_run("same", structure=["x: extra call"]), self.plain_run()
+            ),
+            "an injected environment": self.script(self.plain_run(), self.plain_run()),
+        }
+        for name, script in cases.items():
+            with self.subTest(name=name), contextlib.redirect_stderr(io.StringIO()):
+                injected = name == "an injected environment"
+                self.assertEqual(self.record(script, injected=injected), INCOMPLETE)
+                self.assertFalse((self.root / "golden").exists())
+                self.assertEqual(list(self.root.glob("golden.partial-*")), [])
+                for counter in self.root.glob("seen.json.*"):
+                    counter.unlink()
+
+    def test_a_plain_run_that_fails_its_check_exits_3_and_refuses_checks(self) -> None:
+        failed = self.plain_run("same")
+        failed["report"] = _report("failed")
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.record(self.script(failed, self.plain_run("small")))
+        self.assertEqual(code, 3)
+        golden = self.root / "golden"
+        manifest = json.loads((golden / "manifest.json").read_text())
+        self.assertIn("plain run 2", manifest["unstable"])
+        leaf = json.loads((golden / "calls-main.json").read_text())["calls"][0][
+            "leaves"
+        ][0]
+        self.assertEqual(leaf["plain"]["runs"], 2)
+
+    def test_an_integer_tensor_that_varies_between_plain_runs_is_not_instability(
+        self,
+    ) -> None:
+        varying = self.plain_run("large")
+        varying["out"]["calls-main.json"]["calls"][0]["leaves"][0]["cmp"]["kind"] = (
+            "exact"
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = self.record(self.script(varying, self.plain_run("same")))
+        self.assertEqual(code, 0, stderr.getvalue())
+        golden = self.root / "golden"
+        self.assertIsNone(
+            json.loads((golden / "manifest.json").read_text())["unstable"]
+        )
+        leaf = json.loads((golden / "calls-main.json").read_text())["calls"][0][
+            "leaves"
+        ][0]
+        self.assertEqual(leaf["plain"]["changed"], 1)
+        self.assertIn("an integer tensor that varies anyway", stderr.getvalue())
+
+    def test_a_complex_tensor_that_varies_between_plain_runs_is_instability(
+        self,
+    ) -> None:
+        varying = self.plain_run("large")
+        cmp = varying["out"]["calls-main.json"]["calls"][0]["leaves"][0]["cmp"]
+        cmp.update(kind="exact", dtype="complex64")
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = self.record(self.script(varying, self.plain_run("same")))
+        self.assertEqual(code, 3)
+
+    def test_each_run_is_labeled_and_a_failure_keeps_its_evidence(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            ok = self.record(
+                self.script(self.plain_run("same"), self.plain_run("same"))
+            )
+        self.assertEqual(ok, 0)
+        self.assertIn("numerics record run 1/3 (golden): exit 1", stderr.getvalue())
+        self.assertIn(
+            "numerics record run 3/3 (plain check): exit 1", stderr.getvalue()
+        )
+        shutil.rmtree(self.root / "golden")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            failed = self.record(
+                self.script(self.plain_run(), calls=0), output_dir=None
+            )
+        self.assertEqual(failed, INCOMPLETE)
+        kept = stderr.getvalue().split("evidence in ")[-1].strip()
+        self.assertTrue(list(Path(kept).glob("attempt-*")), stderr.getvalue())
+        shutil.rmtree(kept)
+
+    def test_staging_is_removed_when_a_run_raises(self) -> None:
+        numerics = self.oracle.NumericsOptions(
+            mode="record", golden=self.root / "golden"
+        )
+
+        def broken(mode: str, golden: Path, out: Path, label: str) -> Any:
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError), contextlib.redirect_stderr(io.StringIO()):
+            self.oracle.record_golden(numerics, {}, self.root / "evidence", broken)
+        self.assertEqual(list(self.root.glob("golden*")), [])
+
+    def test_plain_records_note_a_non_finite_relative_error(self) -> None:
+        out = self.root / "run"
+        out.mkdir()
+        calls = _leaf_calls("small")
+        calls["calls"][0]["leaves"][0]["cmp"]["rel_l2"] = float("nan")
+        (out / "calls-main.json").write_text(json.dumps(calls))
+        stats = self.oracle._plain_stats([out])
+        (record,) = stats.values()
+        self.assertEqual(
+            (record["max_rel_l2"], record.get("nonfinite_rel_l2")), (0.0, True)
+        )
+
+    def test_a_golden_directory_must_be_new_or_empty(self) -> None:
+        (self.root / "golden").mkdir()
+        (self.root / "golden" / "old").write_text("x")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.record(self.script(self.plain_run())), INCOMPLETE)
+        self.assertEqual(
+            sorted(p.name for p in (self.root / "golden").iterdir()), ["old"]
+        )
+
+    def test_numerics_usage_errors_exit_2(self) -> None:
+        base = ["--rootdir", str(self.root), "--nodeid", NODE]
+        for extra in (
+            ["--numerics", "check"],
+            ["--golden", "g"],
+            ["--numerics-wrap", "m:f"],
+            ["--numerics", "check", "--golden", "g", "--numerics-runs", "2"],
+            ["--numerics", "record", "--golden", "g", "--numerics-strict"],
+            ["--numerics", "record", "--golden", "g", "--numerics-runs", "0"],
+            ["--numerics", "check", "--golden", "g", "--numerics-wrap", "nocolon"],
+            ["--numerics", "record", "--golden", "g", "--signature-file", "s"],
+            ["--numerics", "record", "--golden", "g", "--expected-signature", "x"],
+        ):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.oracle.main([*base, *extra])
+                self.assertEqual(raised.exception.code, 2)
+
+
 class RealPytestWorkerTest(_OracleTestCase):
     """The worker mode under real pytest (in this process), then the oracle's
     classification of its report."""
@@ -580,6 +1114,8 @@ class OracleCliTest(unittest.TestCase):
             ["--rootdir", ".", "--nodeid", NODE, "--pytest-arg=-x"],
             prog="cutracer oracle pytest",
         )
+        # The oracle finds the capture resource, wherever it is unpacked.
+        self.assertEqual(Path(fake.NUMERICS_CAPTURE).name, "cutracer_numerics.py")
         fake.main.side_effect = RuntimeError("x")
         with mock.patch("cutracer.oracle.cli.pytest_oracle", loaded):
             invoked = CliRunner().invoke(oracle_command, argv)
@@ -613,6 +1149,46 @@ class OracleCliTest(unittest.TestCase):
                 timeout=120,
             )
         self.assertEqual(proc.returncode, REPRODUCED, proc.stderr)
+
+    def test_the_exported_script_checks_numerics_with_the_capture_beside_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "bin" / "oracle.py"
+            invoked = CliRunner().invoke(oracle_command, ["export", str(script)])
+            self.assertEqual(invoked.exit_code, 0, invoked.output)
+            self.assertTrue((root / "bin" / "cutracer_numerics.py").is_file())
+            golden = root / "golden"
+            golden.mkdir()
+            (golden / "calls-main.json").write_text(json.dumps({"calls": []}))
+            manifest = {"oracle": "pytest", "nodeid": NODE, "rootdir": tmp}
+            (golden / "manifest.json").write_text(json.dumps(manifest))
+            fx = _Fixture(root, None)
+            env = {k: v for k, v in os.environ.items() if k != "CUDA_INJECTION64_PATH"}
+            check = {"out": {"numerics-main.json": _summary("large")}}
+            env.update(
+                fx.env(
+                    {"report": _report(), "numerics": {"check": check}}, injected=False
+                )
+            )
+            proc = subprocess.run(
+                [sys.executable, str(script), "--python", str(fx.python)]
+                + ["--rootdir", tmp, "--nodeid", NODE, "--plain"]
+                + ["--numerics", "check", "--golden", str(golden)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(proc.returncode, REPRODUCED, proc.stderr)
+        self.assertIn("large numerics change in main", proc.stderr)
+
+    def test_export_refuses_the_capture_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = str(Path(tmp) / "cutracer_numerics.py")
+            invoked = CliRunner().invoke(oracle_command, ["export", target])
+        self.assertEqual(invoked.exit_code, 2, invoked.output)
 
     def test_registered_in_main_cli(self) -> None:
         from cutracer.cli import main
