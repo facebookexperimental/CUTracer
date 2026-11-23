@@ -47,6 +47,8 @@ For every observation, record:
 - result, unit, denominator, and exit status when relevant;
 - a durable link or a session-local path, labeled correctly.
 
+For a compiled kernel (Triton, TLX, CuTe, CUDA), the compiler build is part of the kernel identity. Read each run's build (the wheel version or the compiler commit) from that run's own environment log or build output, not from the host's current default. The same source under two builds is two kernels: a compiler pass can add or remove the ordering that decides the case.
+
 Keep current verification separate from historical documentation. A current
 run can confirm the symptom on the current host. It does not retroactively
 verify a historical driver, compiler, timing, or failure rate.
@@ -125,6 +127,10 @@ coverage, or generalization limit beside the claim that it constrains.
 A strong A/B changes one relevant variable while holding the input, GPU,
 toolchain, launch configuration, and oracle constant. Record both commands and
 both outcomes.
+
+Check the toolchain against each arm's own logs before you call an A/B matched. When the arms ran under different compiler builds, the comparison is confounded. Rerun the treatment on the build where the failure reproduced, or report that the fix was validated only on another build: that does not validate it on the failing build.
+
+The build is part of the defect boundary only when the same source was measured under both builds and reproduces the failure under one and not under the other. A reproduction rate that differs within sampling noise, for example 9 of 10 against 7 of 10, is not a different outcome. State the build in the conclusion and the case identity. Name the compiler change when the disassembly shows it, for example a barrier that only one build inserts. Validate the fix on a build that reproduces the failure.
 
 For a fix, prefer a regression that fails without the change and passes with
 it. If only a workaround or negative control exists, report that narrower
@@ -225,6 +231,8 @@ part of the defect boundary or are needed to distinguish compared artifacts.
 Do not repeat details that the symptom, evidence, or validation sections make
 clear.
 
+A compiler build that changes the outcome is part of the defect boundary (see section 4). Add it to the case identity, and give each variant's build in the reproducer's variant table.
+
 Reproduction instructions must work for the intended audience. Include the
 dependency or wheel installation commands and the run command. Link the
 reproducer to a durable location that the audience can access. Use a public
@@ -284,6 +292,8 @@ Verify all of the following:
 - Every number has a unit, a denominator when applicable, and an evidence
   location.
 - Original and treatment artifacts have distinct identities.
+- Each arm of a matched comparison names its compiler build from its own logs. A fix measured only on another build is not reported as validated on the failing build.
+- A result that differs by compiler build states the build in the conclusion and the case identity.
 - Negative evidence states its completeness and coverage boundary.
 - Tool attribution distinguishes CUTracer from profilers, debuggers,
   sanitizers, compilers, and source inspection.

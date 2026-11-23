@@ -1,0 +1,7 @@
+--- a/kernels/gemm.py
++++ b/kernels/gemm.py
+@@ -201,6 +201,7 @@ def _epilogue(c_smem, acc, ...):
+     c = tl.load(c_smem_ptrs)
+     tma_store(c_desc, c, offs)
++    tl.debug_barrier()
+     tl.store(c_smem_ptrs, acc_next.to(tl.float16))

@@ -1,0 +1,8 @@
+== environment ==
+host GPU: NVIDIA H100 (sm_90a), driver 570.124
+python 3.12.4, torch 2.9.0+cu128, triton 3.7.0
+tree: unfixed (main at 9c01d7e)
+== command ==
+for i in $(seq 600); do python -m pytest tests/test_gemm.py::test_epilogue_bias -q; done
+== result ==
+598 passed, 2 failed

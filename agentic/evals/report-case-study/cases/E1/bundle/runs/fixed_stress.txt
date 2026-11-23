@@ -1,0 +1,13 @@
+== environment ==
+host GPU: NVIDIA B200 (sm_100a), driver 580.82
+python 3.12.4, torch 2.9.0+cu130, triton 3.9.0
+tree: fixed (main at 4f2a91c + fix.patch)
+== command ==
+cutracer oracle pytest --numerics record --golden /tmp/g2 --rootdir . --nodeid tests/test_attn_bwd.py::test_dk
+cutracer stress --strategy isolate -k attn_bwd_ws --not-interesting-exit-codes 1 --confirm -o /tmp/s2 -- \
+    cutracer oracle pytest --numerics check --golden /tmp/g2 --rootdir . --nodeid tests/test_attn_bwd.py::test_dk -k attn_bwd_ws
+== output (abridged) ==
+cutracer oracle: numerics record: exit 0: golden /tmp/g2 recorded: 3 calls; plain runs: same, same
+Isolated 16 target(s).
+Not reproduced across 16 trial(s) (0 infra error(s)). No triggering config saved.
+Verdict: clean

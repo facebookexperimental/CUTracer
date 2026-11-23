@@ -1,0 +1,5 @@
+# gemm_persistent_ws, unfixed tree; triton 3.7.0 and 3.9.0 give the same instructions in this range
+/*2c80*/  LDS.128 R12, [R3+0x400] ;
+/*2c90*/  UTMASTG.2D [UR8], [UR4] ;
+...
+/*2d40*/  STS.128 [R3+0x400], R20 ;

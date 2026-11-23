@@ -1,0 +1,8 @@
+# attn_bwd_ws, unfixed tree, from the run in runs/unfixed_stress.txt
+/*1b40*/  SYNCS.PHASECHK.TRANS64.TRYWAIT P3, [UR4+0x30180], R86 ;
+...
+/*2110*/  LDTM.x32 R24, tmem[UR36] ;
+/*2120*/  FMUL R40, R24, R8 ;
+...
+/*30f0*/  F2FP.BF16.F32.PACK_AB R60, R41, R40 ;
+/*3100*/  STTM.x16 tmem[UR37], R60 ;

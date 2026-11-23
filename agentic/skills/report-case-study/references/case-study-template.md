@@ -72,10 +72,12 @@ import. Pin it only when the compiler version affects the case.>
 <exact run command>
 ```
 
-| Variant | Changed variable | Result | Evidence |
-|---|---|---|---|
-| Original | <value> | <exit status, verdict, count, or metric> | <artifact> |
-| Treatment/control | <value> | <exit status, verdict, count, or metric> | <artifact> |
+| Variant | Changed variable | Compiler build | Result | Evidence |
+|---|---|---|---|---|
+| Original | <value> | <build from this run's own log> | <exit status, verdict, count, or metric> | <artifact> |
+| Treatment/control | <value> | <build from this run's own log> | <exit status, verdict, count, or metric> | <artifact> |
+
+<Use one compiler build for every variant, or add a variant that changes only the build. When the outcome changes with the build, the build is part of the defect boundary: add it to the case identity.>
 
 ## Evidence summary
 
@@ -205,6 +207,7 @@ impact, workaround, and concrete improvement.
 - Make reproduction setup portable. Include pinned dependencies or wheels.
 - For TLX, use the `fbtriton` PyPI wheel. Pin it only when the compiler version
   affects the case.
+- Take each variant's compiler build from that run's own log. Do not call an A/B matched across two builds.
 - Link public reports to public source. Do not expose private paths.
 - Keep the CUTracer contribution section focused on what changed the diagnosis.
 - When a human report exists, compare it only after the blind conclusion is

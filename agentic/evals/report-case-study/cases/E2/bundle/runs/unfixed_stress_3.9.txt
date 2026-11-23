@@ -1,0 +1,12 @@
+== environment ==
+host GPU: NVIDIA H100 (sm_90a), driver 570.124
+python 3.12.4, torch 2.9.0+cu128, triton 3.9.0
+tree: unfixed (main at 9c01d7e)
+== command ==
+cutracer stress -k gemm_persistent_ws --not-interesting-exit-codes 1 --confirm -o /tmp/s_unfixed_3.9 -- \
+    cutracer oracle pytest --rootdir . --nodeid tests/test_gemm.py::test_epilogue_bias -k gemm_persistent_ws
+== output (abridged) ==
+Reproduced: delay_ns=10000 warpgroup=all rate=0.88 -> /tmp/s_unfixed_3.9/triggering_config.json
+attempts: 14 of 16 reproduced (AssertionError at tests/test_gemm.py:88, mismatched elements in C)
+Confirmed: reduced to 1 delay point(s); the minimal config reproduced again: LDS.128 R12, [R3+0x400] (pc 0x2c80, gemm_persistent_ws)
+Verdict: finding

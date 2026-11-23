@@ -1,0 +1,8 @@
+--- a/kernels/attn_bwd.py
++++ b/kernels/attn_bwd.py
+@@ -412,6 +412,8 @@ def _bwd_compute(p_tiles, s_tiles, ...):
+         s = tlx.local_load(s_tile)
+         p = _activation(s)
++        # Every compute warp must finish reading its score columns first.
++        tlx.named_barrier_wait(8, 256)
+         tlx.local_store(p_tile, p.to(tl.bfloat16))

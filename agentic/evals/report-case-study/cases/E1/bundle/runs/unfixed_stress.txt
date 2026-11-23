@@ -1,0 +1,15 @@
+== environment ==
+host GPU: NVIDIA B200 (sm_100a), driver 580.82
+python 3.12.4, torch 2.9.0+cu130, triton 3.7.0
+tree: unfixed (main at 4f2a91c)
+== command ==
+cutracer oracle pytest --numerics record --golden /tmp/g --rootdir . --nodeid tests/test_attn_bwd.py::test_dk
+cutracer stress --strategy isolate -k attn_bwd_ws --not-interesting-exit-codes 1 --confirm -o /tmp/s -- \
+    cutracer oracle pytest --numerics check --golden /tmp/g --rootdir . --nodeid tests/test_attn_bwd.py::test_dk -k attn_bwd_ws
+== output (abridged) ==
+cutracer oracle: numerics record: exit 0: golden /tmp/g recorded: 3 calls; plain runs: same, same
+Isolated 16 target(s).
+Reproduced: delay_ns=1000000 target=warp 0 rate=1.00 -> /tmp/s/triggering_config.json
+attempts: 16 large (dk rel_l2 0.31-0.37, dv 0.33-0.36), 0 small
+Confirmed: reduced to 1 delay point(s); the minimal config reproduced again: SYNCS.PHASECHK.TRANS64.TRYWAIT P3, [UR4+0x30180], R86 (pc 0x1b40, attn_bwd_ws)
+Verdict: finding
