@@ -100,6 +100,9 @@ _BARRIER_SASS = re.compile(
 )
 _IMMEDIATE = re.compile(r"^(?:0x[0-9a-fA-F]+|0|[1-9][0-9]*)$")
 _CHECKSUM = re.compile(r"^[0-9a-f]+$")
+# How many times an attempt runs again after its kernel launched a binary its
+# delay config did not name (see `_unnamed_binaries`).
+_BINARY_RETRIES = 2
 
 
 def _barrier_operation(sass: str) -> Optional[Tuple[str, str, str]]:
@@ -162,6 +165,13 @@ class BarrierSite:
         if not isinstance(sass, str) or _barrier_operation(sass) is None:
             raise ValueError("a named-barrier site is not a named-barrier instruction")
         return cls(name, checksum, pc, sass)
+
+
+# The binaries a search has seen of each kernel, by kernel name, then checksum:
+# a kernel can compile to another binary in another process. Each binary maps
+# to the named-barrier points (pc, SASS) a control run's delay dump listed for
+# it, or to None when only a launch of it was seen.
+KernelBinaries = Dict[str, Dict[str, Optional[frozenset[Tuple[int, str]]]]]
 
 
 @dataclass(frozen=True)
@@ -666,6 +676,10 @@ class _AttemptResult:
     # attached to, and deleting the evidence at the moment validation fails
     # makes the failure unexplainable from the published artifacts.
     rejected_config_path: Optional[str] = None
+    # Binaries (kernel name, checksum) a replayed attempt launched instead of
+    # the ones its delay config names: it delayed none of those sites, and
+    # `_run_attempt` runs it again with them.
+    unnamed_binaries: Tuple[Tuple[str, str], ...] = ()
 
 
 def _enabled_point_count(config_path: str) -> Optional[int]:
@@ -1542,8 +1556,9 @@ def _barrier_targets(
     """One target per named barrier, in search order.
 
     Sites group by immediate barrier id across the instrumented kernels; a
-    site whose barrier id is in a register is a target of its own. A target
-    delays its barrier's syncs and reductions, and its arrives with
+    site whose barrier id is in a register is a target of its own, once for
+    every binary of its kernel that has it (see `_write_barrier_config`). A
+    target delays its barrier's syncs and reductions, and its arrives with
     `barrier_arrives`. Barriers that some warps only arrive at come first: a
     late sync there lets the arriving warps run a phase ahead. Register-id
     sites follow, then the barriers every participant syncs on, whose arrival
@@ -1553,13 +1568,16 @@ def _barrier_targets(
     by_id: Dict[int, List[BarrierSite]] = {}
     arrived: set[int] = set()
     by_site: List[BarrierSite] = []
+    register_sites: set[Tuple[str, int, str]] = set()
     for site in sites:
         operation = _barrier_operation(site.sass)
         if operation is None:
             continue
         _opcode, kind, operand = operation
         if not _IMMEDIATE.match(operand):
-            if kind in delayed:
+            key = (site.kernel_name, site.pc, site.sass)
+            if kind in delayed and key not in register_sites:
+                register_sites.add(key)
                 by_site.append(site)
             continue
         barrier_id = int(operand, 0)
@@ -1964,29 +1982,99 @@ def _attempt_targeting(
     return {"delay_enable_prob": 1.0, **_target_fields(config, target)}
 
 
-def _write_barrier_config(path: str, barrier: NamedBarrier, delay_ns: int) -> None:
+def _known_binaries(sites: Sequence[BarrierSite]) -> KernelBinaries:
+    """The binaries the control arm's named-barrier `sites` come from, each
+    with its points."""
+    points: Dict[Tuple[str, str], set[Tuple[int, str]]] = {}
+    for site in sites:
+        points.setdefault((site.kernel_name, site.kernel_checksum), set()).add(
+            (site.pc, site.sass)
+        )
+    binaries: KernelBinaries = {}
+    for (name, checksum), found in points.items():
+        binaries.setdefault(name, {})[checksum] = frozenset(found)
+    return binaries
+
+
+def _site_binaries(site: BarrierSite, binaries: KernelBinaries) -> List[str]:
+    """Checksums of the binaries a delay config names `site` in: its own, and
+    every other binary of its kernel not known to lack it. A binary seen only
+    in a launch is assumed to have the same instruction at the site's pc, as
+    the binaries a control arm dumps have had."""
+    return sorted(
+        {
+            site.kernel_checksum,
+            *(
+                checksum
+                for checksum, points in binaries.get(site.kernel_name, {}).items()
+                if points is None or (site.pc, site.sass) in points
+            ),
+        }
+    )
+
+
+def _write_barrier_config(
+    path: str,
+    barrier: NamedBarrier,
+    delay_ns: int,
+    binaries: Optional[KernelBinaries] = None,
+) -> None:
     """A delay config that turns on `barrier`'s sites, and names no other
-    point: replay mode leaves every point it does not list undelayed."""
+    point: replay mode leaves every point it does not list undelayed.
+
+    Replay mode finds a kernel's points by its checksum, which differs
+    between the binaries a kernel can compile to from one process to the
+    next, so each site is named in every binary of `binaries` that has it.
+    """
     kernels: Dict[str, Dict[str, Any]] = {}
     timestamp = datetime.datetime.now().isoformat(timespec="milliseconds")
     for site in barrier.sites:
-        kernel = kernels.setdefault(
-            f"{site.kernel_name}_{site.kernel_checksum}",
-            {
-                "kernel_name": site.kernel_name,
-                "kernel_checksum": site.kernel_checksum,
-                "timestamp": timestamp,
-                "instrumentation_points": {},
-            },
-        )
-        kernel["instrumentation_points"][str(site.pc)] = {
-            "pc": site.pc,
-            "sass": site.sass,
-            "delay": delay_ns,
-            "on": True,
-        }
+        for checksum in _site_binaries(site, binaries or {}):
+            kernel = kernels.setdefault(
+                f"{site.kernel_name}_{checksum}",
+                {
+                    "kernel_name": site.kernel_name,
+                    "kernel_checksum": checksum,
+                    "timestamp": timestamp,
+                    "instrumentation_points": {},
+                },
+            )
+            kernel["instrumentation_points"][str(site.pc)] = {
+                "pc": site.pc,
+                "sass": site.sass,
+                "delay": delay_ns,
+                "on": True,
+            }
     with open(path, "w") as output:
         json.dump({"version": "1.0", "delay_ns": delay_ns, "kernels": kernels}, output)
+
+
+def _unnamed_binaries(
+    barrier: NamedBarrier, binaries: KernelBinaries, output_dir: str
+) -> Tuple[Tuple[str, str], ...]:
+    """The binaries (kernel name, checksum) an attempt that replayed
+    `barrier`'s config launched of a site's kernel when it launched none of
+    the binaries the config names for that site: no point of it was delayed."""
+    launched: Dict[str, set[str]] = {}
+    for event in _kernel_launch_events(output_dir):
+        name, checksum = event.get("kernel_name"), event.get("kernel_checksum")
+        if isinstance(name, str) and isinstance(checksum, str):
+            launched.setdefault(name, set()).add(checksum)
+    unnamed: set[Tuple[str, str]] = set()
+    for site in barrier.sites:
+        ran = launched.get(site.kernel_name, set())
+        named = set(_site_binaries(site, binaries))
+        if ran and not ran & named:
+            unnamed.update((site.kernel_name, checksum) for checksum in ran)
+    return tuple(sorted(unnamed))
+
+
+def _unnamed_reason(target: DelayTarget, unnamed: Sequence[Tuple[str, str]]) -> str:
+    binaries = ", ".join(f"{name} {checksum}" for name, checksum in unnamed)
+    return (
+        f"the kernel of {target.label()} launched binaries its delay config does "
+        f"not name ({binaries}), so none of its points were delayed"
+    )
 
 
 def _attempt_config_name(
@@ -2016,6 +2104,8 @@ def _run_attempt_in_output_dir(  # noqa: C901
     runner: Optional[RunTarget],
     instrumentation_output_dir: str,
     target: Optional[DelayTarget] = None,
+    binaries: Optional[KernelBinaries] = None,
+    retry_binaries: bool = False,
 ) -> _AttemptResult:
     config_path = os.path.join(
         config.output_dir,
@@ -2033,7 +2123,7 @@ def _run_attempt_in_output_dir(  # noqa: C901
     try:
         if replays:
             assert target is not None and target.barrier is not None
-            _write_barrier_config(config_path, target.barrier, delay_ns)
+            _write_barrier_config(config_path, target.barrier, delay_ns, binaries)
         proc = run_instrumented_target(
             config.oracle_argv,
             InstrumentationConfig(
@@ -2148,6 +2238,52 @@ def _run_attempt_in_output_dir(  # noqa: C901
         return _AttemptResult(0, 0, 0, None, log, timed_out=1, hangs=hangs)
 
     is_interesting = hung or bool(late_writes) or returncode == 0
+    unnamed = (
+        _unnamed_binaries(target.barrier, binaries or {}, instrumentation_output_dir)
+        if replays
+        and target is not None
+        and target.barrier is not None
+        and target.barrier.barrier_id is None
+        else ()
+    )
+    if unnamed:
+        assert target is not None
+        reason = _unnamed_reason(target, unnamed)
+        if is_interesting:
+            # Like a config with no enabled point: the failure is real, but
+            # the target's sites were not delayed.
+            _unlink(config_path)
+            return _AttemptResult(
+                1,
+                0,
+                0,
+                None,
+                log + f"\n--- error ---\noracle reported the bug but {reason}: "
+                "the target reproduces without attributable injected delay",
+                unattributed=1,
+                hangs=hangs,
+            )
+        if retry_binaries:
+            _unlink(config_path)
+            return _AttemptResult(
+                0,
+                0,
+                0,
+                None,
+                log + f"\n--- retry ---\n{reason}",
+                hangs=hangs,
+                unnamed_binaries=unnamed,
+            )
+        rejected = _preserve_rejected_config(config_path)
+        return _AttemptResult(
+            0,
+            0,
+            1,
+            None,
+            log + f"\n--- error ---\n{reason}",
+            rejected_config_path=rejected,
+            hangs=hangs,
+        )
     is_clean = not is_interesting and (
         not config.not_interesting_exit_codes
         or returncode in config.not_interesting_exit_codes
@@ -2271,26 +2407,43 @@ def _run_attempt(
     cutracer_so: Optional[str],
     runner: Optional[RunTarget],
     target: Optional[DelayTarget] = None,
+    binaries: Optional[KernelBinaries] = None,
 ) -> _AttemptResult:
-    event_dir = (
-        tempfile.mkdtemp(prefix=".stress_events_", dir=config.output_dir)
-        if _records_launches(config, warpgroup=warpgroup, target=target)
-        else None
-    )
-    try:
-        return _run_attempt_in_output_dir(
-            config,
-            delay_ns=delay_ns,
-            warpgroup=warpgroup,
-            attempt=attempt,
-            cutracer_so=cutracer_so,
-            runner=runner,
-            instrumentation_output_dir=event_dir or config.output_dir,
-            target=target,
+    """One attempt. An attempt whose kernel launched a binary its delay config
+    did not name runs again with it (up to `_BINARY_RETRIES` times), and the
+    binary is added to `binaries` for the attempts that follow."""
+    logs: List[str] = []
+    hangs = 0
+    for retry in range(_BINARY_RETRIES + 1):
+        event_dir = (
+            tempfile.mkdtemp(prefix=".stress_events_", dir=config.output_dir)
+            if _records_launches(config, warpgroup=warpgroup, target=target)
+            else None
         )
-    finally:
-        if event_dir is not None:
-            shutil.rmtree(event_dir, ignore_errors=True)
+        try:
+            outcome = _run_attempt_in_output_dir(
+                config,
+                delay_ns=delay_ns,
+                warpgroup=warpgroup,
+                attempt=attempt,
+                cutracer_so=cutracer_so,
+                runner=runner,
+                instrumentation_output_dir=event_dir or config.output_dir,
+                target=target,
+                binaries=binaries,
+                retry_binaries=binaries is not None and retry < _BINARY_RETRIES,
+            )
+        finally:
+            if event_dir is not None:
+                shutil.rmtree(event_dir, ignore_errors=True)
+        hangs += outcome.hangs
+        logs.append(outcome.log)
+        if not outcome.unnamed_binaries:
+            break
+        assert binaries is not None
+        for name, checksum in outcome.unnamed_binaries:
+            binaries.setdefault(name, {}).setdefault(checksum, None)
+    return dataclasses.replace(outcome, log="\n".join(logs), hangs=hangs)
 
 
 def _fsync_directory(path: str) -> None:
@@ -3069,6 +3222,12 @@ def run_stress(  # noqa: C901
                 targets_total = len(discovered)
     schedule = _trial_schedule(config, targets)
     planned_trials = len(schedule)
+    binaries = _known_binaries(baseline.barriers)
+    for target in targets:
+        for site in () if target.barrier is None else target.barrier.sites:
+            binaries.setdefault(site.kernel_name, {}).setdefault(
+                site.kernel_checksum, None
+            )
     if resume is not None:
         # The remaining trials are located by counting the ones already run,
         # which is only the same position under the original schedule shape.
@@ -3184,6 +3343,7 @@ def run_stress(  # noqa: C901
             cutracer_so=cutracer_so,
             runner=runner,
             target=trial.target,
+            binaries=binaries,
         )
         completed += outcome.completed_trials
         reproductions += outcome.reproductions
