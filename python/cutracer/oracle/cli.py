@@ -4,7 +4,8 @@
 
 The oracle is a standalone script (``pytest_oracle.py``, shipped as a
 resource) so the project's interpreter can run it without CUTracer; these
-commands run it in-process or write it out.
+commands run it in-process or write it out. ``cutracer_numerics.py``, also a
+resource, is the numerics capture the process under test imports.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from types import ModuleType
 import click
 
 _PYTEST_ORACLE = "pytest_oracle.py"
+_NUMERICS_CAPTURE = "cutracer_numerics.py"
 
 
 @contextlib.contextmanager
@@ -40,6 +42,15 @@ def pytest_oracle() -> Iterator[ModuleType]:
             yield module
         finally:
             sys.modules.pop(spec.name, None)
+
+
+@contextlib.contextmanager
+def numerics_capture_path() -> Iterator[Path]:
+    """The numerics capture script, which the process under test imports as
+    `cutracer_numerics`. Its file stays in place while the context is open."""
+    source = resources.files("cutracer.oracle").joinpath(_NUMERICS_CAPTURE)
+    with resources.as_file(source) as path:
+        yield path
 
 
 @click.group(name="oracle")
