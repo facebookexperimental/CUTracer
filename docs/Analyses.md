@@ -192,6 +192,22 @@ Every report carries a `verdict`, with `reasons`:
 
 `--confirm` checks a finding before the search reports it: `cutracer reduce` replays the triggering config with the search's targeting, narrows it to the delay points that matter (`bisect`, majority of 3 runs per candidate), and the minimal config is replayed once more. The report then carries a `confirmation` (`confirmed`, `not_reproduced` or `unconfirmed`, with the essential points and `minimal_config.json` next to the mode's report), and the verdict stays `finding` only when the confirmation reproduced: a config that stops reproducing makes it `suspect`, and a replay that fails or runs out of `--budget-s` makes it `incomplete`.
 
+A confirmed finding then gets two checks of what its delay needs, each a majority of 3 replays of the minimal config. They qualify what the finding says, not the verdict:
+
+- `target_check`: when the triggering config delayed specific warps (an isolate warp, or a random search's warpgroup), the minimal config is replayed with those warps left undelayed and every other warp of the CTA delayed instead: the 32-bit complement of the target's mask, in the same CTA of each cluster for a cluster target. Warps a launch does not have are never delayed, so in a CTA with no other warp this replay delays nobody. `not_needed` means it still reproduced; `not_reproduced_without_target` means it did not; `inconclusive` means a replay failed or the budget ran out; `not_applicable` covers named-barrier targets, searches that delayed every warp, a target that leaves no other warp or that a 32-bit mask cannot name, and a target record that cannot be read.
+- `zero_delay_check`: the minimal config is replayed with every point's delay set to 0 ns (`minimal_config_zero_delay.json`; the top-level `delay_ns` stays, and `CUTRACER_DELAY_MIN_NS` is dropped from these replays and unset with `env -u` in the replay command the CLI prints). CUTracer still instruments the points but stalls no thread, so the perturbation left is the instrumentation's own overhead. `reproduced` means that is enough; `not_reproduced` means the finding needs a delay.
+
+Read together:
+
+| `target_check` | `zero_delay_check` | Reading |
+|---|---|---|
+| `not_needed` | `reproduced` | The instrumentation alone triggers it: no warp's delay is the cause. |
+| `not_needed` | `not_reproduced` | A delay is needed, but not the target's: delaying other warps works too. |
+| `not_reproduced_without_target` | `not_reproduced` | Consistent with the target's delay being needed, though delaying the other warps may also close the window. |
+| `not_reproduced_without_target` | `reproduced` | The instrumentation alone triggers it, and delaying the other warps closes the window. |
+
+The reproduction line reads `target=warp 0 (not needed: ...)` when the zero-delay check reproduced or the target check said `not_needed` (`warpgroup=all (no delay needed: ...)` for a search that named no target). For a hang finding, delaying every other warp can run the kernel past its timeout by itself, so a `not_needed` hang says less. Each check reports its replays and reproductions, the delay config it replayed and the `cutracer trace` options that replay it (printed as `Target check replay:` and `Zero-delay check replay:`; the latter keeps the triggering `--delay-ns`, which the per-point delays of the zero-delay config override), and `weak: true` when the search did not show that the bug stays away without a delay (its control runs reproduced, or it ran none); the reason of a reproduction then says so. Without `--signature-file` (or `--fail-pattern` for `oracle cmd`), any failure counts in these replays, as in the confirmation.
+
 The exit code stays 0 whenever the search itself ran; read the report for the outcome.
 
 Three oracle rules:

@@ -15,7 +15,7 @@ import shlex
 import shutil
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import click
@@ -25,6 +25,9 @@ from cutracer.stress.confirm import (
     Confirmation,
     CONFIRMED,
     confirmed_verdict,
+    ReplayCheck,
+    TARGET_NOT_NEEDED,
+    ZERO_DELAY_REPRODUCED,
 )
 from cutracer.stress.modes import get_mode, get_modes, StressMode
 from cutracer.stress.plan import MODE_RAN, PlanResult, run_stress_plan
@@ -594,9 +597,25 @@ def _confirm(
             f"Confirmed: {confirmation.reason}: {points} -> "
             f"{confirmation.minimal_config_path}"
         )
+        _echo_check("Target check", confirmation.target_check, config.oracle_argv)
+        _echo_check(
+            "Zero-delay check", confirmation.zero_delay_check, config.oracle_argv
+        )
     else:
         click.echo(f"Not confirmed: {confirmation.reason}")
     return confirmed_verdict(verdict, confirmation), confirmation
+
+
+def _echo_check(name: str, check: ReplayCheck | None, oracle: Sequence[str]) -> None:
+    if check is None:
+        return
+    click.echo(f"{name}: {check.reason}")
+    if check.replays and check.config_path and check.replay_args:
+        unset = [arg for variable in check.unset_env for arg in ("-u", variable)]
+        replay = ["env", *unset] if unset else []
+        replay += ["cutracer", "trace", *check.replay_args]
+        replay += ["--delay-load-path", check.config_path, "--", *oracle]
+        click.echo(f"{name} replay: {shlex.join(replay)}")
 
 
 def _report_extra(
@@ -647,7 +666,7 @@ def _run_single(
     if result.triggering is not None and os.path.exists(result.triggering.config_path):
         dump_out = dump_path or f"{output_dir}/triggering_config.json"
         shutil.copyfile(result.triggering.config_path, dump_out)
-        _echo_reproduction(config, result, dump_out, oracle)
+        _echo_reproduction(config, result, dump_out, oracle, confirmation)
     elif result.triggering is not None:
         click.echo(
             f"Reproduced (delay_ns={result.triggering.delay_ns}) but its delay "
@@ -816,7 +835,7 @@ def _run_plan(
         if os.path.exists(triggering.config_path):
             dump_out = dump_path or f"{output_dir}/triggering_config.json"
             shutil.copyfile(triggering.config_path, dump_out)
-            _echo_reproduction(trigger.config, result, dump_out, oracle)
+            _echo_reproduction(trigger.config, result, dump_out, oracle, confirmation)
         _echo_notes(trigger.config, result)
     elif plan.plain is not None:
         returncode = plan.plain["returncode"]
@@ -826,11 +845,27 @@ def _run_plan(
     _echo_verdict(verdict.status, verdict.reasons)
 
 
+def _target_qualifier(confirmation: Confirmation | None) -> str:
+    """What the checks of a confirmation say against the target the
+    reproduction line names."""
+    if confirmation is None:
+        return ""
+    zero, target = confirmation.zero_delay_check, confirmation.target_check
+    named = target is not None and target.excluded is not None
+    if zero is not None and zero.status == ZERO_DELAY_REPRODUCED:
+        what = "not needed" if named else "no delay needed"
+        return f" ({what}: the minimal config reproduces with no delay)"
+    if target is not None and target.status == TARGET_NOT_NEEDED:
+        return " (not needed: excluding it still reproduces)"
+    return ""
+
+
 def _echo_reproduction(
     config: StressConfig,
     result: StressResult,
     dump_out: str,
     oracle: tuple[str, ...],
+    confirmation: Confirmation | None = None,
 ) -> None:
     triggering = result.triggering
     assert triggering is not None
@@ -845,6 +880,7 @@ def _echo_reproduction(
     else:
         group = triggering.warpgroup_id
         placement = f"warpgroup={'all' if group is None else group}"
+    placement += _target_qualifier(confirmation)
     click.echo(
         f"Reproduced{symptom}: delay_ns={triggering.delay_ns} {placement} "
         f"rate={result.reproduction_rate:.2f} -> {dump_out}"
