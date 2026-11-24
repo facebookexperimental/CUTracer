@@ -23,6 +23,7 @@ import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import FrameType
 from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar
 
 import click
@@ -595,7 +596,11 @@ def _run_with_environment(
     )
 
 
-def run_process_group(
+class ProcessTerminated(subprocess.TimeoutExpired):
+    """The supervising process received SIGTERM and stopped its owned targets."""
+
+
+def run_process_group(  # noqa: C901
     command: str | Sequence[str],
     *,
     shell: bool = False,
@@ -606,6 +611,7 @@ def run_process_group(
     text: bool = False,
     check: bool = False,
     kill_grace_s: float = 10.0,
+    terminate_on_sigterm: bool = False,
 ) -> "subprocess.CompletedProcess[str]":
     """`subprocess.run` for a target that starts processes of its own.
 
@@ -620,37 +626,74 @@ def run_process_group(
     daemon that double-forks and calls `setsid()`) can outlive the target; it
     cannot block the timeout, because the final output drain is bounded by
     `kill_grace_s` as well. A `RunTarget` for `run_instrumented_target`.
+
+    With `terminate_on_sigterm`, call from the main thread. SIGTERM received
+    during launch is deferred until the target is owned; during the wait it
+    triggers the same cleanup as a timeout, then raises `ProcessTerminated`.
+    The previous signal handler is restored before returning or raising.
     """
     stdio = subprocess.PIPE if capture_output else None
-    with subprocess.Popen(
-        command,
-        shell=shell,
-        env=env,
-        cwd=cwd,
-        stdout=stdio,
-        stderr=stdio,
-        text=text,
-        start_new_session=True,
-    ) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            related = _related_pids(process.pid)
-            _signal_process_group(process.pid, signal.SIGTERM)
-            _signal_pids(related, signal.SIGTERM)
+    terminated = False
+    active = False
+    timed_out = False
+
+    def on_sigterm(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal terminated, active
+        terminated = True
+        if active:
+            active = False
+            raise subprocess.TimeoutExpired(command, timeout or 0)
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    if terminate_on_sigterm:
+        signal.signal(signal.SIGTERM, on_sigterm)
+    try:
+        with subprocess.Popen(
+            command,
+            shell=shell,
+            env=env,
+            cwd=cwd,
+            stdout=stdio,
+            stderr=stdio,
+            text=text,
+            start_new_session=True,
+        ) as process:
             try:
-                process.wait(timeout=kill_grace_s)
+                try:
+                    active = True
+                    if terminated:
+                        raise subprocess.TimeoutExpired(process.args, timeout or 0)
+                    stdout, stderr = process.communicate(timeout=timeout)
+                finally:
+                    active = False
+                if terminated:
+                    raise subprocess.TimeoutExpired(process.args, timeout or 0)
             except subprocess.TimeoutExpired:
-                pass
-            related |= _related_pids(process.pid)
-            _signal_process_group(process.pid, signal.SIGKILL)
-            _signal_pids(related, signal.SIGKILL)
-            stdout, stderr = _drain_output(process, kill_grace_s, text=text)
-            raise subprocess.TimeoutExpired(
-                process.args, timeout or 0, output=stdout, stderr=stderr
-            ) from None
-        finally:
-            _signal_process_group(process.pid, signal.SIGKILL)
+                timed_out = True
+                related = _related_pids(process.pid)
+                _signal_process_group(process.pid, signal.SIGTERM)
+                _signal_pids(related, signal.SIGTERM)
+                try:
+                    process.wait(timeout=kill_grace_s)
+                except subprocess.TimeoutExpired:
+                    pass
+                related |= _related_pids(process.pid)
+                _signal_process_group(process.pid, signal.SIGKILL)
+                _signal_pids(related, signal.SIGKILL)
+                stdout, stderr = _drain_output(process, kill_grace_s, text=text)
+            finally:
+                _signal_process_group(process.pid, signal.SIGKILL)
+    finally:
+        if terminate_on_sigterm:
+            signal.signal(signal.SIGTERM, previous_handler)
+    if terminated:
+        raise ProcessTerminated(
+            process.args, timeout or 0, output=stdout, stderr=stderr
+        ) from None
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            process.args, timeout or 0, output=stdout, stderr=stderr
+        ) from None
     result = subprocess.CompletedProcess(
         process.args, process.returncode, stdout, stderr
     )

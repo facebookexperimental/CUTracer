@@ -11,6 +11,11 @@ or an injected run whose delay config never instrumented a launched kernel of
 interest. A run that measured nothing must not read as a pass. Each run prints
 its exit code and the reason on one stderr line.
 
+With ``--test-failures``, any completed failing pytest call counts as a test
+regression. This does not identify numerical corruption or a GPU race. The
+collection, setup, teardown and instrumentation-coverage requirements still
+apply; skips and xfails remain incomplete.
+
 The node runs in a child process of the project's interpreter (``--python``),
 which inherits CUTracer's injection; the oracle itself never loads CUDA. The
 child stays in the oracle's process group, so the runner that launched the
@@ -125,6 +130,7 @@ class OracleOptions:
     # This file, which the child runs in its worker mode.
     script: Path = field(default_factory=lambda: Path(__file__).resolve())
     numerics: Optional[NumericsOptions] = None
+    test_failures: bool = False
 
 
 @dataclass
@@ -244,7 +250,11 @@ def _failure_reason(report: Dict[str, Any]) -> str:
 
 
 def classify(
-    report: Dict[str, Any], nodeid: str, expected_signature: Optional[str] = None
+    report: Dict[str, Any],
+    nodeid: str,
+    expected_signature: Optional[str] = None,
+    *,
+    test_failures: bool = False,
 ) -> tuple[int, str]:
     """The oracle exit code for one worker report, and the reason for it."""
     selected = report.get("selected")
@@ -270,6 +280,15 @@ def classify(
         return PASSED, "the node passed"
     if outcome != "failed" or pytest_exit != 1:
         return INCOMPLETE, f"the node's call {outcome}, but pytest exited {pytest_exit}"
+    if test_failures:
+        if report.get("test_failure") is not True:
+            return INCOMPLETE, "pytest reported failure without a failing test call"
+        if (
+            expected_signature is not None
+            and report.get("signature") != expected_signature
+        ):
+            return INCOMPLETE, "the pytest call failed, but not with the pinned failure"
+        return REPRODUCED, "the node's pytest call failed"
     if report.get("correctness_failure") is not True or not report.get("signature"):
         return INCOMPLETE, _failure_reason(report)
     where = _where(report.get("assertion_site"))
@@ -1236,6 +1255,8 @@ def _worker_command(
     command += [f"--assertion-site={site}" for site in options.assertion_sites]
     if numerics_module is not None:
         command += ["--numerics-module", str(numerics_module)]
+    if options.test_failures:
+        command.append("--test-failures")
     return command + [f"--pytest-arg={arg}" for arg in options.pytest_args]
 
 
@@ -1314,12 +1335,18 @@ def _run_pytest(  # noqa: C901
         options.output_dir.mkdir(parents=True, exist_ok=True)
     attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=options.output_dir))
     outcome: Dict[str, Any] = {"exit": INCOMPLETE, "nodeid": options.nodeid}
+    if options.test_failures:
+        outcome["test_failures"] = True
 
     def finish(code: int, reason: str) -> tuple[int, Dict[str, Any], Path]:
         outcome.update(exit=code, reason=reason)
         return code, outcome, attempt
 
     try:
+        if options.test_failures and options.assertion_sites:
+            return finish(
+                INCOMPLETE, "--test-failures cannot be combined with --assertion-site"
+            )
         env = dict(os.environ)
         run, error = _numerics_run(
             options.numerics, mode, golden, _numerics_label(options), env
@@ -1360,7 +1387,10 @@ def _run_pytest(  # noqa: C901
         )
         # With numerics, the signature is checked once the numbers are judged.
         code, reason = classify(
-            report, options.nodeid, expected if run is None else None
+            report,
+            options.nodeid,
+            expected if run is None else None,
+            test_failures=options.test_failures,
         )
         outcome.update(
             signature=report.get("signature"),
@@ -1575,21 +1605,29 @@ def run_worker(args: argparse.Namespace) -> int:
             asserted = call.excinfo.type is AssertionError
             exception = call.excinfo.type.__name__
             # A multi-process test sees its child's failure as a launcher error.
-            child = child_failure(call.excinfo.value, args.rootdir)
+            child = (
+                None
+                if args.test_failures
+                else child_failure(call.excinfo.value, args.rootdir)
+            )
             if child is not None:
                 exception, site = child
                 asserted = exception == "AssertionError"
                 state["child_failure"] = True
             state["exception"] = exception
             correctness = (
-                asserted
+                not args.test_failures
+                and asserted
                 and site is not None
                 and (not sites or (site[0], site[1]) in sites)
             )
             state["correctness_failure"] = correctness
             state["failure"] = str(call.excinfo.value)[:2000]
             state["assertion_site"] = site
-            if correctness and site is not None:
+            if args.test_failures:
+                state["test_failure"] = True
+                state["signature"] = signature(args.nodeid, [exception, *(site or [])])
+            elif correctness and site is not None:
                 state["signature"] = signature(args.nodeid, site)
 
         def pytest_runtest_logreport(self, report: Any) -> None:
@@ -1799,6 +1837,14 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--nodeid", required=True, help="The one test node to run.")
     parser.add_argument(
+        "--test-failures",
+        action="store_true",
+        help="Count any completed failing pytest call as a test regression, not "
+        "as proof of numerical corruption or a GPU race. Setup and teardown "
+        "must pass; skips and xfails remain incomplete. Cannot be combined "
+        "with --assertion-site.",
+    )
+    parser.add_argument(
         "--assertion-site",
         action="append",
         default=[],
@@ -1987,6 +2033,8 @@ def main(argv: Optional[Sequence[str]] = None, prog: Optional[str] = None) -> in
         return main_cmd(argv[1:], prog=prog)
     parser = build_parser(prog)
     args = parser.parse_args(argv)
+    if args.test_failures and args.assertion_site:
+        parser.error("--test-failures cannot be combined with --assertion-site")
     if args.worker_report is not None:
         return run_worker(args)
     numerics = _numerics_options(parser, args)
@@ -1997,6 +2045,7 @@ def main(argv: Optional[Sequence[str]] = None, prog: Optional[str] = None) -> in
                 rootdir=args.rootdir.resolve(),
                 nodeid=args.nodeid,
                 assertion_sites=args.assertion_site,
+                test_failures=args.test_failures,
                 kernels=args.kernels,
                 output_dir=args.output_dir,
                 expected_signature=args.expected_signature,

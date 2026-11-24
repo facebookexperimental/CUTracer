@@ -1036,6 +1036,7 @@ class RealPytestWorkerTest(_OracleTestCase):
         prelude: str = "",
         child_last: str | None = None,
         installed: dict[str, str] | None = None,
+        test_failures: bool = False,
     ) -> tuple[int, str]:
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -1074,6 +1075,7 @@ class RealPytestWorkerTest(_OracleTestCase):
             ["--worker-report", str(report), "--rootdir", str(root)]
             + ["--nodeid", "test_x.py::test_x"]
             + [f"--assertion-site={site}" for site in sites]
+            + (["--test-failures"] if test_failures else [])
             + [f"--pytest-arg={arg}" for arg in self.oracle.DEFAULT_PYTEST_ARGS]
         )
         # Every case writes its own `test_x.py`, and pytest reuses a module that
@@ -1085,7 +1087,8 @@ class RealPytestWorkerTest(_OracleTestCase):
             code = self.oracle.run_worker(args)
         data = json.loads(report.read_text())
         self.assertEqual(code, data["pytest_exit"])
-        return self.oracle.classify(data, "test_x.py::test_x")
+        kwargs = {"test_failures": True} if test_failures else {}
+        return self.oracle.classify(data, "test_x.py::test_x", **kwargs)
 
     def test_a_failed_torchelastic_worker_is_judged_by_its_own_traceback(
         self,
@@ -1154,6 +1157,39 @@ class RealPytestWorkerTest(_OracleTestCase):
             with self.subTest(body=body, sites=sites):
                 self.assertEqual(self._classify(body, sites)[0], expected)
 
+    def test_only_completed_failing_calls_count_as_regressions(self) -> None:
+        check = "def check():\n    raise ValueError('check failed')\n"
+        cases = [
+            ("helper()", "", REPRODUCED),
+            ("check()", check, REPRODUCED),
+            ("pass", "", PASSED),
+            ("import pytest; pytest.skip('unsupported')", "", INCOMPLETE),
+            ("import pytest; pytest.xfail('known issue')", "", INCOMPLETE),
+            (
+                "pass",
+                check
+                + "import pytest\n@pytest.fixture(autouse=True)\ndef setup():\n    check()\n",
+                INCOMPLETE,
+            ),
+            (
+                "pass",
+                check
+                + "import pytest\n@pytest.fixture(autouse=True)\ndef cleanup():\n    yield\n    check()\n",
+                INCOMPLETE,
+            ),
+            ("pass", "raise ValueError('collection')\n", INCOMPLETE),
+            (
+                "pass",
+                "import pytest\npytestmark = pytest.mark.xfail(strict=True)\n",
+                INCOMPLETE,
+            ),
+        ]
+        for body, prelude, expected in cases:
+            with self.subTest(body=body, prelude=prelude):
+                code, _ = self._classify(body, (), prelude=prelude, test_failures=True)
+                self.assertEqual(code, expected)
+        self.assertEqual(self._classify("check()", (), prelude=check)[0], INCOMPLETE)
+
     def test_modules_the_test_imports_do_not_stop_the_report(self) -> None:
         installed = {
             # Like `torch.classes`: every attribute exists, `__path__` included.
@@ -1208,7 +1244,11 @@ class OracleCliTest(unittest.TestCase):
         self.assertEqual(invoked.exit_code, INCOMPLETE)
 
     def test_usage_errors_exit_2(self) -> None:
-        for extra in (["--assertion-site", "x.py"], ["--timeout", "0"]):
+        for extra in (
+            ["--assertion-site", "x.py"],
+            ["--timeout", "0"],
+            ["--test-failures", "--assertion-site", "x.py::check"],
+        ):
             with self.subTest(extra=extra):
                 invoked = CliRunner().invoke(
                     oracle_command,
