@@ -33,8 +33,8 @@ echo "🚀 ===== CUDA Installation Script Started ====="
 CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX:-$HOME/opt}
 CUDA_INSTALL_PREFIX=${CUDA_INSTALL_PREFIX%/}
 CUDA_VERSION=${CUDA_VERSION:-12.8}
-NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.7.2}
-CUDA_CUPTI_VERSION=${CUDA_CUPTI_VERSION:-13.3.75}
+NVSHMEM_VERSION=${NVSHMEM_VERSION:-3.8.0}
+CUDA_CUPTI_VERSION=${CUDA_CUPTI_VERSION:-13.5.25}
 INSTALL_NCCL=${INSTALL_NCCL:-1}
 NCCL_VERSION=${NCCL_VERSION:-v2.32.3-1}
 
@@ -53,7 +53,7 @@ declare -A CUDA_FULL_VERSION=(
   ["12.9"]="12.9.1"
   ["13.0"]="13.0.3"
   ["13.2"]="13.2.2"
-  ["13.4"]="13.4.1"
+  ["13.4"]="13.4.3"
   ["13.5"]="13.5.0"
 )
 
@@ -63,9 +63,9 @@ declare -A CUDA_RUNFILE=(
   ["12.9"]="cuda_12.9.1_575.57.08_linux"
   ["13.0"]="cuda_13.0.3_580.126.20_linux"
   ["13.2"]="cuda_13.2.2_595.71.05_linux"
-  # 13.4.1 runfile carries no driver suffix; NVIDIA published it after
+  # 13.4.3 runfile carries no driver suffix; NVIDIA published it after
   # upstream wired 13.4 to the preview network repo (runfile URL verified).
-  ["13.4"]="cuda_13.4.1_linux"
+  ["13.4"]="cuda_13.4.3_linux"
   # 13.5.0 runfile likewise carries no driver suffix, since the driver is no
   # longer bundled with the toolkit from 13.4 on (runfile URL verified).
   ["13.5"]="cuda_13.5.0_linux"
@@ -73,11 +73,11 @@ declare -A CUDA_RUNFILE=(
 
 declare -A CUDNN_VERSIONS=(
   ["12.6"]="9.10.2.21"
-  ["12.8"]="9.27.0.42"
-  ["12.9"]="9.27.0.42"
-  ["13.0"]="9.27.0.42"
-  ["13.2"]="9.27.0.42"
-  ["13.4"]="9.27.0.42"
+  ["12.8"]="9.26.0.51"
+  ["12.9"]="9.26.0.51"
+  ["13.0"]="9.26.0.51"
+  ["13.2"]="9.26.0.51"
+  ["13.4"]="9.26.0.51"
   ["13.5"]="9.27.0.42"
 )
 
@@ -559,8 +559,8 @@ function install_nvshmem {
 # the x86_64 archive.
 # Synced with PyTorch .ci/docker/common/install_cuda.sh
 function install_cupti_headers {
-  local cupti_version=$1                 # e.g. "13.3.75"
-  local major_minor=${cupti_version%.*}  # e.g. "13.3"
+  local cupti_version=$1                 # e.g. "13.5.25"
+  local major_minor=${cupti_version%.*}  # e.g. "13.5"
   local target_dir="${CUDA_INSTALL_PREFIX}/cupti-headers-${major_minor}"
 
   echo "Installing CUPTI ${cupti_version} headers..."
