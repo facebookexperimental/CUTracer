@@ -528,8 +528,14 @@ def execute_selection(
         return 2
     return (
         1
-        if args.action == "trace"
-        and any(row["status"] == "test_failed" for row in rows)
+        if (
+            args.action == "trace"
+            and any(row["status"] == "test_failed" for row in rows)
+        )
+        or (
+            getattr(args, "fail_on_findings", False)
+            and any(row["status"] == "finding" for row in rows)
+        )
         else 0
     )
 
@@ -559,6 +565,11 @@ def run_workload(
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--action", choices=("stress", "trace"))
+    parser.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help="Return exit 1 for measured stress findings without discarding complete results.",
+    )
     parser.add_argument("--select-only", action="store_true")
     parser.add_argument(
         "--output-dir", type=Path, default=os.environ.get("WORKLOAD_OUTPUT_DIR")
@@ -588,7 +599,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--inventory", type=Path, help=argparse.SUPPRESS)
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Select pytest cases, then run CUTracer stress or trace."
     )
@@ -599,6 +610,11 @@ def main() -> None:
         default=Path(os.environ.get("WORKLOAD_SOURCE_DIR", os.getcwd())),
     )
     parser.add_argument("--tests", nargs="+", required=True)
+    return parser
+
+
+def main() -> None:
+    parser = build_argument_parser()
     args = parser.parse_args()
     if args.collect_root is not None:
         if args.inventory is None:
