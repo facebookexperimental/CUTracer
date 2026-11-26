@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -32,10 +33,21 @@ class CaseSelection:
     cases: tuple[dict, ...]
 
 
-def project_python() -> str:
+def project_python(output: Path | None = None) -> str:
     runtime = os.environ.get("FB_PAR_RUNTIME_FILES")
     bootstrap = Path(runtime) / "_bootstrap.sh" if runtime else None
-    return str(bootstrap) if bootstrap and bootstrap.is_file() else sys.executable
+    if bootstrap and bootstrap.is_file():
+        return str(bootstrap)
+    if output is None:
+        return sys.executable
+    launcher = output / "project-python"
+    python_path = os.pathsep.join(os.path.realpath(path) for path in sys.path if path)
+    launcher.write_text(
+        "#!/bin/sh\n"
+        f'PYTHONPATH={shlex.quote(python_path)} exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    launcher.chmod(0o700)
+    return str(launcher)
 
 
 class _Collection:
@@ -193,7 +205,7 @@ def _worker_command(
     args: argparse.Namespace, selection: CaseSelection, case: dict, output: Path
 ) -> list[str]:
     return [
-        project_python(),
+        project_python(output),
         str(output / "pytest-oracle.py"),
         "--worker-report",
         str(output / case["case_id"] / "pytest.json"),
@@ -230,7 +242,7 @@ def _stress_command(
     kernels: str,
 ) -> list[str]:
     return [
-        project_python(),
+        project_python(output),
         "-m",
         "cutracer.cli",
         "stress",
@@ -251,10 +263,10 @@ def _stress_command(
         "--output-dir",
         str(output / case["case_id"]),
         "--",
-        project_python(),
+        project_python(output),
         str(output / "pytest-oracle.py"),
         "--python",
-        project_python(),
+        project_python(output),
         *_pytest_arguments(args, selection, case),
         "--kernels",
         kernels,
@@ -271,7 +283,7 @@ def _trace_command(
     kernels: str,
 ) -> list[str]:
     return [
-        project_python(),
+        project_python(output),
         "-m",
         "cutracer.cli",
         "trace",

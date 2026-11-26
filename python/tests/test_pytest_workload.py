@@ -5,16 +5,42 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cutracer.pytest_workload import inspect_trace, project_python
 from parameterized import parameterized
 
 
 class SelectionTest(unittest.TestCase):
+    def test_nested_python_keeps_runtime_dependencies_after_env_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "runtime_dependency.py").write_text("VALUE = 42\n")
+            with (
+                patch.dict(os.environ, {"FB_PAR_RUNTIME_FILES": ""}),
+                patch.object(sys, "path", [str(root), *sys.path]),
+            ):
+                python = project_python(root)
+            child = (
+                "import os, subprocess\n"
+                "os.environ.pop('PYTHONPATH', None)\n"
+                f"result = subprocess.run([{python!r}, '-c', "
+                "'import runtime_dependency; assert runtime_dependency.VALUE == 42'])\n"
+                "raise SystemExit(result.returncode)\n"
+            )
+            result = subprocess.run(
+                [python, "-c", child],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_selection_does_not_run_cases_or_depend_on_action(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
