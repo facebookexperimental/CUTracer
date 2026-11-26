@@ -18,6 +18,14 @@ class AMDLDSDecoderTest(unittest.TestCase):
                 "ds_write2_b32 v160, v204, v205 offset0:8 offset1:12",
                 ("write", "v160", [(32, 4), (48, 4)]),
             ),
+            (
+                "ds_write_b128 v164, v[120:123] offset:1024",
+                ("write", "v164", [(1024, 16)]),
+            ),
+            (
+                "ds_read_b64_tr_b16 v[30:31], v115 offset:8704",
+                ("read", "v115", [(8704, 8)]),
+            ),
         )
         for asm, expected in cases:
             with self.subTest(asm=asm):

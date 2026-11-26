@@ -95,6 +95,14 @@ def decode_instruction(asm: str) -> DecodedInstruction | None:
     if mnemonic == "ds_read_b128":
         kind, address_index = "read", 1
         width_bytes, offset_slots, offset_scale = 16, ("",), 1
+    elif mnemonic == "ds_read_b64_tr_b16":
+        # Each lane addresses one 8-byte chunk; the transpose only moves the
+        # loaded halfwords between lanes (CDNA4 ISA 11.4).
+        kind, address_index = "read", 1
+        width_bytes, offset_slots, offset_scale = 8, ("",), 1
+    elif mnemonic == "ds_write_b128":
+        kind, address_index = "write", 0
+        width_bytes, offset_slots, offset_scale = 16, ("",), 1
     elif mnemonic == "ds_write2_b32":
         kind, address_index = "write", 0
         width_bytes, offset_slots, offset_scale = 4, ("0", "1"), 4
